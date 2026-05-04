@@ -1,0 +1,234 @@
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import Dashboard from './components/Dashboard';
+import InvoiceForm from './components/InvoiceForm';
+import StockForm from './components/StockForm';
+import AlertsPanel from './components/AlertsPanel';
+import './App.css';
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api';
+
+function App() {
+  const [currentView, setCurrentView] = useState('dashboard');
+  const [shopData, setShopData] = useState(null);
+  const [inventoryStatus, setInventoryStatus] = useState(null);
+  const [alerts, setAlerts] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Hardcoded shop ID for Kanhaiya Marbles (will be set after first init)
+  const SHOP_ID = localStorage.getItem('shopId');
+
+  useEffect(() => {
+    if (SHOP_ID) {
+      fetchShopData();
+      fetchInventoryStatus();
+      fetchAlerts();
+      // Refresh every 30 seconds
+      const interval = setInterval(() => {
+        fetchInventoryStatus();
+        fetchAlerts();
+      }, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [SHOP_ID]);
+
+  const fetchShopData = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/shops/${SHOP_ID}`);
+      setShopData(response.data);
+    } catch (err) {
+      setError('Failed to fetch shop data');
+      console.error(err);
+    }
+  };
+
+  const fetchInventoryStatus = async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(`${API_BASE_URL}/inventory/status/${SHOP_ID}`);
+      setInventoryStatus(response.data);
+      setError(null);
+    } catch (err) {
+      setError('Failed to fetch inventory');
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchAlerts = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/alerts/${SHOP_ID}`);
+      setAlerts(response.data);
+    } catch (err) {
+      console.error('Failed to fetch alerts:', err);
+    }
+  };
+
+  const handleInitializeShop = async (shopDetails) => {
+    try {
+      setLoading(true);
+      const response = await axios.post(`${API_BASE_URL}/shops/init`, shopDetails);
+      const newShopId = response.data.id;
+      localStorage.setItem('shopId', newShopId);
+      setShopData(response.data);
+      window.location.reload();
+    } catch (err) {
+      setError('Failed to initialize shop');
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!SHOP_ID) {
+    return (
+      <div className="container">
+        <div className="init-screen">
+          <h1>🏪 Kanhaiya Marbles</h1>
+          <p>AI-Powered Inventory Management</p>
+          <InitializeShop onSubmit={handleInitializeShop} />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <header className="app-header">
+        <h1>🏪 Kanhaiya Marbles</h1>
+        <p className="shop-owner">{shopData?.owner_name}</p>
+      </header>
+
+      {error && <div className="error-message">{error}</div>}
+
+      <div className="main-content">
+        {currentView === 'dashboard' && (
+          <Dashboard 
+            shopData={shopData} 
+            inventoryStatus={inventoryStatus}
+            loading={loading}
+          />
+        )}
+        {currentView === 'invoice' && (
+          <InvoiceForm 
+            shopId={SHOP_ID}
+            inventory={inventoryStatus?.inventory || []}
+            onSuccess={() => {
+              fetchInventoryStatus();
+              fetchAlerts();
+              setCurrentView('dashboard');
+            }}
+          />
+        )}
+        {currentView === 'stock' && (
+          <StockForm 
+            shopId={SHOP_ID}
+            inventory={inventoryStatus?.inventory || []}
+            onSuccess={() => {
+              fetchInventoryStatus();
+              fetchAlerts();
+              setCurrentView('dashboard');
+            }}
+          />
+        )}
+        {currentView === 'alerts' && (
+          <AlertsPanel alerts={alerts} loading={loading} />
+        )}
+      </div>
+
+      <nav className="bottom-nav">
+        <button 
+          className={`nav-button ${currentView === 'dashboard' ? 'active' : ''}`}
+          onClick={() => setCurrentView('dashboard')}
+        >
+          📊 Dashboard
+        </button>
+        <button 
+          className={`nav-button ${currentView === 'invoice' ? 'active' : ''}`}
+          onClick={() => setCurrentView('invoice')}
+        >
+          🧾 Invoice
+        </button>
+        <button 
+          className={`nav-button ${currentView === 'stock' ? 'active' : ''}`}
+          onClick={() => setCurrentView('stock')}
+        >
+          📦 Add Stock
+        </button>
+        <button 
+          className={`nav-button ${currentView === 'alerts' ? 'active' : ''}`}
+          onClick={() => setCurrentView('alerts')}
+        >
+          🚨 Alerts
+        </button>
+      </nav>
+    </div>
+  );
+}
+
+function InitializeShop({ onSubmit }) {
+  const [formData, setFormData] = useState({
+    ownerName: 'Sanjay Kumar Sharma',
+    phone: '6202146538',
+    address: 'Tarwara More, Siwan',
+    shopType: 'tile_marble'
+  });
+
+  const handleChange = (e) => {
+    setFormData({
+      ...formData,
+      [e.target.name]: e.target.value
+    });
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSubmit({
+      shopName: 'Kanhaiya Marbles',
+      ownerName: formData.ownerName,
+      phone: formData.phone,
+      address: formData.address,
+      shopType: formData.shopType
+    });
+  };
+
+  return (
+    <form className="init-form" onSubmit={handleSubmit}>
+      <div className="form-group">
+        <label>Owner Name</label>
+        <input 
+          type="text" 
+          name="ownerName" 
+          value={formData.ownerName}
+          onChange={handleChange}
+          required
+        />
+      </div>
+      <div className="form-group">
+        <label>Phone</label>
+        <input 
+          type="tel" 
+          name="phone" 
+          value={formData.phone}
+          onChange={handleChange}
+          required
+        />
+      </div>
+      <div className="form-group">
+        <label>Address</label>
+        <input 
+          type="text" 
+          name="address" 
+          value={formData.address}
+          onChange={handleChange}
+          required
+        />
+      </div>
+      <button type="submit" className="btn-primary">Start</button>
+    </form>
+  );
+}
+
+export default App;

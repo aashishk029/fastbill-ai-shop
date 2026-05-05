@@ -87,8 +87,8 @@ function App() {
     return (
       <div className="container">
         <div className="init-screen">
-          <h1>🏪 Kanhaiya Marbles</h1>
-          <p>AI-Powered Inventory Management</p>
+          <h1>⚡ FastBill</h1>
+          <p>AI-Powered Shop Management Platform</p>
           <InitializeShop onSubmit={handleInitializeShop} />
         </div>
       </div>
@@ -98,8 +98,8 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>🏪 Kanhaiya Marbles</h1>
-        <p className="shop-owner">{shopData?.owner_name}</p>
+        <h1>⚡ FastBill</h1>
+        <p className="shop-owner">{shopData?.name} · {shopData?.owner_name}</p>
       </header>
 
       {error && <div className="error-message">{error}</div>}
@@ -180,37 +180,44 @@ function App() {
 
 function InitializeShop({ onSubmit }) {
   const [formData, setFormData] = useState({
-    ownerName: 'Sanjay Kumar Sharma',
-    phone: '6202146538',
-    address: 'Tarwara More, Siwan',
-    shopType: 'tile_marble'
+    shopName: '',
+    ownerName: '',
+    phone: '',
+    address: '',
+    shopType: 'general'
   });
+  const [loading, setLoading] = useState(false);
 
   const handleChange = (e) => {
-    setFormData({
-      ...formData,
-      [e.target.name]: e.target.value
-    });
+    setFormData({ ...formData, [e.target.name]: e.target.value });
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    onSubmit({
-      shopName: 'Kanhaiya Marbles',
-      ownerName: formData.ownerName,
-      phone: formData.phone,
-      address: formData.address,
-      shopType: formData.shopType
-    });
+    setLoading(true);
+    await onSubmit(formData);
+    setLoading(false);
   };
 
   return (
     <form className="init-form" onSubmit={handleSubmit}>
       <div className="form-group">
+        <label>Shop Name</label>
+        <input
+          type="text"
+          name="shopName"
+          placeholder="e.g. Kanhaiya Marbles"
+          value={formData.shopName}
+          onChange={handleChange}
+          required
+        />
+      </div>
+      <div className="form-group">
         <label>Owner Name</label>
-        <input 
-          type="text" 
-          name="ownerName" 
+        <input
+          type="text"
+          name="ownerName"
+          placeholder="e.g. Sanjay Kumar Sharma"
           value={formData.ownerName}
           onChange={handleChange}
           required
@@ -218,9 +225,10 @@ function InitializeShop({ onSubmit }) {
       </div>
       <div className="form-group">
         <label>Phone</label>
-        <input 
-          type="tel" 
-          name="phone" 
+        <input
+          type="tel"
+          name="phone"
+          placeholder="e.g. 9876543210"
           value={formData.phone}
           onChange={handleChange}
           required
@@ -228,15 +236,29 @@ function InitializeShop({ onSubmit }) {
       </div>
       <div className="form-group">
         <label>Address</label>
-        <input 
-          type="text" 
-          name="address" 
+        <input
+          type="text"
+          name="address"
+          placeholder="e.g. Main Market, Siwan"
           value={formData.address}
           onChange={handleChange}
           required
         />
       </div>
-      <button type="submit" className="btn-primary">Start</button>
+      <div className="form-group">
+        <label>Shop Type</label>
+        <select name="shopType" value={formData.shopType} onChange={handleChange}>
+          <option value="general">General Store</option>
+          <option value="tile_marble">Tiles / Marble</option>
+          <option value="grocery">Grocery</option>
+          <option value="electronics">Electronics</option>
+          <option value="pharmacy">Pharmacy</option>
+          <option value="clothing">Clothing</option>
+        </select>
+      </div>
+      <button type="submit" className="btn-primary" disabled={loading}>
+        {loading ? 'Setting up...' : '🚀 Start FastBill'}
+      </button>
     </form>
   );
 }

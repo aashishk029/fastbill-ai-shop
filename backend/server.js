@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
+const bcrypt = require("bcrypt");
 require("dotenv").config();
 
 const { createClient } = require("@supabase/supabase-js");
@@ -139,28 +140,29 @@ app.get("/api/health", (req, res) => {
 // Initialize Shop
 app.post("/api/shops/init", async (req, res) => {
   try {
-    const { shopName, ownerName, phone, address, shopType } = req.body;
+    const { shopName, ownerName, phone, address, shopType, pin } = req.body;
 
-    // Insert shop
+    if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ error: "4 digit PIN zaroori hai" });
+    }
+
+    // Check phone not already registered
+    const { data: existing } = await supabase
+      .from("shops").select("id").eq("phone", phone).single();
+    if (existing) {
+      return res.status(409).json({ error: "Ye phone number pehle se registered hai. Login karo." });
+    }
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+
     const { data: shop, error } = await supabase
       .from("shops")
-      .insert([
-        {
-          name: shopName,
-          owner_name: ownerName,
-          phone,
-          address,
-          shop_type: shopType,
-        },
-      ])
+      .insert([{ name: shopName, owner_name: ownerName, phone, address, shop_type: shopType, pin_hash }])
       .select();
 
     if (error) throw error;
 
-    res.json({
-      message: "✓ Shop initialized",
-      shop: shop[0],
-    });
+    res.json({ message: "✓ Shop initialized", shop: shop[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -183,13 +185,16 @@ app.get("/api/shops/:shopId", async (req, res) => {
   }
 });
 
-// Login by phone number
-app.get("/api/shops/login/:phone", async (req, res) => {
+// Login by phone + PIN
+app.post("/api/shops/login", async (req, res) => {
   try {
+    const { phone, pin } = req.body;
+    if (!phone || !pin) return res.status(400).json({ error: "Phone aur PIN dono chahiye" });
+
     const { data, error } = await supabase
       .from("shops")
       .select("*")
-      .eq("phone", req.params.phone)
+      .eq("phone", phone)
       .order("created_at", { ascending: false })
       .limit(1)
       .single();
@@ -197,7 +202,20 @@ app.get("/api/shops/login/:phone", async (req, res) => {
     if (error || !data) {
       return res.status(404).json({ error: "Koi shop nahi mila is number pe" });
     }
-    res.json({ found: true, shop: data });
+
+    // Old shops (no PIN set) — allow login without PIN for migration
+    if (!data.pin_hash) {
+      return res.json({ found: true, shop: data, warning: "PIN set nahi hai, please update karo" });
+    }
+
+    const valid = await bcrypt.compare(pin, data.pin_hash);
+    if (!valid) {
+      return res.status(401).json({ error: "Galat PIN. Dobara try karo." });
+    }
+
+    // Don't send pin_hash to client
+    const { pin_hash, ...shopSafe } = data;
+    res.json({ found: true, shop: shopSafe });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

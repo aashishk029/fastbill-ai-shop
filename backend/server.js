@@ -537,3 +537,120 @@ app.post("/api/purchases/add", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Add New Product/Design
+app.post("/api/designs/add", async (req, res) => {
+  try {
+    const { shopId, designCode, designName, color, categoryName, sizeMm, coverageSqft, pricePerBox, initialQuantity } = req.body;
+
+    if (!shopId || !designName || !categoryName) {
+      return res.status(400).json({ error: "shopId, designName, categoryName zaroori hai" });
+    }
+
+    // Find or create category
+    let categoryId;
+    const { data: existingCat } = await supabase
+      .from("tile_categories")
+      .select("id")
+      .eq("shop_id", shopId)
+      .ilike("category_name", categoryName)
+      .single();
+
+    if (existingCat) {
+      categoryId = existingCat.id;
+    } else {
+      const { data: newCat, error: catError } = await supabase
+        .from("tile_categories")
+        .insert([{
+          shop_id: shopId,
+          category_name: categoryName,
+          size_mm: sizeMm || "",
+          coverage_sqft: parseFloat(coverageSqft) || 0,
+          base_price_per_box: parseFloat(pricePerBox) || 0,
+        }])
+        .select()
+        .single();
+      if (catError) throw catError;
+      categoryId = newCat.id;
+    }
+
+    // Auto-generate code if not provided
+    const code = designCode || `PROD-${Date.now().toString().slice(-5)}`;
+
+    // Insert design
+    const { data: design, error: designError } = await supabase
+      .from("designs")
+      .insert([{
+        shop_id: shopId,
+        category_id: categoryId,
+        design_code: code,
+        design_name: designName,
+        color: color || "",
+      }])
+      .select()
+      .single();
+    if (designError) throw designError;
+
+    // Create inventory entry
+    const { error: invError } = await supabase
+      .from("inventory")
+      .insert([{
+        shop_id: shopId,
+        design_id: design.id,
+        quantity_boxes: parseInt(initialQuantity) || 0,
+        low_stock_threshold: 10,
+        is_low_stock: (parseInt(initialQuantity) || 0) <= 10,
+        last_restocked_at: new Date().toISOString(),
+      }]);
+    if (invError) throw invError;
+
+    res.json({ success: true, design, message: "Naya product add ho gaya!" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Identify Product from Photo using Claude Vision
+app.post("/api/products/identify-photo", async (req, res) => {
+  try {
+    const { imageBase64, shopType } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "Image required" });
+
+    const message = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 500,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: imageBase64,
+            },
+          },
+          {
+            type: "text",
+            text: `You are a product identification assistant for a ${shopType || "general"} shop in India.
+Analyze this product image and return ONLY a JSON object (no markdown, no explanation):
+{
+  "designName": "product name in English",
+  "color": "main color",
+  "categoryName": "product category",
+  "sizeMm": "size if visible e.g. 24x24",
+  "priceEstimate": estimated price per unit in INR as number,
+  "description": "1 line description in Hindi"
+}`,
+          },
+        ],
+      }],
+    });
+
+    const raw = message.content[0].text.trim();
+    const json = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    res.json({ success: true, product: json });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});

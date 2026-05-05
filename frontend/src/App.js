@@ -25,13 +25,13 @@ function App() {
       fetchShopData();
       fetchInventoryStatus();
       fetchAlerts();
-      // Refresh every 30 seconds
       const interval = setInterval(() => {
         fetchInventoryStatus();
         fetchAlerts();
       }, 30000);
       return () => clearInterval(interval);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [SHOP_ID]);
 
   const fetchShopData = async () => {

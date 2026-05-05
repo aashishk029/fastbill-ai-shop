@@ -564,7 +564,7 @@ app.post("/api/designs/add", async (req, res) => {
         .insert([{
           shop_id: shopId,
           category_name: categoryName,
-          size_mm: sizeMm || "",
+          size_mm: sizeMm || "N/A",
           coverage_sqft: parseFloat(coverageSqft) || 0,
           base_price_per_box: parseFloat(pricePerBox) || 0,
         }])
@@ -577,11 +577,10 @@ app.post("/api/designs/add", async (req, res) => {
     // Auto-generate code if not provided
     const code = designCode || `PROD-${Date.now().toString().slice(-5)}`;
 
-    // Insert design
+    // Insert design (no shop_id column in designs table)
     const { data: design, error: designError } = await supabase
       .from("designs")
       .insert([{
-        shop_id: shopId,
         category_id: categoryId,
         design_code: code,
         design_name: designName,
@@ -591,7 +590,7 @@ app.post("/api/designs/add", async (req, res) => {
       .single();
     if (designError) throw designError;
 
-    // Create inventory entry
+    // Create inventory entry (is_low_stock is GENERATED column, don't insert it)
     const { error: invError } = await supabase
       .from("inventory")
       .insert([{
@@ -599,7 +598,6 @@ app.post("/api/designs/add", async (req, res) => {
         design_id: design.id,
         quantity_boxes: parseInt(initialQuantity) || 0,
         low_stock_threshold: 10,
-        is_low_stock: (parseInt(initialQuantity) || 0) <= 10,
         last_restocked_at: new Date().toISOString(),
       }]);
     if (invError) throw invError;

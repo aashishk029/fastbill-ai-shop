@@ -652,7 +652,7 @@ app.post("/api/products/identify-photo", async (req, res) => {
     const { imageBase64, shopType } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "Image required" });
 
-    const message = await anthropic.messages.create({
+    const message = await claudeClient.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 500,
       messages: [{

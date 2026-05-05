@@ -189,11 +189,10 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
     const { data, error } = await supabase
       .from("inventory")
       .select(
-        `
-        *,
-        designs(design_code, design_name, color),
-        tile_categories(category_name, base_price_per_box)
-      `
+        `*,
+        designs(design_code, design_name, color,
+          tile_categories(category_name, base_price_per_box)
+        )`
       )
       .eq("shop_id", req.params.shopId);
 
@@ -349,7 +348,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
         .order("created_at", { ascending: false }),
 
       supabase.from("inventory")
-        .select("quantity_boxes, is_low_stock, last_restocked_at, designs(design_name, design_code), tile_categories(category_name, base_price_per_box)")
+        .select("quantity_boxes, is_low_stock, last_restocked_at, designs(design_name, design_code, tile_categories(category_name, base_price_per_box))")
         .eq("shop_id", shopId),
 
       supabase.from("purchases")
@@ -394,7 +393,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
         totalProducts: inventory.length,
         lowStockItems: inventory.filter(i => i.is_low_stock).length,
         totalStockValue: inventory.reduce((s, i) => {
-          const price = i.tile_categories?.base_price_per_box || 0;
+          const price = i.designs?.tile_categories?.base_price_per_box || 0;
           return s + (i.quantity_boxes * price);
         }, 0),
         categories: [...new Set(inventory.map(i => i.tile_categories?.category_name).filter(Boolean))],

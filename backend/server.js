@@ -288,7 +288,17 @@ app.post("/api/invoices/generate", async (req, res) => {
 
     res.json({
       message: "✓ Invoice generated",
-      invoice: invoice[0],
+      invoice: {
+        ...invoice[0],
+        totalBoxes,
+        totalAmount,
+        items: items.map(i => ({
+          designId: i.designId,
+          quantityBoxes: i.quantityBoxes,
+          pricePerBox: i.pricePerBox,
+          lineTotal: (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0),
+        })),
+      },
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

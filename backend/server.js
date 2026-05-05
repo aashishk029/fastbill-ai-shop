@@ -183,6 +183,26 @@ app.get("/api/shops/:shopId", async (req, res) => {
   }
 });
 
+// Login by phone number
+app.get("/api/shops/login/:phone", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("shops")
+      .select("*")
+      .eq("phone", req.params.phone)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Koi shop nahi mila is number pe" });
+    }
+    res.json({ found: true, shop: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get Inventory Status
 app.get("/api/inventory/status/:shopId", async (req, res) => {
   try {

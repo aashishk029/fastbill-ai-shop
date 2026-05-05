@@ -4,6 +4,7 @@ import Dashboard from './components/Dashboard';
 import InvoiceForm from './components/InvoiceForm';
 import StockForm from './components/StockForm';
 import AlertsPanel from './components/AlertsPanel';
+import CreditScore from './components/CreditScore';
 import './App.css';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api';
@@ -70,7 +71,7 @@ function App() {
     try {
       setLoading(true);
       const response = await axios.post(`${API_BASE_URL}/shops/init`, shopDetails);
-      const newShopId = response.data.id;
+      const newShopId = response.data.shop?.id || response.data.id;
       localStorage.setItem('shopId', newShopId);
       setShopData(response.data);
       window.location.reload();
@@ -136,6 +137,9 @@ function App() {
         {currentView === 'alerts' && (
           <AlertsPanel alerts={alerts} loading={loading} />
         )}
+        {currentView === 'credit' && (
+          <CreditScore shopId={SHOP_ID} />
+        )}
       </div>
 
       <nav className="bottom-nav">
@@ -157,11 +161,17 @@ function App() {
         >
           📦 Add Stock
         </button>
-        <button 
+        <button
           className={`nav-button ${currentView === 'alerts' ? 'active' : ''}`}
           onClick={() => setCurrentView('alerts')}
         >
           🚨 Alerts
+        </button>
+        <button
+          className={`nav-button ${currentView === 'credit' ? 'active' : ''}`}
+          onClick={() => setCurrentView('credit')}
+        >
+          💳 Credit
         </button>
       </nav>
     </div>

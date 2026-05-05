@@ -282,7 +282,7 @@ app.get("/api/alerts/:shopId", async (req, res) => {
 
     // Generate alerts using Claude
     const alertsMessage = await claudeClient.messages.create({
-      model: "claude-3-5-sonnet-20241022",
+      model: "claude-sonnet-4-6",
       max_tokens: 500,
       messages: [
         {
@@ -321,6 +321,154 @@ app.listen(PORT, () => {
 ║  📝 Ready for testing!               ║
 ╚══════════════════════════════════════╝
   `);
+});
+
+// ============================================
+// CREDIT SCORE ENDPOINT (AI-Driven)
+// ============================================
+
+app.get("/api/credit-score/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+
+    const ninetyDaysAgo = new Date();
+    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+
+    // Gather ALL available local data in parallel
+    const [shopRes, invoicesRes, inventoryRes, purchasesRes] = await Promise.all([
+      supabase.from("shops").select("*").eq("id", shopId).single(),
+
+      supabase.from("invoices")
+        .select("invoice_number, customer_name, total_amount, total_boxes, created_at")
+        .eq("shop_id", shopId)
+        .gte("created_at", ninetyDaysAgo.toISOString())
+        .order("created_at", { ascending: false }),
+
+      supabase.from("inventory")
+        .select("quantity_boxes, is_low_stock, last_restocked_at, designs(design_name, design_code), tile_categories(category_name, base_price_per_box)")
+        .eq("shop_id", shopId),
+
+      supabase.from("purchases")
+        .select("quantity_boxes, supplier_name, cost_per_box, purchase_date")
+        .eq("shop_id", shopId)
+        .gte("purchase_date", ninetyDaysAgo.toISOString())
+        .order("purchase_date", { ascending: false }),
+    ]);
+
+    const shop = shopRes.data;
+    const invoices = invoicesRes.data || [];
+    const inventory = inventoryRes.data || [];
+    const purchases = purchasesRes.data || [];
+
+    // Build monthly revenue summary for trend analysis
+    const monthlyRevenue = {};
+    invoices.forEach(inv => {
+      const month = inv.created_at?.slice(0, 7);
+      if (month) monthlyRevenue[month] = (monthlyRevenue[month] || 0) + (inv.total_amount || 0);
+    });
+
+    // Package all data for Claude
+    const shopProfile = {
+      name: shop?.name,
+      owner: shop?.owner_name,
+      address: shop?.address,
+      shopType: shop?.shop_type,
+      dataAvailable: {
+        invoiceCount: invoices.length,
+        inventoryItems: inventory.length,
+        purchaseOrders: purchases.length,
+        dataPeriodDays: 90,
+      },
+      invoiceSummary: {
+        total: invoices.length,
+        totalRevenue: invoices.reduce((s, i) => s + (i.total_amount || 0), 0),
+        uniqueCustomers: new Set(invoices.map(i => i.customer_name)).size,
+        monthlyRevenueTrend: monthlyRevenue,
+        recentInvoices: invoices.slice(0, 5),
+      },
+      inventorySummary: {
+        totalProducts: inventory.length,
+        lowStockItems: inventory.filter(i => i.is_low_stock).length,
+        totalStockValue: inventory.reduce((s, i) => {
+          const price = i.tile_categories?.base_price_per_box || 0;
+          return s + (i.quantity_boxes * price);
+        }, 0),
+        categories: [...new Set(inventory.map(i => i.tile_categories?.category_name).filter(Boolean))],
+      },
+      purchaseSummary: {
+        totalOrders: purchases.length,
+        totalInvested: purchases.reduce((s, p) => s + ((p.cost_per_box || 0) * (p.quantity_boxes || 0)), 0),
+        suppliers: [...new Set(purchases.map(p => p.supplier_name).filter(Boolean))],
+        recentPurchases: purchases.slice(0, 3),
+      },
+    };
+
+    // Claude analyzes ALL data and scores intelligently
+    const claudeResp = await claudeClient.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 600,
+      messages: [{
+        role: "user",
+        content: `You are a credit scoring AI for Indian SMBs. Analyze this tile shop's business data and generate a credit score.
+
+SHOP DATA (last 90 days):
+${JSON.stringify(shopProfile, null, 2)}
+
+INSTRUCTIONS:
+- Score 300-900 (like CIBIL). Only use data that is actually available. If data is missing, note it but don't penalize heavily.
+- Consider: sales activity, revenue consistency/trend, inventory management, purchase regularity, business scale.
+- Return ONLY valid JSON (no extra text):
+
+{
+  "score": <number 300-900>,
+  "rating": "<Excellent|Good|Fair|Poor>",
+  "scoreBreakdown": {
+    "salesActivity": "<Strong|Good|Fair|Weak> - <one line reason>",
+    "revenueHealth": "<Strong|Good|Fair|Weak> - <one line reason>",
+    "inventoryManagement": "<Strong|Good|Fair|Weak> - <one line reason>",
+    "purchaseConsistency": "<Strong|Good|Fair|Weak> - <one line reason>"
+  },
+  "dataQuality": "<how much data was available to score - one line>",
+  "adviceHindi": "<2-3 simple Hindi lines: score ka matlab aur improvement tips>"
+}`
+      }]
+    });
+
+    // Parse Claude's structured response
+    let aiResult;
+    try {
+      const rawText = claudeResp.content[0].text;
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      aiResult = JSON.parse(jsonMatch[0]);
+    } catch {
+      aiResult = {
+        score: 500,
+        rating: "Fair",
+        scoreBreakdown: {},
+        dataQuality: "Partial data available",
+        adviceHindi: "Score calculate karne mein thodi takleef hui. Dobara try karein."
+      };
+    }
+
+    res.json({
+      score: aiResult.score,
+      rating: aiResult.rating,
+      scoreBreakdown: aiResult.scoreBreakdown,
+      dataQuality: aiResult.dataQuality,
+      adviceHindi: aiResult.adviceHindi,
+      rawStats: {
+        invoicesLast90Days: invoices.length,
+        totalRevenue90Days: shopProfile.invoiceSummary.totalRevenue,
+        inventoryItems: inventory.length,
+        lowStockItems: shopProfile.inventorySummary.lowStockItems,
+        purchaseOrders90Days: purchases.length,
+        uniqueCustomers: shopProfile.invoiceSummary.uniqueCustomers,
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 module.exports = app;

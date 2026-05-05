@@ -255,41 +255,31 @@ app.post("/api/invoices/generate", async (req, res) => {
   try {
     const { shopId, customerName, items } = req.body;
 
-    // Calculate totals
-    let totalSqft = 0;
-    let totalBoxes = 0;
-    let totalAmount = 0;
+    // Calculate totals from items
+    const totalBoxes = items.reduce((s, i) => s + (parseInt(i.quantityBoxes) || 0), 0);
+    const totalAmount = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
 
     // Insert invoice
     const { data: invoice, error: invoiceError } = await supabase
       .from("invoices")
-      .insert([
-        {
-          shop_id: shopId,
-          invoice_number: `INV-${Date.now()}`,
-          customer_name: customerName,
-          total_sqft: totalSqft,
-          total_boxes: totalBoxes,
-          total_amount: totalAmount,
-        },
-      ])
+      .insert([{
+        shop_id: shopId,
+        invoice_number: `INV-${Date.now()}`,
+        customer_name: customerName,
+      }])
       .select();
 
     if (invoiceError) throw invoiceError;
 
     // Insert items and update inventory
     for (const item of items) {
-      // Insert invoice item
-      await supabase.from("invoice_items").insert([
-        {
-          invoice_id: invoice[0].id,
-          design_id: item.designId,
-          quantity_boxes: item.quantityBoxes,
-          price_per_box: item.pricePerBox,
-        },
-      ]);
+      await supabase.from("invoice_items").insert([{
+        invoice_id: invoice[0].id,
+        design_id: item.designId,
+        quantity_boxes: item.quantityBoxes,
+        price_per_box: item.pricePerBox,
+      }]);
 
-      // Update inventory
       await supabase.rpc("update_inventory_after_invoice", {
         design_id: item.designId,
         quantity: item.quantityBoxes,
@@ -380,7 +370,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
       supabase.from("shops").select("*").eq("id", shopId).single(),
 
       supabase.from("invoices")
-        .select("invoice_number, customer_name, total_amount, total_boxes, created_at")
+        .select("invoice_number, customer_name, created_at")
         .eq("shop_id", shopId)
         .gte("created_at", ninetyDaysAgo.toISOString())
         .order("created_at", { ascending: false }),
@@ -405,7 +395,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
     const monthlyRevenue = {};
     invoices.forEach(inv => {
       const month = inv.created_at?.slice(0, 7);
-      if (month) monthlyRevenue[month] = (monthlyRevenue[month] || 0) + (inv.total_amount || 0);
+      if (month) monthlyRevenue[month] = (monthlyRevenue[month] || 0) + 1;
     });
 
     // Package all data for Claude
@@ -422,7 +412,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
       },
       invoiceSummary: {
         total: invoices.length,
-        totalRevenue: invoices.reduce((s, i) => s + (i.total_amount || 0), 0),
+        totalRevenue: invoices.length,
         uniqueCustomers: new Set(invoices.map(i => i.customer_name)).size,
         monthlyRevenueTrend: monthlyRevenue,
         recentInvoices: invoices.slice(0, 5),

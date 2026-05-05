@@ -9,8 +9,12 @@ import './App.css';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api';
 
+// Extended timeout for Render free tier cold start (90 sec)
+const api = axios.create({ baseURL: API_BASE_URL, timeout: 90000 });
+
 function App() {
   const [currentView, setCurrentView] = useState('dashboard');
+  const [serverWaking, setServerWaking] = useState(false);
   const [shopData, setShopData] = useState(null);
   const [inventoryStatus, setInventoryStatus] = useState(null);
   const [alerts, setAlerts] = useState([]);
@@ -19,6 +23,18 @@ function App() {
 
   // Hardcoded shop ID for Kanhaiya Marbles (will be set after first init)
   const SHOP_ID = localStorage.getItem('shopId');
+
+  useEffect(() => {
+    // Ping backend to wake Render free tier
+    const wakeServer = async () => {
+      try {
+        setServerWaking(true);
+        await api.get('/health');
+      } catch (e) {}
+      finally { setServerWaking(false); }
+    };
+    wakeServer();
+  }, []);
 
   useEffect(() => {
     if (SHOP_ID) {
@@ -36,7 +52,7 @@ function App() {
 
   const fetchShopData = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/shops/${SHOP_ID}`);
+      const response = await api.get(`/shops/${SHOP_ID}`);
       setShopData(response.data);
     } catch (err) {
       setError('Failed to fetch shop data');
@@ -47,7 +63,7 @@ function App() {
   const fetchInventoryStatus = async () => {
     try {
       setLoading(true);
-      const response = await axios.get(`${API_BASE_URL}/inventory/status/${SHOP_ID}`);
+      const response = await api.get(`/inventory/status/${SHOP_ID}`);
       setInventoryStatus(response.data);
       setError(null);
     } catch (err) {
@@ -60,7 +76,7 @@ function App() {
 
   const fetchAlerts = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/alerts/${SHOP_ID}`);
+      const response = await api.get(`/alerts/${SHOP_ID}`);
       setAlerts(response.data);
     } catch (err) {
       console.error('Failed to fetch alerts:', err);
@@ -70,7 +86,7 @@ function App() {
   const handleInitializeShop = async (shopDetails) => {
     try {
       setLoading(true);
-      const response = await axios.post(`${API_BASE_URL}/shops/init`, shopDetails);
+      const response = await api.post(`/shops/init`, shopDetails);
       const newShopId = response.data.shop?.id || response.data.id;
       localStorage.setItem('shopId', newShopId);
       setShopData(response.data);
@@ -89,6 +105,11 @@ function App() {
         <div className="init-screen">
           <h1>⚡ FastBill</h1>
           <p>AI-Powered Shop Management Platform</p>
+          {serverWaking && (
+            <div style={{background:'#fef3c7', padding:'10px', borderRadius:'8px', marginBottom:'12px', fontSize:'13px', color:'#92400e'}}>
+              ⏳ Server start ho raha hai... 30-50 sec wait karo
+            </div>
+          )}
           <InitializeShop onSubmit={handleInitializeShop} />
         </div>
       </div>

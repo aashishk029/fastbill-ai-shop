@@ -263,7 +263,8 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // Generate Invoice
 app.post("/api/invoices/generate", async (req, res) => {
   try {
-    const { shopId, customerName, customerPhone, customerAddress, customerGstin, gstRate, items } = req.body;
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin, gstRate, gstMode, items } = req.body;
+    const mode = gstMode || 'included'; // 'included' | 'exclusive'
 
     // Fetch HSN codes for each design from DB
     const designIds = items.map(i => i.designId).filter(Boolean);
@@ -275,13 +276,29 @@ app.post("/api/invoices/generate", async (req, res) => {
     (designsData || []).forEach(d => { designMap[d.id] = d; });
 
     const totalBoxes = items.reduce((s, i) => s + (parseInt(i.quantityBoxes) || 0), 0);
-    const grossAmount = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
+    const itemsTotal = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
 
-    // GST calculation
+    // GST calculation based on mode
     const rate = parseFloat(gstRate) || 0;
     const isGstInvoice = !!customerGstin && rate > 0;
-    const taxableValue = isGstInvoice ? grossAmount / (1 + rate / 100) : grossAmount;
-    const gstAmount = isGstInvoice ? grossAmount - taxableValue : 0;
+    let taxableValue, gstAmount, grossAmount;
+    if (isGstInvoice) {
+      if (mode === 'included') {
+        // Price includes GST — reverse extract
+        taxableValue = itemsTotal / (1 + rate / 100);
+        gstAmount = itemsTotal - taxableValue;
+        grossAmount = itemsTotal; // total paid = items total (unchanged)
+      } else {
+        // GST added on top of base price
+        taxableValue = itemsTotal;
+        gstAmount = itemsTotal * rate / 100;
+        grossAmount = itemsTotal + gstAmount; // total paid = base + GST
+      }
+    } else {
+      taxableValue = itemsTotal;
+      gstAmount = 0;
+      grossAmount = itemsTotal;
+    }
     const cgst = gstAmount / 2;
     const sgst = gstAmount / 2;
     const invoiceType = customerGstin ? 'B2B' : 'B2C';
@@ -332,13 +349,16 @@ app.post("/api/invoices/generate", async (req, res) => {
       invoice: {
         ...invoice[0],
         totalBoxes,
+        itemsTotal: Math.round(itemsTotal),
         grossAmount: Math.round(grossAmount),
+        finalTotal: Math.round(grossAmount),
         taxableValue: Math.round(taxableValue),
         cgst: Math.round(cgst * 100) / 100,
         sgst: Math.round(sgst * 100) / 100,
         gstAmount: Math.round(gstAmount * 100) / 100,
         isGstInvoice,
         gstRate: rate,
+        gstMode: mode,
         items: items.map(i => {
           const design = designMap[i.designId] || {};
           return {

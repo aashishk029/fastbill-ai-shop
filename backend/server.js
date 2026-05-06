@@ -140,7 +140,7 @@ app.get("/api/health", (req, res) => {
 // Initialize Shop
 app.post("/api/shops/init", async (req, res) => {
   try {
-    const { shopName, ownerName, phone, address, shopType, pin } = req.body;
+    const { shopName, ownerName, phone, address, shopType, pin, gstin, pan } = req.body;
 
     if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
       return res.status(400).json({ error: "4 digit PIN zaroori hai" });
@@ -155,9 +155,19 @@ app.post("/api/shops/init", async (req, res) => {
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
+    // Generate unique display ID: FB-YYYY-XXXXX
+    const { count } = await supabase.from("shops").select("*", { count: "exact", head: true });
+    const shopIdDisplay = `FB-${new Date().getFullYear()}-${String((count || 0) + 1).padStart(5, "0")}`;
+
     const { data: shop, error } = await supabase
       .from("shops")
-      .insert([{ name: shopName, owner_name: ownerName, phone, address, shop_type: shopType, pin_hash }])
+      .insert([{
+        name: shopName, owner_name: ownerName, phone, address,
+        shop_type: shopType, pin_hash,
+        gstin: gstin?.toUpperCase() || null,
+        pan_number: pan?.toUpperCase() || null,
+        shop_id_display: shopIdDisplay,
+      }])
       .select();
 
     if (error) throw error;

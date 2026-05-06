@@ -690,3 +690,97 @@ Analyze this product image and return ONLY a JSON object (no markdown, no explan
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================
+// TAX SUMMARY (GST + ITR)
+// ============================================
+
+app.get("/api/tax/summary/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { year } = req.query; // e.g. 2025 for FY 2025-26
+    const fy = parseInt(year) || new Date().getFullYear();
+    const fyStart = new Date(`${fy}-04-01`).toISOString();
+    const fyEnd = new Date(`${fy + 1}-03-31T23:59:59`).toISOString();
+
+    const [invoicesRes, itemsRes, purchasesRes, shopRes] = await Promise.allSettled([
+      supabase.from("invoices")
+        .select("id, invoice_number, customer_name, invoice_date, created_at")
+        .eq("shop_id", shopId)
+        .gte("created_at", fyStart)
+        .lte("created_at", fyEnd)
+        .order("created_at", { ascending: true }),
+
+      supabase.from("invoice_items")
+        .select("invoice_id, quantity_boxes, price_per_box, invoices!inner(shop_id, created_at)")
+        .eq("invoices.shop_id", shopId)
+        .gte("invoices.created_at", fyStart)
+        .lte("invoices.created_at", fyEnd),
+
+      supabase.from("purchases")
+        .select("quantity_boxes, cost_per_box, purchase_date, supplier_name")
+        .eq("shop_id", shopId)
+        .gte("purchase_date", fyStart)
+        .lte("purchase_date", fyEnd),
+
+      supabase.from("shops").select("*").eq("id", shopId).single(),
+    ]);
+
+    const invoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
+    const items = itemsRes.status === "fulfilled" ? itemsRes.value.data || [] : [];
+    const purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
+    const shop = shopRes.status === "fulfilled" ? shopRes.value.data : {};
+
+    // Calculate totals
+    const grossSales = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+    const gstRate = 0.18; // 18% GST (12% for most tiles/building material)
+    const taxableValue = grossSales / (1 + gstRate);
+    const gstCollected = grossSales - taxableValue;
+    const cgst = gstCollected / 2;
+    const sgst = gstCollected / 2;
+
+    const totalPurchaseCost = purchases.reduce((s, p) => s + ((p.quantity_boxes || 0) * (p.cost_per_box || 0)), 0);
+    const gstPaid = totalPurchaseCost * gstRate;
+    const itcAvailable = gstPaid; // Input Tax Credit
+    const netGstPayable = Math.max(0, gstCollected - itcAvailable);
+
+    // Monthly breakdown for GSTR-1
+    const monthlyBreakdown = {};
+    invoices.forEach(inv => {
+      const month = (inv.created_at || inv.invoice_date || "").slice(0, 7);
+      if (!month) return;
+      if (!monthlyBreakdown[month]) monthlyBreakdown[month] = { invoiceCount: 0, taxableValue: 0, cgst: 0, sgst: 0 };
+      monthlyBreakdown[month].invoiceCount += 1;
+    });
+
+    // P&L for ITR
+    const netProfit = taxableValue - totalPurchaseCost;
+
+    res.json({
+      shop: { name: shop?.name, owner: shop?.owner_name, phone: shop?.phone, gstin: shop?.gstin || null },
+      fy: `${fy}-${fy + 1}`,
+      gst: {
+        grossSales: Math.round(grossSales),
+        taxableValue: Math.round(taxableValue),
+        cgst: Math.round(cgst),
+        sgst: Math.round(sgst),
+        totalGstCollected: Math.round(gstCollected),
+        gstPaidOnPurchases: Math.round(gstPaid),
+        itcAvailable: Math.round(itcAvailable),
+        netGstPayable: Math.round(netGstPayable),
+        totalInvoices: invoices.length,
+        monthlyBreakdown,
+      },
+      pnl: {
+        grossIncome: Math.round(grossSales),
+        taxableIncome: Math.round(taxableValue),
+        purchaseExpenses: Math.round(totalPurchaseCost),
+        grossProfit: Math.round(netProfit),
+        presumptiveTaxableIncome: Math.round(taxableValue * 0.08), // 8% of turnover under ITR-4 44AD
+      },
+      itrNote: "ITR-4 (44AD): Agar turnover ₹3Cr se kam hai to 8% ko taxable income maan sakte ho.",
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});

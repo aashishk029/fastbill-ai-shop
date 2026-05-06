@@ -263,7 +263,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // Generate Invoice
 app.post("/api/invoices/generate", async (req, res) => {
   try {
-    const { shopId, customerName, customerPhone, customerAddress, customerGstin, gstRate, gstMode, items } = req.body;
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstRate, gstMode, items } = req.body;
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
 
     // Fetch HSN codes for each design from DB
@@ -280,7 +280,7 @@ app.post("/api/invoices/generate", async (req, res) => {
 
     // GST calculation based on mode
     const rate = parseFloat(gstRate) || 0;
-    const isGstInvoice = !!customerGstin && rate > 0;
+    const isGstInvoice = (showGst === true || showGst === 'true') && rate > 0;
     let taxableValue, gstAmount, grossAmount;
     if (isGstInvoice) {
       if (mode === 'included') {
@@ -301,7 +301,7 @@ app.post("/api/invoices/generate", async (req, res) => {
     }
     const cgst = gstAmount / 2;
     const sgst = gstAmount / 2;
-    const invoiceType = customerGstin ? 'B2B' : 'B2C';
+    const invoiceType = (customerGstin && customerGstin.length === 15) ? 'B2B' : 'B2C';
 
     // Insert invoice
     const { data: invoice, error: invoiceError } = await supabase

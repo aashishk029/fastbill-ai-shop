@@ -817,3 +817,46 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Invoice History with filters
+app.get("/api/invoices/history/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { customer, month, date } = req.query; // month=2026-05, date=2026-05-06
+
+    let query = supabase
+      .from("invoices")
+      .select(`*, invoice_items(quantity_boxes, price_per_box, design_id, designs(design_code, design_name))`)
+      .eq("shop_id", shopId)
+      .order("created_at", { ascending: false })
+      .limit(100);
+
+    if (customer) query = query.ilike("customer_name", `%${customer}%`);
+    if (month) {
+      query = query
+        .gte("created_at", `${month}-01T00:00:00`)
+        .lte("created_at", `${month}-31T23:59:59`);
+    }
+    if (date) {
+      query = query
+        .gte("created_at", `${date}T00:00:00`)
+        .lte("created_at", `${date}T23:59:59`);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Compute totals from items
+    const invoices = (data || []).map(inv => {
+      const gross = (inv.invoice_items || []).reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+      const boxes = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes || 0), 0);
+      return { ...inv, grossAmount: Math.round(gross), totalBoxes: boxes };
+    });
+
+    const monthlyTotal = invoices.reduce((s, i) => s + i.grossAmount, 0);
+
+    res.json({ invoices, count: invoices.length, monthlyTotal });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});

@@ -238,7 +238,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
       .from("inventory")
       .select(
         `*,
-        designs(design_code, design_name, color,
+        designs(design_code, design_name, color, hsn_code, default_gst_rate,
           tile_categories(category_name, base_price_per_box)
         )`
       )
@@ -264,6 +264,15 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 app.post("/api/invoices/generate", async (req, res) => {
   try {
     const { shopId, customerName, customerPhone, customerAddress, customerGstin, gstRate, items } = req.body;
+
+    // Fetch HSN codes for each design from DB
+    const designIds = items.map(i => i.designId).filter(Boolean);
+    const { data: designsData } = await supabase
+      .from("designs")
+      .select("id, hsn_code, default_gst_rate, design_code, design_name")
+      .in("id", designIds);
+    const designMap = {};
+    (designsData || []).forEach(d => { designMap[d.id] = d; });
 
     const totalBoxes = items.reduce((s, i) => s + (parseInt(i.quantityBoxes) || 0), 0);
     const grossAmount = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
@@ -297,13 +306,19 @@ app.post("/api/invoices/generate", async (req, res) => {
 
     if (invoiceError) throw invoiceError;
 
-    // Insert items and update inventory
+    // Insert items with HSN code, update inventory
     for (const item of items) {
+      const design = designMap[item.designId] || {};
+      const itemHsn = item.hsnCode || design.hsn_code || null;
+      const itemGstRate = item.gstRate || design.default_gst_rate || rate || null;
+
       await supabase.from("invoice_items").insert([{
         invoice_id: invoice[0].id,
         design_id: item.designId,
         quantity_boxes: item.quantityBoxes,
         price_per_box: item.pricePerBox,
+        hsn_code: itemHsn,
+        gst_rate: itemGstRate,
       }]);
 
       await supabase.rpc("update_inventory_after_invoice", {
@@ -324,13 +339,17 @@ app.post("/api/invoices/generate", async (req, res) => {
         gstAmount: Math.round(gstAmount * 100) / 100,
         isGstInvoice,
         gstRate: rate,
-        totalAmount,
-        items: items.map(i => ({
-          designId: i.designId,
-          quantityBoxes: i.quantityBoxes,
-          pricePerBox: i.pricePerBox,
-          lineTotal: (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0),
-        })),
+        items: items.map(i => {
+          const design = designMap[i.designId] || {};
+          return {
+            designId: i.designId,
+            quantityBoxes: i.quantityBoxes,
+            pricePerBox: i.pricePerBox,
+            hsnCode: i.hsnCode || design.hsn_code || null,
+            gstRate: i.gstRate || design.default_gst_rate || rate || null,
+            lineTotal: (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0),
+          };
+        }),
       },
     });
   } catch (error) {
@@ -612,7 +631,7 @@ app.post("/api/purchases/add", async (req, res) => {
 // Add New Product/Design
 app.post("/api/designs/add", async (req, res) => {
   try {
-    const { shopId, designCode, designName, color, categoryName, sizeMm, coverageSqft, pricePerBox, initialQuantity } = req.body;
+    const { shopId, designCode, designName, color, categoryName, sizeMm, coverageSqft, pricePerBox, initialQuantity, hsnCode, defaultGstRate } = req.body;
 
     if (!shopId || !designName || !categoryName) {
       return res.status(400).json({ error: "shopId, designName, categoryName zaroori hai" });
@@ -656,6 +675,8 @@ app.post("/api/designs/add", async (req, res) => {
         design_code: code,
         design_name: designName,
         color: color || "",
+        hsn_code: hsnCode || null,
+        default_gst_rate: parseFloat(defaultGstRate) || 18,
       }])
       .select()
       .single();
@@ -826,7 +847,7 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
 
     let query = supabase
       .from("invoices")
-      .select(`*, invoice_items(quantity_boxes, price_per_box, design_id, designs(design_code, design_name))`)
+      .select(`*, invoice_items(quantity_boxes, price_per_box, design_id, hsn_code, gst_rate, designs(design_code, design_name, hsn_code, default_gst_rate))`)
       .eq("shop_id", shopId)
       .order("created_at", { ascending: false })
       .limit(100);

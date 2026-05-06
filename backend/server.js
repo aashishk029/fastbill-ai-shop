@@ -263,11 +263,19 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // Generate Invoice
 app.post("/api/invoices/generate", async (req, res) => {
   try {
-    const { shopId, customerName, items } = req.body;
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin, gstRate, items } = req.body;
 
-    // Calculate totals from items
     const totalBoxes = items.reduce((s, i) => s + (parseInt(i.quantityBoxes) || 0), 0);
-    const totalAmount = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
+    const grossAmount = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
+
+    // GST calculation
+    const rate = parseFloat(gstRate) || 0;
+    const isGstInvoice = !!customerGstin && rate > 0;
+    const taxableValue = isGstInvoice ? grossAmount / (1 + rate / 100) : grossAmount;
+    const gstAmount = isGstInvoice ? grossAmount - taxableValue : 0;
+    const cgst = gstAmount / 2;
+    const sgst = gstAmount / 2;
+    const invoiceType = customerGstin ? 'B2B' : 'B2C';
 
     // Insert invoice
     const { data: invoice, error: invoiceError } = await supabase
@@ -276,6 +284,14 @@ app.post("/api/invoices/generate", async (req, res) => {
         shop_id: shopId,
         invoice_number: `INV-${Date.now()}`,
         customer_name: customerName,
+        customer_phone: customerPhone || null,
+        customer_address: customerAddress || null,
+        customer_gstin: customerGstin?.toUpperCase() || null,
+        invoice_type: invoiceType,
+        taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
+        cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
+        sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
+        gst_rate: rate || null,
       }])
       .select();
 
@@ -301,6 +317,13 @@ app.post("/api/invoices/generate", async (req, res) => {
       invoice: {
         ...invoice[0],
         totalBoxes,
+        grossAmount: Math.round(grossAmount),
+        taxableValue: Math.round(taxableValue),
+        cgst: Math.round(cgst * 100) / 100,
+        sgst: Math.round(sgst * 100) / 100,
+        gstAmount: Math.round(gstAmount * 100) / 100,
+        isGstInvoice,
+        gstRate: rate,
         totalAmount,
         items: items.map(i => ({
           designId: i.designId,

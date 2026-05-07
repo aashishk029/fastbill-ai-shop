@@ -853,8 +853,9 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const { shopId } = req.params;
     const { year } = req.query; // e.g. 2025 for FY 2025-26
     const fy = parseInt(year) || new Date().getFullYear();
-    const fyStart = new Date(`${fy}-04-01`).toISOString();
-    const fyEnd = new Date(`${fy + 1}-03-31T23:59:59`).toISOString();
+    // IST = UTC+5:30 — use explicit IST midnight to avoid boundary errors
+    const fyStart = `${fy}-04-01T00:00:00+05:30`;
+    const fyEnd   = `${fy + 1}-03-31T23:59:59+05:30`;
 
     const [invoicesRes, purchasesRes, shopRes] = await Promise.allSettled([
       supabase.from("invoices")
@@ -898,8 +899,19 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     invoices.forEach(inv => {
       const month = (inv.created_at || inv.invoice_date || "").slice(0, 7);
       if (!month) return;
-      if (!monthlyBreakdown[month]) monthlyBreakdown[month] = { invoiceCount: 0, taxableValue: 0, cgst: 0, sgst: 0 };
+      if (!monthlyBreakdown[month]) monthlyBreakdown[month] = { invoiceCount: 0, taxableValue: 0, cgst: 0, sgst: 0, grossSales: 0 };
       monthlyBreakdown[month].invoiceCount += 1;
+      monthlyBreakdown[month].taxableValue += inv.taxable_value || 0;
+      monthlyBreakdown[month].cgst += inv.cgst_amount || 0;
+      monthlyBreakdown[month].sgst += inv.sgst_amount || 0;
+      const invGross = (inv.invoice_items || []).reduce((t, i) => t + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+      monthlyBreakdown[month].grossSales += invGross;
+    });
+    Object.keys(monthlyBreakdown).forEach(m => {
+      monthlyBreakdown[m].taxableValue = Math.round(monthlyBreakdown[m].taxableValue);
+      monthlyBreakdown[m].cgst = Math.round(monthlyBreakdown[m].cgst);
+      monthlyBreakdown[m].sgst = Math.round(monthlyBreakdown[m].sgst);
+      monthlyBreakdown[m].grossSales = Math.round(monthlyBreakdown[m].grossSales);
     });
 
     // P&L for ITR

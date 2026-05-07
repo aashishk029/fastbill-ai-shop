@@ -856,19 +856,13 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const fyStart = new Date(`${fy}-04-01`).toISOString();
     const fyEnd = new Date(`${fy + 1}-03-31T23:59:59`).toISOString();
 
-    const [invoicesRes, itemsRes, purchasesRes, shopRes] = await Promise.allSettled([
+    const [invoicesRes, purchasesRes, shopRes] = await Promise.allSettled([
       supabase.from("invoices")
-        .select("id, invoice_number, customer_name, invoice_date, created_at")
+        .select("id, invoice_number, customer_name, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate, invoice_items(quantity_boxes, price_per_box)")
         .eq("shop_id", shopId)
         .gte("created_at", fyStart)
         .lte("created_at", fyEnd)
         .order("created_at", { ascending: true }),
-
-      supabase.from("invoice_items")
-        .select("invoice_id, quantity_boxes, price_per_box, invoices!inner(shop_id, created_at)")
-        .eq("invoices.shop_id", shopId)
-        .gte("invoices.created_at", fyStart)
-        .lte("invoices.created_at", fyEnd),
 
       supabase.from("purchases")
         .select("quantity_boxes, cost_per_box, purchase_date, supplier_name")
@@ -880,21 +874,23 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     ]);
 
     const invoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
-    const items = itemsRes.status === "fulfilled" ? itemsRes.value.data || [] : [];
     const purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
     const shop = shopRes.status === "fulfilled" ? shopRes.value.data : {};
 
-    // Calculate totals
-    const grossSales = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
-    const gstRate = 0.18; // 18% GST (12% for most tiles/building material)
-    const taxableValue = grossSales / (1 + gstRate);
-    const gstCollected = grossSales - taxableValue;
-    const cgst = gstCollected / 2;
-    const sgst = gstCollected / 2;
+    // Gross sales from actual invoice items (shop-filtered via shop_id on invoices)
+    const grossSales = invoices.reduce((s, inv) => {
+      const invTotal = (inv.invoice_items || []).reduce((t, i) => t + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+      return s + invTotal;
+    }, 0);
+
+    // GST from actual stored values (null for non-GST invoices → 0)
+    const taxableValue = invoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
+    const cgst = invoices.reduce((s, inv) => s + (inv.cgst_amount || 0), 0);
+    const sgst = invoices.reduce((s, inv) => s + (inv.sgst_amount || 0), 0);
+    const gstCollected = cgst + sgst;
 
     const totalPurchaseCost = purchases.reduce((s, p) => s + ((p.quantity_boxes || 0) * (p.cost_per_box || 0)), 0);
-    const gstPaid = totalPurchaseCost * gstRate;
-    const itcAvailable = gstPaid; // Input Tax Credit
+    const itcAvailable = 0; // ITC requires purchase GST invoices — not tracked yet
     const netGstPayable = Math.max(0, gstCollected - itcAvailable);
 
     // Monthly breakdown for GSTR-1
@@ -918,7 +914,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         cgst: Math.round(cgst),
         sgst: Math.round(sgst),
         totalGstCollected: Math.round(gstCollected),
-        gstPaidOnPurchases: Math.round(gstPaid),
+        gstPaidOnPurchases: 0,
         itcAvailable: Math.round(itcAvailable),
         netGstPayable: Math.round(netGstPayable),
         totalInvoices: invoices.length,

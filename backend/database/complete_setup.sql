@@ -112,6 +112,17 @@ CREATE INDEX IF NOT EXISTS idx_alerts_shop ON alerts(shop_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_shop ON invoices(shop_id);
 CREATE INDEX IF NOT EXISTS idx_purchases_shop ON purchases(shop_id);
 
+-- RPC FUNCTION: increment inventory on purchase
+CREATE OR REPLACE FUNCTION increment_inventory(p_design_id UUID, p_quantity INTEGER)
+RETURNS void AS $$
+BEGIN
+  UPDATE inventory
+  SET quantity_boxes = quantity_boxes + p_quantity,
+      updated_at = NOW()
+  WHERE inventory.design_id = increment_inventory.p_design_id;
+END;
+$$ LANGUAGE plpgsql;
+
 -- RPC FUNCTION: deduct inventory on invoice
 CREATE OR REPLACE FUNCTION update_inventory_after_invoice(design_id UUID, quantity INTEGER)
 RETURNS void AS $$

@@ -377,6 +377,85 @@ app.post("/api/invoices/generate", async (req, res) => {
   }
 });
 
+// AI-Powered Scan-to-Stock (Purchase Entry)
+app.post("/api/inventory/scan-purchase", async (req, res) => {
+  try {
+    const { imageBase64 } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "No image data provided" });
+
+    const response = await claudeClient.messages.create({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `You are an expert in Indian tile and marble purchase bills. 
+              Extract all items from this purchase bill. 
+              For each item, find:
+              1. Design Code or Design Name (e.g., WL-001, Marble White)
+              2. Quantity in Boxes (number only)
+              3. Rate per Box (if available, number only)
+
+              Return the data ONLY as a JSON array of objects like this:
+              [{"designCode": "WL-001", "quantity": 50, "rate": 260}]
+              
+              If you cannot find a specific field, leave it as null. Do not include any other text.`
+            },
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/jpeg",
+                data: imageBase64,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const extractedText = response.content[0].text;
+    const items = JSON.parse(extractedText.substring(extractedText.indexOf('['), extractedText.lastIndexOf(']') + 1));
+    
+    res.json({ items });
+  } catch (error) {
+    console.error("AI Scan Error:", error);
+    res.status(500).json({ error: "AI could not read the bill. Please try again or enter manually." });
+  }
+});
+
+app.post("/api/inventory/confirm-scan", async (req, res) => {
+  try {
+    const { shopId, items } = req.body; // items: [{ designId, quantity, rate }]
+
+    for (const item of items) {
+      if (!item.designId || !item.quantity) continue;
+
+      // Update inventory (Increment stock)
+      await supabase.rpc("increment_inventory", {
+        p_design_id: item.designId,
+        p_quantity: parseInt(item.quantity),
+      });
+
+      // Record as purchase for credit scoring/profit tracking
+      await supabase.from("purchases").insert([{
+        shop_id: shopId,
+        design_id: item.designId,
+        quantity_boxes: parseInt(item.quantity),
+        cost_per_box: parseFloat(item.rate) || 0,
+        purchase_date: new Date().toISOString(),
+      }]);
+    }
+
+    res.json({ message: "✓ Stock updated successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // AI-Powered Alerts
 app.get("/api/alerts/:shopId", async (req, res) => {
   try {
@@ -395,7 +474,7 @@ app.get("/api/alerts/:shopId", async (req, res) => {
 
     // Generate alerts using Claude
     const alertsMessage = await claudeClient.messages.create({
-      model: "claude-sonnet-4-6",
+      model: "claude-3-5-sonnet-20241022",
       max_tokens: 500,
       messages: [
         {
@@ -518,7 +597,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
 
     // Claude analyzes ALL data and scores intelligently
     const claudeResp = await claudeClient.messages.create({
-      model: "claude-sonnet-4-6",
+      model: "claude-3-5-sonnet-20241022",
       max_tokens: 600,
       messages: [{
         role: "user",
@@ -727,7 +806,7 @@ app.post("/api/products/identify-photo", async (req, res) => {
     if (!imageBase64) return res.status(400).json({ error: "Image required" });
 
     const message = await claudeClient.messages.create({
-      model: "claude-sonnet-4-6",
+      model: "claude-3-5-sonnet-20241022",
       max_tokens: 500,
       messages: [{
         role: "user",

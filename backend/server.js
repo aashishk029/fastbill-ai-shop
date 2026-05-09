@@ -246,13 +246,35 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 
     if (error) throw error;
 
-    // Separate low stock items
-    const lowStock = data.filter((item) => item.is_low_stock);
+    // Enrich with latest purchase (supplier + cost) per design — single batch query
+    const designIds = (data || []).map(d => d.design_id).filter(Boolean);
+    let latestPurchaseMap = {};
+    if (designIds.length > 0) {
+      const { data: purchasesData } = await supabase
+        .from('purchases')
+        .select('design_id, supplier_name, cost_per_box, purchase_date')
+        .eq('shop_id', req.params.shopId)
+        .in('design_id', designIds)
+        .order('purchase_date', { ascending: false });
+      (purchasesData || []).forEach(p => {
+        if (!latestPurchaseMap[p.design_id]) {
+          latestPurchaseMap[p.design_id] = { supplier: p.supplier_name, cost: p.cost_per_box };
+        }
+      });
+    }
+
+    const enrichedInventory = (data || []).map(item => ({
+      ...item,
+      last_supplier: latestPurchaseMap[item.design_id]?.supplier || null,
+      last_cost: latestPurchaseMap[item.design_id]?.cost || null,
+    }));
+
+    const lowStock = enrichedInventory.filter((item) => item.is_low_stock);
 
     res.json({
-      totalItems: data.length,
+      totalItems: enrichedInventory.length,
       lowStockCount: lowStock.length,
-      inventory: data,
+      inventory: enrichedInventory,
       lowStockItems: lowStock,
     });
   } catch (error) {
@@ -735,6 +757,31 @@ app.post("/api/purchases/add", async (req, res) => {
   }
 });
 
+// Get latest purchase rate + supplier for a design (auto-fill in stock form)
+app.get("/api/purchases/latest-rate/:shopId/:designId", async (req, res) => {
+  try {
+    const { shopId, designId } = req.params;
+    const { data, error } = await supabase
+      .from('purchases')
+      .select('cost_per_box, supplier_name, purchase_date')
+      .eq('shop_id', shopId)
+      .eq('design_id', designId)
+      .order('purchase_date', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error || !data) return res.json({ cost_per_box: null, supplier_name: null });
+
+    res.json({
+      cost_per_box: data.cost_per_box || null,
+      supplier_name: data.supplier_name || null,
+      last_purchased: data.purchase_date,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Add New Product/Design
 app.post("/api/designs/add", async (req, res) => {
   try {
@@ -866,8 +913,9 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const fyEnd   = `${fy + 1}-03-31T23:59:59+05:30`;
 
     const [invoicesRes, purchasesRes, shopRes] = await Promise.allSettled([
+      // No invoice_items join — use pre-stored aggregated values (O(n) not O(n*m))
       supabase.from("invoices")
-        .select("id, invoice_number, customer_name, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate, invoice_items(quantity_boxes, price_per_box)")
+        .select("id, invoice_number, customer_name, customer_gstin, invoice_type, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate")
         .eq("shop_id", shopId)
         .gte("created_at", fyStart)
         .lte("created_at", fyEnd)
@@ -886,10 +934,10 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
     const shop = shopRes.status === "fulfilled" ? shopRes.value.data : {};
 
-    // Gross sales from actual invoice items (shop-filtered via shop_id on invoices)
+    // Gross sales from stored taxable_value + gst (GST invoices only — non-GST invoices have null values)
     const grossSales = invoices.reduce((s, inv) => {
-      const invTotal = (inv.invoice_items || []).reduce((t, i) => t + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
-      return s + invTotal;
+      const invGross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      return s + invGross;
     }, 0);
 
     // GST from actual stored values (null for non-GST invoices → 0)
@@ -902,18 +950,23 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const itcAvailable = 0; // ITC requires purchase GST invoices — not tracked yet
     const netGstPayable = Math.max(0, gstCollected - itcAvailable);
 
-    // Monthly breakdown for GSTR-1
+    // B2B vs B2C split (for GSTR-1 filing)
+    const b2bInvoices = invoices.filter(inv => inv.invoice_type === 'B2B' || inv.customer_gstin);
+    const b2bTaxable = b2bInvoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
+    const b2bGst = b2bInvoices.reduce((s, inv) => s + (inv.cgst_amount || 0) + (inv.sgst_amount || 0), 0);
+
+    // Monthly breakdown for GSTR-1 — O(n) using stored values only
     const monthlyBreakdown = {};
     invoices.forEach(inv => {
       const month = (inv.created_at || inv.invoice_date || "").slice(0, 7);
       if (!month) return;
-      if (!monthlyBreakdown[month]) monthlyBreakdown[month] = { invoiceCount: 0, taxableValue: 0, cgst: 0, sgst: 0, grossSales: 0 };
+      if (!monthlyBreakdown[month]) monthlyBreakdown[month] = { invoiceCount: 0, taxableValue: 0, cgst: 0, sgst: 0, grossSales: 0, b2bCount: 0 };
       monthlyBreakdown[month].invoiceCount += 1;
       monthlyBreakdown[month].taxableValue += inv.taxable_value || 0;
       monthlyBreakdown[month].cgst += inv.cgst_amount || 0;
       monthlyBreakdown[month].sgst += inv.sgst_amount || 0;
-      const invGross = (inv.invoice_items || []).reduce((t, i) => t + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
-      monthlyBreakdown[month].grossSales += invGross;
+      monthlyBreakdown[month].grossSales += (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      if (inv.invoice_type === 'B2B' || inv.customer_gstin) monthlyBreakdown[month].b2bCount += 1;
     });
     Object.keys(monthlyBreakdown).forEach(m => {
       monthlyBreakdown[m].taxableValue = Math.round(monthlyBreakdown[m].taxableValue);
@@ -938,6 +991,9 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         itcAvailable: Math.round(itcAvailable),
         netGstPayable: Math.round(netGstPayable),
         totalInvoices: invoices.length,
+        b2bInvoices: b2bInvoices.length,
+        b2bTaxableValue: Math.round(b2bTaxable),
+        b2bGstCollected: Math.round(b2bGst),
         monthlyBreakdown,
       },
       pnl: {

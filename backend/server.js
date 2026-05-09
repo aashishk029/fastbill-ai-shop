@@ -384,7 +384,7 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
     if (!imageBase64) return res.status(400).json({ error: "No image data provided" });
 
     const response = await claudeClient.messages.create({
-      model: "claude-3-5-sonnet-20241022",
+      model: "claude-sonnet-4-6",
       max_tokens: 1000,
       messages: [
         {
@@ -392,17 +392,17 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
           content: [
             {
               type: "text",
-              text: `You are an expert in Indian tile and marble purchase bills. 
-              Extract all items from this purchase bill. 
-              For each item, find:
-              1. Design Code or Design Name (e.g., WL-001, Marble White)
-              2. Quantity in Boxes (number only)
-              3. Rate per Box (if available, number only)
+              text: `You are an expert at reading Indian purchase bills and invoices for any type of shop.
+              Extract all line items from this purchase bill image.
+              For each item find:
+              1. Product name or item code (e.g., "Chini 50kg", "WL-001", "Paracetamol 500mg")
+              2. Quantity as a number only
+              3. Rate or price per unit as a number only (if visible)
 
-              Return the data ONLY as a JSON array of objects like this:
-              [{"designCode": "WL-001", "quantity": 50, "rate": 260}]
-              
-              If you cannot find a specific field, leave it as null. Do not include any other text.`
+              Return ONLY a valid JSON array with no other text:
+              [{"designCode": "product name or code", "quantity": 50, "rate": 260}]
+
+              Use null for fields not visible. Return [] if no items found.`
             },
             {
               type: "image",

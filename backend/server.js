@@ -361,13 +361,25 @@ app.post("/api/invoices/generate", async (req, res) => {
         gstMode: mode,
         items: items.map(i => {
           const design = designMap[i.designId] || {};
+          const lineTotal = (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0);
+          const itemRate = parseFloat(i.gstRate || design.default_gst_rate || rate || 0);
+          const itemIsGst = isGstInvoice && itemRate > 0;
+          const itemTaxable = itemIsGst && mode === 'included' ? lineTotal / (1 + itemRate / 100) : lineTotal;
+          const itemGst = itemIsGst ? (mode === 'included' ? lineTotal - itemTaxable : lineTotal * itemRate / 100) : 0;
+          const itemTotal = mode === 'exclusive' && itemIsGst ? lineTotal + itemGst : lineTotal;
           return {
             designId: i.designId,
+            designCode: design.design_code || null,
+            designName: design.design_name || null,
             quantityBoxes: i.quantityBoxes,
             pricePerBox: i.pricePerBox,
             hsnCode: i.hsnCode || design.hsn_code || null,
-            gstRate: i.gstRate || design.default_gst_rate || rate || null,
-            lineTotal: (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0),
+            gstRate: itemRate,
+            lineTotal: Math.round(lineTotal * 100) / 100,
+            taxableValue: Math.round(itemTaxable * 100) / 100,
+            cgstAmount: Math.round(itemGst / 2 * 100) / 100,
+            sgstAmount: Math.round(itemGst / 2 * 100) / 100,
+            totalWithGst: Math.round(itemTotal * 100) / 100,
           };
         }),
       },

@@ -292,7 +292,7 @@ app.post("/api/invoices/generate", async (req, res) => {
     const designIds = items.map(i => i.designId).filter(Boolean);
     const { data: designsData } = await supabase
       .from("designs")
-      .select("id, hsn_code, default_gst_rate, design_code, design_name")
+      .select("id, hsn_code, default_gst_rate, design_code, design_name, unit_type")
       .in("id", designIds);
     const designMap = {};
     (designsData || []).forEach(d => { designMap[d.id] = d; });
@@ -336,8 +336,10 @@ app.post("/api/invoices/generate", async (req, res) => {
         cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
         sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
         gst_rate: null, // mixed per-item rates — see invoice_items
+        is_gst_invoice: isGstInvoice,
         payment_status: paymentStatus || 'paid',
         amount_paid: (paymentStatus === 'credit') ? 0 : null,
+        table_number: req.body.tableNumber || null,
       }])
       .select();
 
@@ -833,6 +835,7 @@ app.post("/api/designs/add", async (req, res) => {
         color: color || "",
         hsn_code: hsnCode || null,
         default_gst_rate: parseFloat(defaultGstRate) || 18,
+        unit_type: req.body.unitType || 'boxes',
       }])
       .select()
       .single();

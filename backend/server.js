@@ -285,7 +285,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // Generate Invoice
 app.post("/api/invoices/generate", async (req, res) => {
   try {
-    const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstRate, gstMode, items } = req.body;
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstRate, gstMode, items, paymentStatus } = req.body;
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
 
     // Fetch HSN codes for each design from DB
@@ -336,6 +336,8 @@ app.post("/api/invoices/generate", async (req, res) => {
         cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
         sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
         gst_rate: null, // mixed per-item rates — see invoice_items
+        payment_status: paymentStatus || 'paid',
+        amount_paid: (paymentStatus === 'credit') ? 0 : null,
       }])
       .select();
 
@@ -1005,6 +1007,79 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
       },
       itrNote: "ITR-4 (44AD): Agar turnover ₹3Cr se kam hai to 8% ko taxable income maan sakte ho.",
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Bakaya Ledger — customer outstanding + supplier dues
+app.get("/api/bakaya/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const [invoicesRes, purchasesRes] = await Promise.allSettled([
+      supabase.from("invoices")
+        .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
+        .eq("shop_id", shopId)
+        .in("payment_status", ["credit", "partial"])
+        .order("created_at", { ascending: false })
+        .limit(50),
+
+      supabase.from("purchases")
+        .select("id, supplier_name, created_at, purchase_date, payment_status, amount_paid, quantity_boxes, cost_per_box")
+        .eq("shop_id", shopId)
+        .eq("payment_status", "unpaid")
+        .order("purchase_date", { ascending: false })
+        .limit(50),
+    ]);
+
+    const creditInvoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
+    const unpaidPurchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
+
+    const enrichedInvoices = creditInvoices.map(inv => {
+      const gross = (inv.invoice_items || []).reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0)
+        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+      const outstanding = Math.round(gross - (inv.amount_paid || 0));
+      return { ...inv, grossAmount: Math.round(gross), outstanding };
+    });
+
+    const enrichedPurchases = unpaidPurchases.map(p => {
+      const gross = (p.quantity_boxes || 0) * (p.cost_per_box || 0);
+      const outstanding = Math.round(gross - (p.amount_paid || 0));
+      return { ...p, grossAmount: Math.round(gross), outstanding };
+    });
+
+    const customerBakaya = enrichedInvoices.reduce((s, i) => s + i.outstanding, 0);
+    const supplierBakaya = enrichedPurchases.reduce((s, p) => s + p.outstanding, 0);
+
+    res.json({ customerBakaya, supplierBakaya, creditInvoices: enrichedInvoices, unpaidPurchases: enrichedPurchases });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark invoice payment (paid / partial)
+app.patch("/api/invoices/:id/payment", async (req, res) => {
+  try {
+    const { status, amountPaid } = req.body; // status: 'paid'|'partial'|'credit'
+    const { error } = await supabase.from("invoices")
+      .update({ payment_status: status, amount_paid: amountPaid || 0 })
+      .eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark purchase payment
+app.patch("/api/purchases/:id/payment", async (req, res) => {
+  try {
+    const { status, amountPaid } = req.body;
+    const { error } = await supabase.from("purchases")
+      .update({ payment_status: status, amount_paid: amountPaid || 0 })
+      .eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

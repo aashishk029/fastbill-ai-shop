@@ -278,27 +278,23 @@ app.post("/api/invoices/generate", async (req, res) => {
     const totalBoxes = items.reduce((s, i) => s + (parseInt(i.quantityBoxes) || 0), 0);
     const itemsTotal = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
 
-    // GST calculation based on mode
-    const rate = parseFloat(gstRate) || 0;
-    const isGstInvoice = (showGst === true || showGst === 'true') && rate > 0;
-    let taxableValue, gstAmount, grossAmount;
-    if (isGstInvoice) {
-      if (mode === 'included') {
-        // Price includes GST — reverse extract
-        taxableValue = itemsTotal / (1 + rate / 100);
-        gstAmount = itemsTotal - taxableValue;
-        grossAmount = itemsTotal; // total paid = items total (unchanged)
-      } else {
-        // GST added on top of base price
-        taxableValue = itemsTotal;
-        gstAmount = itemsTotal * rate / 100;
-        grossAmount = itemsTotal + gstAmount; // total paid = base + GST
-      }
-    } else {
-      taxableValue = itemsTotal;
-      gstAmount = 0;
-      grossAmount = itemsTotal;
-    }
+    // Per-item GST calculation — each product uses its own GST rate from designs table
+    const isGstInvoice = (showGst === true || showGst === 'true');
+
+    const itemCalcs = items.map(i => {
+      const design = designMap[i.designId] || {};
+      const lineTotal = (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0);
+      const itemRate = parseFloat(i.gstRate || design.default_gst_rate || 0);
+      const applyGst = isGstInvoice && itemRate > 0;
+      const itemTaxable = applyGst && mode === 'included' ? lineTotal / (1 + itemRate / 100) : lineTotal;
+      const itemGst = applyGst ? (mode === 'included' ? lineTotal - itemTaxable : lineTotal * itemRate / 100) : 0;
+      return { lineTotal, itemTaxable, itemGst };
+    });
+
+    const taxableValue = itemCalcs.reduce((s, i) => s + i.itemTaxable, 0);
+    const gstAmount = itemCalcs.reduce((s, i) => s + i.itemGst, 0);
+    const grossAmount = itemCalcs.reduce((s, i) => s + i.lineTotal, 0);
+    const finalGrossAmount = mode === 'exclusive' && isGstInvoice ? grossAmount + gstAmount : grossAmount;
     const cgst = gstAmount / 2;
     const sgst = gstAmount / 2;
     const invoiceType = (customerGstin && customerGstin.length === 15) ? 'B2B' : 'B2C';
@@ -317,7 +313,7 @@ app.post("/api/invoices/generate", async (req, res) => {
         taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
         cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
         sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
-        gst_rate: rate || null,
+        gst_rate: null, // mixed per-item rates — see invoice_items
       }])
       .select();
 
@@ -327,7 +323,7 @@ app.post("/api/invoices/generate", async (req, res) => {
     for (const item of items) {
       const design = designMap[item.designId] || {};
       const itemHsn = item.hsnCode || design.hsn_code || null;
-      const itemGstRate = item.gstRate || design.default_gst_rate || rate || null;
+      const itemGstRate = item.gstRate || design.default_gst_rate || null;
 
       await supabase.from("invoice_items").insert([{
         invoice_id: invoice[0].id,
@@ -350,14 +346,14 @@ app.post("/api/invoices/generate", async (req, res) => {
         ...invoice[0],
         totalBoxes,
         itemsTotal: Math.round(itemsTotal),
-        grossAmount: Math.round(grossAmount),
-        finalTotal: Math.round(grossAmount),
+        grossAmount: Math.round(finalGrossAmount),
+        finalTotal: Math.round(finalGrossAmount),
         taxableValue: Math.round(taxableValue),
         cgst: Math.round(cgst * 100) / 100,
         sgst: Math.round(sgst * 100) / 100,
         gstAmount: Math.round(gstAmount * 100) / 100,
         isGstInvoice,
-        gstRate: rate,
+        gstRate: null,
         gstMode: mode,
         items: items.map(i => {
           const design = designMap[i.designId] || {};

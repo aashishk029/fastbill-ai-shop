@@ -531,6 +531,134 @@ app.get("/api/alerts/:shopId", async (req, res) => {
 });
 
 // ============================================
+// FREE AI — Photo → Product Identify (HuggingFace moondream, no API key)
+// ============================================
+app.post("/api/inventory/photo-identify", async (req, res) => {
+  try {
+    const { imageBase64, shopId } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "imageBase64 required" });
+
+    // Fetch shop's inventory for matching
+    const { data: inventory } = await supabase
+      .from("inventory")
+      .select("design_id, designs(design_code, design_name, color)")
+      .eq("shop_id", shopId);
+    const productList = (inventory || []).map(i =>
+      `${i.designs?.design_code}: ${i.designs?.design_name} ${i.designs?.color || ''}`
+    ).join(", ");
+
+    // HuggingFace moondream2 — free, no key needed
+    const hfRes = await fetch(
+      "https://api-inference.huggingface.co/models/vikhyatk/moondream2",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inputs: {
+            image: imageBase64,
+            question: `This is a product in a shop. Products in this shop: ${productList.slice(0, 500)}. What product is shown? Give product name and code if visible. Be brief.`
+          }
+        }),
+        signal: AbortSignal.timeout(15000),
+      }
+    );
+
+    if (!hfRes.ok) throw new Error(`HF API error: ${hfRes.status}`);
+    const hfData = await hfRes.json();
+    const description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text || "Product identified";
+
+    // Try to match description to existing inventory
+    const descLower = description.toLowerCase();
+    const matched = (inventory || []).find(i => {
+      const code = (i.designs?.design_code || '').toLowerCase();
+      const name = (i.designs?.design_name || '').toLowerCase();
+      return descLower.includes(code) || descLower.includes(name);
+    });
+
+    res.json({
+      description,
+      matchedDesignId: matched?.design_id || null,
+      matchedName: matched ? `${matched.designs?.design_code} — ${matched.designs?.design_name}` : null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message, description: null, matchedDesignId: null });
+  }
+});
+
+// ============================================
+// Customer Credit Score (rule-based, free)
+// ============================================
+app.get("/api/customers/credit-score/:shopId/:customerName", async (req, res) => {
+  try {
+    const { shopId, customerName } = req.params;
+    const { data: invoices } = await supabase
+      .from("invoices")
+      .select("payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, created_at, invoice_items(quantity_boxes, price_per_box)")
+      .eq("shop_id", shopId)
+      .ilike("customer_name", `%${customerName}%`)
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    if (!invoices || invoices.length === 0) {
+      return res.json({ score: null, label: "New Customer", totalBills: 0, totalCredit: 0, paid: 0 });
+    }
+
+    const total = invoices.length;
+    const paid = invoices.filter(i => i.payment_status === "paid").length;
+    const credit = invoices.filter(i => i.payment_status === "credit").length;
+    const partial = invoices.filter(i => i.payment_status === "partial").length;
+    const totalAmount = invoices.reduce((s, inv) => {
+      const gross = (inv.invoice_items || []).reduce((a, i) => a + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0)
+        || (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      return s + gross;
+    }, 0);
+    const paidAmount = invoices.reduce((s, i) => s + (i.amount_paid || 0), 0);
+
+    // Score 0-100
+    const payRate = total > 0 ? paid / total : 0;
+    const score = Math.round(
+      payRate * 50 +                          // payment rate: max 50pts
+      (total >= 5 ? 20 : total * 4) +         // loyalty: max 20pts
+      (credit === 0 ? 20 : Math.max(0, 20 - credit * 5)) + // no pending: max 20pts
+      (totalAmount > 50000 ? 10 : totalAmount / 5000) // volume: max 10pts
+    );
+
+    const label = score >= 80 ? "Excellent" : score >= 60 ? "Good" : score >= 40 ? "Average" : "Risky";
+    res.json({ score: Math.min(100, score), label, totalBills: total, paid, credit, partial, totalAmount: Math.round(totalAmount), paidAmount: Math.round(paidAmount) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// Last rate per customer per product
+// ============================================
+app.get("/api/invoices/last-rate/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { customerName } = req.query;
+    if (!customerName) return res.status(400).json({ error: "customerName required" });
+
+    const { data } = await supabase
+      .from("invoice_items")
+      .select("design_id, price_per_box, invoices!inner(customer_name, created_at, shop_id)")
+      .eq("invoices.shop_id", shopId)
+      .ilike("invoices.customer_name", `%${customerName}%`)
+      .order("invoices.created_at", { ascending: false })
+      .limit(50);
+
+    // Last rate per design_id
+    const rateMap = {};
+    (data || []).forEach(item => {
+      if (!rateMap[item.design_id]) rateMap[item.design_id] = item.price_per_box;
+    });
+    res.json({ rates: rateMap });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 

@@ -449,6 +449,23 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
       console.log("Tesseract OCR chars:", rawText.length);
     } catch (e) { console.error("Tesseract error:", e.message); }
 
+    // Fallback: HuggingFace BLIP (requires HF_TOKEN env var — free HF account)
+    if (!rawText && process.env.HF_TOKEN) {
+      try {
+        const imgBuffer = Buffer.from(imageBase64, 'base64');
+        const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
+          method: "POST",
+          headers: { "Content-Type": "image/jpeg", "Authorization": `Bearer ${process.env.HF_TOKEN}` },
+          body: imgBuffer,
+          signal: AbortSignal.timeout(35000),
+        });
+        if (hfRes.ok) {
+          const hfData = await hfRes.json();
+          rawText = Array.isArray(hfData) ? hfData[0]?.generated_text || "" : hfData?.generated_text || "";
+        }
+      } catch (e) { console.error("HF BLIP scan error:", e.message); }
+    }
+
     // Fallback: local Ollama moondream (if OLLAMA_URL env set — local dev)
     if (!rawText && process.env.OLLAMA_URL) {
       try {
@@ -596,28 +613,27 @@ app.post("/api/inventory/photo-identify", async (req, res) => {
       } catch {}
     }
 
-    // Fallback: HuggingFace BLIP captioning (free, no key, binary upload)
-    if (!description) {
+    // Fallback: HuggingFace BLIP (requires HF_TOKEN env var — free HF account)
+    if (!description && process.env.HF_TOKEN) {
       try {
         const imgBuffer = Buffer.from(imageBase64, 'base64');
         const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
           method: "POST",
-          headers: { "Content-Type": "image/jpeg" },
+          headers: { "Content-Type": "image/jpeg", "Authorization": `Bearer ${process.env.HF_TOKEN}` },
           body: imgBuffer,
-          signal: AbortSignal.timeout(30000),
+          signal: AbortSignal.timeout(35000),
         });
         if (hfRes.ok) {
           const hfData = await hfRes.json();
           description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text;
         } else {
-          const errText = await hfRes.text();
-          console.error("HF BLIP error:", hfRes.status, errText.slice(0, 200));
+          console.error("HF BLIP error:", hfRes.status, (await hfRes.text()).slice(0, 200));
         }
       } catch (hfErr) {
         console.error("HF BLIP fetch failed:", hfErr.message);
       }
     }
-    description = description || "Product identified";
+    description = description || null;
 
     // Try to match description to existing inventory
     const descLower = description.toLowerCase();

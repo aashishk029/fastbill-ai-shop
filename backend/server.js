@@ -1065,39 +1065,17 @@ app.post("/api/products/identify-photo", async (req, res) => {
     const { imageBase64, shopType } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "Image required" });
 
-    const message = await claudeClient.messages.create({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: 500,
-      messages: [{
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: "image/jpeg",
-              data: imageBase64,
-            },
-          },
-          {
-            type: "text",
-            text: `You are a product identification assistant for a ${shopType || "general"} shop in India.
-Analyze this product image and return ONLY a JSON object (no markdown, no explanation):
-{
-  "designName": "product name in English",
-  "color": "main color",
-  "categoryName": "product category",
-  "sizeMm": "size if visible e.g. 24x24",
-  "priceEstimate": estimated price per unit in INR as number,
-  "description": "1 line description in Hindi"
-}`,
-          },
-        ],
-      }],
-    });
+    const prompt = `You are a product identification assistant for a ${shopType || "general"} shop in India.
+Analyze this product image and return ONLY a valid JSON object (no markdown, no explanation):
+{"designName":"product name in English","color":"main color","categoryName":"product category","sizeMm":"size if visible e.g. 24x24","priceEstimate":0,"description":"1 line description"}`;
 
-    const raw = message.content[0].text.trim();
-    const json = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    const raw = await geminiVision(imageBase64, prompt);
+    if (!raw) return res.status(503).json({ error: "AI unavailable. Check GEMINI_API_KEY." });
+
+    const cleaned = raw.replace(/```json|```/g, "").trim();
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}') + 1;
+    const json = JSON.parse(cleaned.slice(start, end));
     res.json({ success: true, product: json });
   } catch (error) {
     res.status(500).json({ error: error.message });

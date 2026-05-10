@@ -547,25 +547,40 @@ app.post("/api/inventory/photo-identify", async (req, res) => {
       `${i.designs?.design_code}: ${i.designs?.design_name} ${i.designs?.color || ''}`
     ).join(", ");
 
-    // HuggingFace moondream2 — free, no key needed
-    const hfRes = await fetch(
-      "https://api-inference.huggingface.co/models/vikhyatk/moondream2",
-      {
+    const question = `Products in this shop: ${productList.slice(0, 400)}. What product is in this image? Name and code if visible. One sentence.`;
+    let description = null;
+
+    // Try local Ollama moondream first (if OLLAMA_URL env set — local dev)
+    const ollamaUrl = process.env.OLLAMA_URL;
+    if (ollamaUrl) {
+      try {
+        const ollamaRes = await fetch(`${ollamaUrl}/api/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "moondream:latest", prompt: question, images: [imageBase64], stream: false }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (ollamaRes.ok) {
+          const data = await ollamaRes.json();
+          description = data.response || null;
+        }
+      } catch {}
+    }
+
+    // Fallback: HuggingFace moondream2 (free, no key, works on Render)
+    if (!description) {
+      const hfRes = await fetch("https://api-inference.huggingface.co/models/vikhyatk/moondream2", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          inputs: {
-            image: imageBase64,
-            question: `This is a product in a shop. Products in this shop: ${productList.slice(0, 500)}. What product is shown? Give product name and code if visible. Be brief.`
-          }
-        }),
-        signal: AbortSignal.timeout(15000),
+        body: JSON.stringify({ inputs: { image: imageBase64, question } }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (hfRes.ok) {
+        const hfData = await hfRes.json();
+        description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text;
       }
-    );
-
-    if (!hfRes.ok) throw new Error(`HF API error: ${hfRes.status}`);
-    const hfData = await hfRes.json();
-    const description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text || "Product identified";
+    }
+    description = description || "Product identified";
 
     // Try to match description to existing inventory
     const descLower = description.toLowerCase();

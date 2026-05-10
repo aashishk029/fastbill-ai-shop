@@ -1073,10 +1073,28 @@ Analyze this product image and return ONLY a valid JSON object (no markdown, no 
     const raw = await geminiVision(imageBase64, prompt);
     if (!raw) return res.status(503).json({ error: "AI unavailable. Check GEMINI_API_KEY." });
 
-    const cleaned = raw.replace(/```json|```/g, "").trim();
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}') + 1;
-    const json = JSON.parse(cleaned.slice(start, end));
+    // Robust JSON extraction — handle markdown, prose, partial JSON
+    let json = null;
+    try {
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      const start = cleaned.indexOf('{');
+      const end = cleaned.lastIndexOf('}') + 1;
+      if (start !== -1 && end > start) json = JSON.parse(cleaned.slice(start, end));
+    } catch {}
+
+    // Fallback: build product from raw text if JSON failed
+    if (!json) {
+      const lines = raw.split('\n').filter(l => l.trim());
+      json = {
+        designName: lines[0]?.replace(/^(product|name|item)[\s:]+/i, '').trim() || 'Unknown Product',
+        color: (raw.match(/color[:\s]+([^\n,]+)/i) || [])[1]?.trim() || '',
+        categoryName: (raw.match(/categor\w*[:\s]+([^\n,]+)/i) || [])[1]?.trim() || 'General',
+        sizeMm: (raw.match(/size[:\s]+([^\n,]+)/i) || [])[1]?.trim() || '',
+        priceEstimate: parseInt((raw.match(/price[:\s₹]+(\d+)/i) || [])[1]) || 0,
+        description: lines.slice(0, 2).join(' ').slice(0, 100),
+      };
+    }
+
     res.json({ success: true, product: json });
   } catch (error) {
     res.status(500).json({ error: error.message });

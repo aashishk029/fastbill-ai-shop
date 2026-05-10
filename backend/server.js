@@ -412,76 +412,115 @@ app.post("/api/invoices/generate", async (req, res) => {
 });
 
 // AI-Powered Scan-to-Stock (Purchase Entry)
+// Parse bill text into structured line items
+function parseBillText(text) {
+  if (!text || text.length < 5) return [];
+  const items = [];
+  const lines = text.split(/\n|;/).map(l => l.trim()).filter(l => l.length > 2);
+  for (const line of lines) {
+    // Format: NAME | QTY | RATE
+    const pipe = line.match(/^(.+?)\s*\|\s*(\d+\.?\d*)\s*\|\s*(\d+\.?\d*)/);
+    if (pipe) { items.push({ designCode: pipe[1].trim(), quantity: parseFloat(pipe[2]), rate: parseFloat(pipe[3]) }); continue; }
+    // Format: NAME QTY RATE (end of line)
+    const nums = line.match(/^(.+?)\s+(\d+)\s+(\d+\.?\d*)\s*$/);
+    if (nums && parseFloat(nums[2]) < 10000) { items.push({ designCode: nums[1].trim(), quantity: parseFloat(nums[2]), rate: parseFloat(nums[3]) }); continue; }
+    // Format: NAME x QTY @ RATE
+    const atSign = line.match(/^(.+?)\s+[xX×]\s*(\d+\.?\d*)\s*@\s*(\d+\.?\d*)/);
+    if (atSign) { items.push({ designCode: atSign[1].trim(), quantity: parseFloat(atSign[2]), rate: parseFloat(atSign[3]) }); }
+  }
+  return items.slice(0, 25);
+}
+
 app.post("/api/inventory/scan-purchase", async (req, res) => {
   try {
     const { imageBase64 } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "No image data provided" });
 
-    const response = await claudeClient.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `You are an expert at reading Indian purchase bills and invoices for any type of shop.
-              Extract all line items from this purchase bill image.
-              For each item find:
-              1. Product name or item code (e.g., "Chini 50kg", "WL-001", "Paracetamol 500mg")
-              2. Quantity as a number only
-              3. Rate or price per unit as a number only (if visible)
+    let rawText = "";
 
-              Return ONLY a valid JSON array with no other text:
-              [{"designCode": "product name or code", "quantity": 50, "rate": 260}]
+    // Primary: local Ollama moondream (if OLLAMA_URL env set)
+    const ollamaUrl = process.env.OLLAMA_URL;
+    if (ollamaUrl) {
+      try {
+        const ollamaRes = await fetch(`${ollamaUrl}/api/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "moondream:latest",
+            prompt: "Read this purchase bill/invoice carefully. List every product line item. For each item write exactly: PRODUCT NAME | QUANTITY | RATE PER UNIT. One item per line. Only numbers for quantity and rate.",
+            images: [imageBase64],
+            stream: false,
+          }),
+          signal: AbortSignal.timeout(25000),
+        });
+        if (ollamaRes.ok) {
+          const data = await ollamaRes.json();
+          rawText = data.response || "";
+        }
+      } catch (e) { console.error("Ollama scan error:", e.message); }
+    }
 
-              Use null for fields not visible. Return [] if no items found.`
-            },
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/jpeg",
-                data: imageBase64,
-              },
-            },
-          ],
-        },
-      ],
-    });
+    // Fallback: HuggingFace BLIP (free, binary upload, no API key)
+    if (!rawText) {
+      try {
+        const imgBuffer = Buffer.from(imageBase64, 'base64');
+        const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
+          method: "POST",
+          headers: { "Content-Type": "image/jpeg" },
+          body: imgBuffer,
+          signal: AbortSignal.timeout(30000),
+        });
+        if (hfRes.ok) {
+          const hfData = await hfRes.json();
+          rawText = Array.isArray(hfData) ? hfData[0]?.generated_text || "" : hfData?.generated_text || "";
+        }
+      } catch (e) { console.error("HF BLIP scan error:", e.message); }
+    }
 
-    const extractedText = response.content[0].text;
-    const items = JSON.parse(extractedText.substring(extractedText.indexOf('['), extractedText.lastIndexOf(']') + 1));
-    
-    res.json({ items });
+    const items = parseBillText(rawText);
+    res.json({ items, rawText: rawText.slice(0, 500) });
   } catch (error) {
-    console.error("AI Scan Error:", error);
-    res.status(500).json({ error: "AI could not read the bill. Please try again or enter manually." });
+    console.error("Bill Scan Error:", error);
+    res.status(500).json({ error: "AI could not read the bill. Please try again or enter manually.", items: [], rawText: "" });
   }
 });
 
 app.post("/api/inventory/confirm-scan", async (req, res) => {
   try {
-    const { shopId, items } = req.body; // items: [{ designId, quantity, rate }]
+    const { shopId, items } = req.body;
+    if (!shopId || !items?.length) return res.status(400).json({ error: "shopId and items required" });
 
     for (const item of items) {
       if (!item.designId || !item.quantity) continue;
+      const qty = parseInt(item.quantity) || 0;
+      if (qty <= 0) continue;
 
-      // Update inventory (Increment stock)
-      await supabase.rpc("increment_inventory", {
-        p_design_id: item.designId,
-        p_quantity: parseInt(item.quantity),
-      });
+      // Increment existing inventory row, or create if missing
+      const { data: invRow } = await supabase
+        .from("inventory")
+        .select("id, quantity_boxes")
+        .eq("shop_id", shopId)
+        .eq("design_id", item.designId)
+        .maybeSingle();
 
-      // Record as purchase for credit scoring/profit tracking
-      await supabase.from("purchases").insert([{
+      if (invRow) {
+        await supabase.from("inventory")
+          .update({ quantity_boxes: invRow.quantity_boxes + qty })
+          .eq("id", invRow.id);
+      } else {
+        await supabase.from("inventory").insert({
+          shop_id: shopId, design_id: item.designId, quantity_boxes: qty, is_low_stock: false,
+        });
+      }
+
+      // Record purchase for profit/credit scoring
+      await supabase.from("purchases").insert({
         shop_id: shopId,
         design_id: item.designId,
-        quantity_boxes: parseInt(item.quantity),
+        quantity_boxes: qty,
         cost_per_box: parseFloat(item.rate) || 0,
         purchase_date: new Date().toISOString(),
-      }]);
+      });
     }
 
     res.json({ message: "✓ Stock updated successfully" });

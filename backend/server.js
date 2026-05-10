@@ -438,53 +438,52 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
     if (!imageBase64) return res.status(400).json({ error: "No image data provided" });
 
     let rawText = "";
+    let items = [];
 
-    // Primary: Tesseract OCR — reads actual text from printed bills, runs on Render, no API key
-    try {
-      const imgBuffer = Buffer.from(imageBase64, 'base64');
-      const worker = await createWorker('eng+hin', 1, { logger: () => {} });
-      const { data } = await worker.recognize(imgBuffer);
-      await worker.terminate();
-      rawText = data.text || "";
-      console.log("Tesseract OCR chars:", rawText.length);
-    } catch (e) { console.error("Tesseract error:", e.message); }
-
-    // Fallback: HuggingFace BLIP (requires HF_TOKEN env var — free HF account)
-    if (!rawText && process.env.HF_TOKEN) {
-      try {
-        const imgBuffer = Buffer.from(imageBase64, 'base64');
-        const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
-          method: "POST",
-          headers: { "Content-Type": "image/jpeg", "Authorization": `Bearer ${process.env.HF_TOKEN}` },
-          body: imgBuffer,
-          signal: AbortSignal.timeout(35000),
-        });
-        if (hfRes.ok) {
-          const hfData = await hfRes.json();
-          rawText = Array.isArray(hfData) ? hfData[0]?.generated_text || "" : hfData?.generated_text || "";
-        }
-      } catch (e) { console.error("HF BLIP scan error:", e.message); }
+    // Primary: Gemini 1.5 Flash — reads bills perfectly, returns structured JSON
+    if (process.env.GEMINI_API_KEY) {
+      const geminiText = await geminiVision(
+        imageBase64,
+        `This is a purchase bill/invoice. Extract ALL line items. Return ONLY valid JSON array, no other text:
+[{"designCode":"product name or code","quantity":10,"rate":250}]
+Rules: quantity and rate must be numbers. Use null if not visible. Return [] if no items found.`
+      );
+      if (geminiText) {
+        try {
+          const start = geminiText.indexOf('[');
+          const end = geminiText.lastIndexOf(']') + 1;
+          if (start !== -1 && end > start) {
+            items = JSON.parse(geminiText.slice(start, end));
+            rawText = `Gemini extracted ${items.length} items`;
+          }
+        } catch (e) { console.error("Gemini JSON parse error:", e.message, geminiText.slice(0, 200)); }
+      }
     }
 
-    // Fallback: local Ollama moondream (if OLLAMA_URL env set — local dev)
-    if (!rawText && process.env.OLLAMA_URL) {
+    // Fallback: Tesseract OCR + regex parser
+    if (!items.length) {
       try {
-        const ollamaRes = await fetch(`${process.env.OLLAMA_URL}/api/generate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "moondream:latest",
-            prompt: "Read this purchase bill. List every line item as: PRODUCT NAME | QUANTITY | RATE. One per line.",
-            images: [imageBase64],
-            stream: false,
-          }),
+        const imgBuffer = Buffer.from(imageBase64, 'base64');
+        const worker = await createWorker('eng+hin', 1, { logger: () => {} });
+        const { data } = await worker.recognize(imgBuffer);
+        await worker.terminate();
+        rawText = data.text || "";
+        items = parseBillText(rawText);
+      } catch (e) { console.error("Tesseract error:", e.message); }
+    }
+
+    // Last fallback: local Ollama moondream
+    if (!items.length && process.env.OLLAMA_URL) {
+      try {
+        const r = await fetch(`${process.env.OLLAMA_URL}/api/generate`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "moondream:latest", prompt: "List bill items as: NAME | QTY | RATE", images: [imageBase64], stream: false }),
           signal: AbortSignal.timeout(25000),
         });
-        if (ollamaRes.ok) rawText = (await ollamaRes.json()).response || "";
+        if (r.ok) { rawText = (await r.json()).response || ""; items = parseBillText(rawText); }
       } catch (e) { console.error("Ollama scan error:", e.message); }
     }
 
-    const items = parseBillText(rawText);
     res.json({ items, rawText: rawText.slice(0, 800) });
   } catch (error) {
     console.error("Bill Scan Error:", error);
@@ -576,8 +575,30 @@ app.get("/api/alerts/:shopId", async (req, res) => {
   }
 });
 
+// Shared Gemini vision helper
+async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg") {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return null;
+  const body = {
+    contents: [{
+      parts: [
+        { inline_data: { mime_type: mimeType, data: imageBase64 } },
+        { text: prompt }
+      ]
+    }],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 800 }
+  };
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) }
+  );
+  if (!r.ok) { console.error("Gemini error:", r.status, (await r.text()).slice(0, 200)); return null; }
+  const data = await r.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+}
+
 // ============================================
-// FREE AI — Photo → Product Identify (HuggingFace moondream, no API key)
+// AI — Photo → Product Identify (Gemini 1.5 Flash free)
 // ============================================
 app.post("/api/inventory/photo-identify", async (req, res) => {
   try {
@@ -593,50 +614,28 @@ app.post("/api/inventory/photo-identify", async (req, res) => {
       `${i.designs?.design_code}: ${i.designs?.design_name} ${i.designs?.color || ''}`
     ).join(", ");
 
-    const question = `Products in this shop: ${productList.slice(0, 400)}. What product is in this image? Name and code if visible. One sentence.`;
     let description = null;
 
-    // Try local Ollama moondream first (if OLLAMA_URL env set — local dev)
-    const ollamaUrl = process.env.OLLAMA_URL;
-    if (ollamaUrl) {
+    // Primary: Gemini 1.5 Flash (free 15 RPM, has vision)
+    description = await geminiVision(
+      imageBase64,
+      `Shop products: ${productList.slice(0, 500)}. What product is shown in this image? Match to closest product from the list if possible. Reply in one sentence with product name and code.`
+    );
+
+    // Fallback: local Ollama moondream (local dev only)
+    if (!description && process.env.OLLAMA_URL) {
       try {
-        const ollamaRes = await fetch(`${ollamaUrl}/api/generate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: "moondream:latest", prompt: question, images: [imageBase64], stream: false }),
+        const r = await fetch(`${process.env.OLLAMA_URL}/api/generate`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "moondream:latest", prompt: `Products: ${productList.slice(0,300)}. What product is this?`, images: [imageBase64], stream: false }),
           signal: AbortSignal.timeout(20000),
         });
-        if (ollamaRes.ok) {
-          const data = await ollamaRes.json();
-          description = data.response || null;
-        }
+        if (r.ok) description = (await r.json()).response || null;
       } catch {}
     }
 
-    // Fallback: HuggingFace BLIP (requires HF_TOKEN env var — free HF account)
-    if (!description && process.env.HF_TOKEN) {
-      try {
-        const imgBuffer = Buffer.from(imageBase64, 'base64');
-        const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
-          method: "POST",
-          headers: { "Content-Type": "image/jpeg", "Authorization": `Bearer ${process.env.HF_TOKEN}` },
-          body: imgBuffer,
-          signal: AbortSignal.timeout(35000),
-        });
-        if (hfRes.ok) {
-          const hfData = await hfRes.json();
-          description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text;
-        } else {
-          console.error("HF BLIP error:", hfRes.status, (await hfRes.text()).slice(0, 200));
-        }
-      } catch (hfErr) {
-        console.error("HF BLIP fetch failed:", hfErr.message);
-      }
-    }
-    description = description || null;
-
     // Try to match description to existing inventory
-    const descLower = description.toLowerCase();
+    const descLower = (description || '').toLowerCase();
     const matched = (inventory || []).find(i => {
       const code = (i.designs?.design_code || '').toLowerCase();
       const name = (i.designs?.design_name || '').toLowerCase();

@@ -135,7 +135,12 @@ const KANHAIYA_MARBLES = {
 
 // Health Check
 app.get("/api/health", (req, res) => {
-  res.json({ status: "✓ AI Shop System Running", timestamp: new Date() });
+  res.json({
+    status: "✓ AI Shop System Running",
+    timestamp: new Date(),
+    gemini: !!process.env.GEMINI_API_KEY,
+    hf: !!process.env.HF_TOKEN,
+  });
 });
 
 // Initialize Shop

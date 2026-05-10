@@ -1030,7 +1030,7 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
       supabase.from("purchases")
         .select("id, supplier_name, created_at, purchase_date, payment_status, amount_paid, quantity_boxes, cost_per_box")
         .eq("shop_id", shopId)
-        .eq("payment_status", "unpaid")
+        .in("payment_status", ["unpaid", "partial"])
         .order("purchase_date", { ascending: false })
         .limit(50),
     ]);
@@ -1067,6 +1067,27 @@ app.patch("/api/invoices/:id/payment", async (req, res) => {
     const { error } = await supabase.from("invoices")
       .update({ payment_status: status, amount_paid: amountPaid || 0 })
       .eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Adjust inventory quantity (edit correction)
+app.patch("/api/inventory/adjust", async (req, res) => {
+  try {
+    const { shopId, designId, newQuantity } = req.body;
+    if (!shopId || !designId || newQuantity === undefined) {
+      return res.status(400).json({ error: "shopId, designId, newQuantity required" });
+    }
+    const qty = parseInt(newQuantity);
+    if (isNaN(qty) || qty < 0) return res.status(400).json({ error: "Invalid quantity" });
+
+    const { error } = await supabase.from("inventory")
+      .update({ quantity_boxes: qty })
+      .eq("shop_id", shopId)
+      .eq("design_id", designId);
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {

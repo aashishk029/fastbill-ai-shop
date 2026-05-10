@@ -6,6 +6,7 @@ require("dotenv").config();
 
 const { createClient } = require("@supabase/supabase-js");
 const Anthropic = require("@anthropic-ai/sdk");
+const { createWorker } = require("tesseract.js");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -438,50 +439,39 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
 
     let rawText = "";
 
-    // Primary: local Ollama moondream (if OLLAMA_URL env set)
-    const ollamaUrl = process.env.OLLAMA_URL;
-    if (ollamaUrl) {
+    // Primary: Tesseract OCR — reads actual text from printed bills, runs on Render, no API key
+    try {
+      const imgBuffer = Buffer.from(imageBase64, 'base64');
+      const worker = await createWorker('eng+hin', 1, { logger: () => {} });
+      const { data } = await worker.recognize(imgBuffer);
+      await worker.terminate();
+      rawText = data.text || "";
+      console.log("Tesseract OCR chars:", rawText.length);
+    } catch (e) { console.error("Tesseract error:", e.message); }
+
+    // Fallback: local Ollama moondream (if OLLAMA_URL env set — local dev)
+    if (!rawText && process.env.OLLAMA_URL) {
       try {
-        const ollamaRes = await fetch(`${ollamaUrl}/api/generate`, {
+        const ollamaRes = await fetch(`${process.env.OLLAMA_URL}/api/generate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "moondream:latest",
-            prompt: "Read this purchase bill/invoice carefully. List every product line item. For each item write exactly: PRODUCT NAME | QUANTITY | RATE PER UNIT. One item per line. Only numbers for quantity and rate.",
+            prompt: "Read this purchase bill. List every line item as: PRODUCT NAME | QUANTITY | RATE. One per line.",
             images: [imageBase64],
             stream: false,
           }),
           signal: AbortSignal.timeout(25000),
         });
-        if (ollamaRes.ok) {
-          const data = await ollamaRes.json();
-          rawText = data.response || "";
-        }
+        if (ollamaRes.ok) rawText = (await ollamaRes.json()).response || "";
       } catch (e) { console.error("Ollama scan error:", e.message); }
     }
 
-    // Fallback: HuggingFace BLIP (free, binary upload, no API key)
-    if (!rawText) {
-      try {
-        const imgBuffer = Buffer.from(imageBase64, 'base64');
-        const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
-          method: "POST",
-          headers: { "Content-Type": "image/jpeg" },
-          body: imgBuffer,
-          signal: AbortSignal.timeout(30000),
-        });
-        if (hfRes.ok) {
-          const hfData = await hfRes.json();
-          rawText = Array.isArray(hfData) ? hfData[0]?.generated_text || "" : hfData?.generated_text || "";
-        }
-      } catch (e) { console.error("HF BLIP scan error:", e.message); }
-    }
-
     const items = parseBillText(rawText);
-    res.json({ items, rawText: rawText.slice(0, 500) });
+    res.json({ items, rawText: rawText.slice(0, 800) });
   } catch (error) {
     console.error("Bill Scan Error:", error);
-    res.status(500).json({ error: "AI could not read the bill. Please try again or enter manually.", items: [], rawText: "" });
+    res.status(500).json({ error: "Bill scan failed. Enter manually.", items: [], rawText: "" });
   }
 });
 

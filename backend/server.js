@@ -567,17 +567,25 @@ app.post("/api/inventory/photo-identify", async (req, res) => {
       } catch {}
     }
 
-    // Fallback: HuggingFace moondream2 (free, no key, works on Render)
+    // Fallback: HuggingFace BLIP captioning (free, no key, binary upload)
     if (!description) {
-      const hfRes = await fetch("https://api-inference.huggingface.co/models/vikhyatk/moondream2", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ inputs: { image: imageBase64, question } }),
-        signal: AbortSignal.timeout(20000),
-      });
-      if (hfRes.ok) {
-        const hfData = await hfRes.json();
-        description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text;
+      try {
+        const imgBuffer = Buffer.from(imageBase64, 'base64');
+        const hfRes = await fetch("https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large", {
+          method: "POST",
+          headers: { "Content-Type": "image/jpeg" },
+          body: imgBuffer,
+          signal: AbortSignal.timeout(30000),
+        });
+        if (hfRes.ok) {
+          const hfData = await hfRes.json();
+          description = Array.isArray(hfData) ? hfData[0]?.generated_text : hfData?.generated_text;
+        } else {
+          const errText = await hfRes.text();
+          console.error("HF BLIP error:", hfRes.status, errText.slice(0, 200));
+        }
+      } catch (hfErr) {
+        console.error("HF BLIP fetch failed:", hfErr.message);
       }
     }
     description = description || "Product identified";

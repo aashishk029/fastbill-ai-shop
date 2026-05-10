@@ -1038,8 +1038,23 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
     const creditInvoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
     const unpaidPurchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
 
+    // Batch fetch invoice_items separately — relational join can silently fail for some invoices
+    const invoiceIds = creditInvoices.map(i => i.id);
+    let itemsByInvoice = {};
+    if (invoiceIds.length > 0) {
+      const { data: itemsData } = await supabase
+        .from("invoice_items")
+        .select("invoice_id, quantity_boxes, price_per_box")
+        .in("invoice_id", invoiceIds);
+      (itemsData || []).forEach(item => {
+        if (!itemsByInvoice[item.invoice_id]) itemsByInvoice[item.invoice_id] = [];
+        itemsByInvoice[item.invoice_id].push(item);
+      });
+    }
+
     const enrichedInvoices = creditInvoices.map(inv => {
-      const gross = (inv.invoice_items || []).reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0)
+      const items = itemsByInvoice[inv.id] || inv.invoice_items || [];
+      const gross = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0)
         || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
       const outstanding = Math.round(gross - (inv.amount_paid || 0));
       return { ...inv, grossAmount: Math.round(gross), outstanding };
@@ -1077,19 +1092,24 @@ app.patch("/api/invoices/:id/payment", async (req, res) => {
 // Adjust inventory quantity (edit correction)
 app.patch("/api/inventory/adjust", async (req, res) => {
   try {
-    const { shopId, designId, newQuantity } = req.body;
-    if (!shopId || !designId || newQuantity === undefined) {
-      return res.status(400).json({ error: "shopId, designId, newQuantity required" });
-    }
+    const { shopId, designId, inventoryId, newQuantity } = req.body;
+    if (newQuantity === undefined) return res.status(400).json({ error: "newQuantity required" });
     const qty = parseInt(newQuantity);
     if (isNaN(qty) || qty < 0) return res.status(400).json({ error: "Invalid quantity" });
 
-    const { error } = await supabase.from("inventory")
-      .update({ quantity_boxes: qty })
-      .eq("shop_id", shopId)
-      .eq("design_id", designId);
+    let query = supabase.from("inventory").update({ quantity_boxes: qty });
+    if (inventoryId) {
+      query = query.eq("id", inventoryId);
+    } else if (shopId && designId) {
+      query = query.eq("shop_id", shopId).eq("design_id", designId);
+    } else {
+      return res.status(400).json({ error: "inventoryId or (shopId + designId) required" });
+    }
+
+    const { data, error } = await query.select();
     if (error) throw error;
-    res.json({ success: true });
+    if (!data || data.length === 0) return res.status(404).json({ error: "Inventory row not found" });
+    res.json({ success: true, updated: data[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

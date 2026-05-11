@@ -853,23 +853,29 @@ RECENT PURCHASES:
 ${purLines}
 `.trim();
 
-    const message = await claudeClient.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 300,
-      messages: [{
-        role: "user",
-        content: `You are BAE — an AI business assistant for an Indian MSME shop using FastBill app.
+    const geminiKey = process.env.GEMINI_API_KEY;
+    let answer = "AI unavailable";
+    if (geminiKey) {
+      const geminiBody = {
+        contents: [{ parts: [{ text: `You are BAE — an AI business assistant for an Indian MSME shop using FastBill.
 Answer using ONLY the data below. Be specific with ₹ amounts and names. 2-4 lines max. Hindi/English mix OK.
 
 ${context}
 
 Question: ${question}
 
-Answer:`
-      }]
-    });
-
-    const answer = message.content[0]?.text || "Unable to answer";
+Answer:` }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 300 }
+      };
+      const gr = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(geminiBody), signal: AbortSignal.timeout(30000) }
+      );
+      if (gr.ok) {
+        const gd = await gr.json();
+        answer = gd?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "No answer";
+      }
+    }
     res.json({ answer, context_used: true });
 
   } catch (err) {

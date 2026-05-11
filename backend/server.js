@@ -1368,3 +1368,87 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Cancel / Delete invoice — restores inventory
+app.delete("/api/invoices/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Fetch invoice items to restore inventory
+    const { data: items, error: itemsErr } = await supabase
+      .from("invoice_items")
+      .select("design_id, quantity_boxes")
+      .eq("invoice_id", id);
+    if (itemsErr) throw itemsErr;
+
+    // Restore inventory for each item
+    for (const item of (items || [])) {
+      const { data: inv } = await supabase
+        .from("inventory")
+        .select("id, quantity_boxes")
+        .eq("design_id", item.design_id)
+        .single();
+      if (inv) {
+        await supabase.from("inventory")
+          .update({ quantity_boxes: (inv.quantity_boxes || 0) + item.quantity_boxes })
+          .eq("id", inv.id);
+      }
+    }
+
+    // Mark invoice as cancelled (soft delete)
+    const { error: updateErr } = await supabase
+      .from("invoices")
+      .update({ payment_status: "cancelled" })
+      .eq("id", id);
+    if (updateErr) throw updateErr;
+
+    res.json({ success: true, message: "Invoice cancelled, inventory restored" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Return / Exchange invoice items — partial or full return
+app.post("/api/invoices/:id/return", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { returnItems, reason } = req.body;
+    // returnItems: [{ designId, quantityBoxes }]
+
+    if (!returnItems || returnItems.length === 0) {
+      return res.status(400).json({ error: "returnItems required" });
+    }
+
+    // Restore inventory for returned items
+    for (const item of returnItems) {
+      const { data: inv } = await supabase
+        .from("inventory")
+        .select("id, quantity_boxes")
+        .eq("design_id", item.designId)
+        .single();
+      if (inv) {
+        await supabase.from("inventory")
+          .update({ quantity_boxes: (inv.quantity_boxes || 0) + item.quantityBoxes })
+          .eq("id", inv.id);
+      }
+    }
+
+    // Fetch invoice to check if fully returned
+    const { data: allItems } = await supabase
+      .from("invoice_items")
+      .select("design_id, quantity_boxes")
+      .eq("invoice_id", id);
+
+    const totalQty = (allItems || []).reduce((s, i) => s + i.quantity_boxes, 0);
+    const returnQty = returnItems.reduce((s, i) => s + i.quantityBoxes, 0);
+    const newStatus = returnQty >= totalQty ? "returned" : "partial_return";
+
+    await supabase.from("invoices")
+      .update({ payment_status: newStatus, return_note: reason || "Customer return" })
+      .eq("id", id);
+
+    res.json({ success: true, returnStatus: newStatus, itemsRestored: returnItems.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});

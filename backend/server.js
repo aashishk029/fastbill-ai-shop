@@ -732,6 +732,152 @@ app.get("/api/invoices/last-rate/:shopId", async (req, res) => {
 });
 
 // ============================================
+// BAE INTELLIGENCE — /bae/query
+// ============================================
+
+app.post("/api/bae/query", async (req, res) => {
+  const { shopId, question } = req.body;
+  if (!shopId || !question) return res.status(400).json({ error: "shopId and question required" });
+
+  try {
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Pull all relevant data in parallel
+    const [invRes, invCtRes, bakayaRes, stockRes, purRes] = await Promise.allSettled([
+      // Revenue summary: last 90 days invoices (paid)
+      supabase.from("invoices")
+        .select("created_at,taxable_value,cgst_amount,sgst_amount,amount_paid,payment_status,customer_name")
+        .eq("shop_id", shopId)
+        .gte("created_at", since)
+        .not("payment_status", "in", '("cancelled","returned")')
+        .order("created_at", { ascending: false })
+        .limit(200),
+
+      // Recent 10 invoices for context
+      supabase.from("invoices")
+        .select("invoice_number,created_at,customer_name,taxable_value,cgst_amount,sgst_amount,payment_status,amount_paid")
+        .eq("shop_id", shopId)
+        .order("created_at", { ascending: false })
+        .limit(10),
+
+      // Bakaya customers
+      supabase.from("invoices")
+        .select("customer_name,customer_phone,amount_paid,taxable_value,cgst_amount,sgst_amount")
+        .eq("shop_id", shopId)
+        .in("payment_status", ["credit", "partial"]),
+
+      // Low stock
+      supabase.from("inventory")
+        .select("quantity_boxes,low_stock_threshold,is_low_stock,designs(design_name,design_code)")
+        .eq("shop_id", shopId)
+        .eq("is_low_stock", true)
+        .limit(20),
+
+      // Recent purchases
+      supabase.from("purchases")
+        .select("supplier_name,quantity_boxes,cost_per_box,payment_status,purchase_date")
+        .eq("shop_id", shopId)
+        .order("created_at", { ascending: false })
+        .limit(10),
+    ]);
+
+    // Build revenue summary
+    let totalBilled = 0, totalCollected = 0, invoiceCount = 0;
+    const monthlyRev = {};
+    if (invRes.status === "fulfilled" && invRes.value.data) {
+      for (const inv of invRes.value.data) {
+        const gross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        const paid  = inv.payment_status === "paid" ? gross : (inv.amount_paid || 0);
+        totalBilled += gross;
+        totalCollected += paid;
+        invoiceCount++;
+        const month = inv.created_at.slice(0, 7);
+        if (!monthlyRev[month]) monthlyRev[month] = { billed: 0, count: 0 };
+        monthlyRev[month].billed += gross;
+        monthlyRev[month].count++;
+      }
+    }
+    const monthLines = Object.entries(monthlyRev).sort().map(
+      ([m, d]) => `${m}: ₹${Math.round(d.billed)} (${d.count} invoices)`
+    ).join(", ");
+
+    // Build bakaya summary
+    const customerBakaya = {};
+    if (bakayaRes.status === "fulfilled" && bakayaRes.value.data) {
+      for (const inv of bakayaRes.value.data) {
+        const gross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        const key   = inv.customer_phone || inv.customer_name;
+        if (!customerBakaya[key]) customerBakaya[key] = { name: inv.customer_name, billed: 0, paid: 0 };
+        customerBakaya[key].billed += gross;
+        customerBakaya[key].paid   += inv.amount_paid || 0;
+      }
+    }
+    const bakayaLines = Object.values(customerBakaya)
+      .map(c => `${c.name}: ₹${Math.round(c.billed - c.paid)} outstanding`)
+      .join("; ") || "No outstanding bakaya";
+
+    // Recent invoices
+    const recentInvLines = (invCtRes.status === "fulfilled" && invCtRes.value.data || [])
+      .map(inv => {
+        const gross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        return `${inv.created_at.slice(0, 10)} ${inv.customer_name} ₹${Math.round(gross)} (${inv.payment_status})`;
+      }).join("\n") || "None";
+
+    // Low stock
+    const stockLines = (stockRes.status === "fulfilled" && stockRes.value.data || [])
+      .map(s => `${s.designs?.design_name || "?"}: ${s.quantity_boxes} boxes (threshold ${s.low_stock_threshold || 10})`)
+      .join("; ") || "All stock OK";
+
+    // Purchases
+    const purLines = (purRes.status === "fulfilled" && purRes.value.data || [])
+      .map(p => `${p.supplier_name} on ${(p.purchase_date || "").slice(0, 10)}: ${p.quantity_boxes} boxes @ ₹${p.cost_per_box} (${p.payment_status})`)
+      .join("\n") || "None";
+
+    const context = `
+REVENUE (last 90 days):
+- Total billed: ₹${Math.round(totalBilled)} across ${invoiceCount} invoices
+- Total collected: ₹${Math.round(totalCollected)}
+- Total outstanding: ₹${Math.round(totalBilled - totalCollected)}
+- Monthly breakdown: ${monthLines || "N/A"}
+
+BAKAYA (credit/partial):
+${bakayaLines}
+
+RECENT INVOICES:
+${recentInvLines}
+
+LOW STOCK ITEMS:
+${stockLines}
+
+RECENT PURCHASES:
+${purLines}
+`.trim();
+
+    const message = await claudeClient.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 300,
+      messages: [{
+        role: "user",
+        content: `You are BAE — an AI business assistant for an Indian MSME shop using FastBill app.
+Answer using ONLY the data below. Be specific with ₹ amounts and names. 2-4 lines max. Hindi/English mix OK.
+
+${context}
+
+Question: ${question}
+
+Answer:`
+      }]
+    });
+
+    const answer = message.content[0]?.text || "Unable to answer";
+    res.json({ answer, context_used: true });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 

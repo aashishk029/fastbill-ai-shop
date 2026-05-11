@@ -1452,3 +1452,307 @@ app.post("/api/invoices/:id/return", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================
+// WEEK 1 — CUSTOMER PAYMENT HISTORY
+// ============================================
+
+// Record a payment event (partial/full payment with date)
+app.post("/api/payment-events", async (req, res) => {
+  try {
+    const { invoiceId, amount, paymentMode, note } = req.body;
+    if (!invoiceId || !amount) return res.status(400).json({ error: "invoiceId and amount required" });
+
+    const { data, error } = await supabase.from("payment_events").insert([{
+      invoice_id: invoiceId,
+      amount: parseFloat(amount),
+      payment_mode: paymentMode || "cash",
+      note: note || null,
+    }]).select();
+    if (error) throw error;
+
+    // Also update invoice amount_paid + status
+    const { data: inv } = await supabase.from("invoices")
+      .select("id, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
+      .eq("id", invoiceId).single();
+    if (inv) {
+      const { data: allEvents } = await supabase.from("payment_events")
+        .select("amount").eq("invoice_id", invoiceId);
+      const totalPaid = (allEvents || []).reduce((s, e) => s + e.amount, 0);
+      const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
+        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+      const status = totalPaid >= gross ? "paid" : "partial";
+      await supabase.from("invoices").update({ amount_paid: totalPaid, payment_status: status }).eq("id", invoiceId);
+    }
+    res.json({ success: true, event: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all payment events for an invoice
+app.get("/api/payment-events/:invoiceId", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("payment_events")
+      .select("*").eq("invoice_id", req.params.invoiceId).order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// All customers list (derived from invoices)
+app.get("/api/customers/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { data, error } = await supabase.from("invoices")
+      .select("customer_name, customer_phone, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
+      .eq("shop_id", shopId)
+      .not("payment_status", "in", '("cancelled")')
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+
+    // Group by customer_phone (or name if no phone)
+    const customerMap = {};
+    for (const inv of (data || [])) {
+      const key = inv.customer_phone || inv.customer_name;
+      const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
+        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+      if (!customerMap[key]) {
+        customerMap[key] = { name: inv.customer_name, phone: inv.customer_phone, totalBilled: 0, totalPaid: 0, invoiceCount: 0 };
+      }
+      customerMap[key].totalBilled += Math.round(gross);
+      customerMap[key].totalPaid += (inv.amount_paid || (inv.payment_status === 'paid' ? gross : 0));
+      customerMap[key].invoiceCount += 1;
+    }
+
+    const customers = Object.values(customerMap).map(c => ({
+      ...c,
+      totalBilled: Math.round(c.totalBilled),
+      totalPaid: Math.round(c.totalPaid),
+      outstanding: Math.round(c.totalBilled - c.totalPaid),
+    })).sort((a, b) => b.outstanding - a.outstanding);
+
+    res.json(customers);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Full invoice + payment history for one customer
+app.get("/api/customers/:shopId/history", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { phone, name } = req.query;
+    if (!phone && !name) return res.status(400).json({ error: "phone or name required" });
+
+    let query = supabase.from("invoices")
+      .select("*, invoice_items(quantity_boxes, price_per_box, design_id, hsn_code, gst_rate, designs(design_code, design_name))")
+      .eq("shop_id", shopId)
+      .not("payment_status", "in", '("cancelled")')
+      .order("created_at", { ascending: false });
+
+    if (phone) query = query.ilike("customer_phone", `%${phone}%`);
+    else query = query.ilike("customer_name", `%${name}%`);
+
+    const { data: invoices, error } = await query;
+    if (error) throw error;
+
+    // Fetch payment events for each invoice
+    const invoiceIds = (invoices || []).map(i => i.id);
+    let eventsByInvoice = {};
+    if (invoiceIds.length > 0) {
+      const { data: events } = await supabase.from("payment_events")
+        .select("*").in("invoice_id", invoiceIds).order("created_at", { ascending: false });
+      (events || []).forEach(e => {
+        if (!eventsByInvoice[e.invoice_id]) eventsByInvoice[e.invoice_id] = [];
+        eventsByInvoice[e.invoice_id].push(e);
+      });
+    }
+
+    const enriched = (invoices || []).map(inv => {
+      const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
+        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+      const paid = inv.amount_paid || (inv.payment_status === 'paid' ? gross : 0);
+      return { ...inv, grossAmount: Math.round(gross), amountPaid: Math.round(paid), outstanding: Math.round(gross - paid), paymentEvents: eventsByInvoice[inv.id] || [] };
+    });
+
+    const totalBilled = enriched.reduce((s, i) => s + i.grossAmount, 0);
+    const totalPaid = enriched.reduce((s, i) => s + i.amountPaid, 0);
+
+    res.json({ invoices: enriched, totalBilled, totalPaid, outstanding: totalBilled - totalPaid,
+      customerName: invoices?.[0]?.customer_name, customerPhone: invoices?.[0]?.customer_phone });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// WEEK 2 — ANALYTICS & PROJECTIONS
+// ============================================
+
+app.get("/api/analytics/projections/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const months = parseInt(req.query.months) || 6;
+    const since = new Date();
+    since.setMonth(since.getMonth() - months);
+
+    const { data: invoices, error } = await supabase.from("invoices")
+      .select("created_at, payment_status, invoice_items(quantity_boxes, price_per_box, design_id, designs(design_name))")
+      .eq("shop_id", shopId)
+      .not("payment_status", "in", '("cancelled","returned")')
+      .gte("created_at", since.toISOString())
+      .order("created_at");
+    if (error) throw error;
+
+    // Group by month
+    const monthly = {};
+    const dayOfWeek = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
+    const itemVelocity = {};
+
+    for (const inv of (invoices || [])) {
+      const month = inv.created_at.slice(0, 7);
+      const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0);
+      if (!monthly[month]) monthly[month] = { month, revenue: 0, invoiceCount: 0 };
+      monthly[month].revenue += Math.round(gross);
+      monthly[month].invoiceCount += 1;
+      dayOfWeek[new Date(inv.created_at).getDay()] += Math.round(gross);
+
+      for (const item of (inv.invoice_items || [])) {
+        const n = item.designs?.design_name || item.design_id;
+        if (!itemVelocity[n]) itemVelocity[n] = 0;
+        itemVelocity[n] += item.quantity_boxes;
+      }
+    }
+
+    const monthlyArr = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month));
+    const revenues = monthlyArr.map(m => m.revenue);
+    const avgRevenue = revenues.length > 0 ? revenues.reduce((s, v) => s + v, 0) / revenues.length : 0;
+
+    // Simple linear projection: last 3 months trend
+    const last3 = revenues.slice(-3);
+    const trend = last3.length >= 2 ? (last3[last3.length - 1] - last3[0]) / (last3.length - 1) : 0;
+    const projectedNext = Math.round(Math.max(0, (last3[last3.length - 1] || avgRevenue) + trend));
+
+    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const peakDay = dayNames[Object.entries(dayOfWeek).sort((a, b) => b[1] - a[1])[0][0]];
+
+    const slowItems = Object.entries(itemVelocity)
+      .sort((a, b) => a[1] - b[1]).slice(0, 5).map(([name, qty]) => ({ name, qty }));
+    const topItems = Object.entries(itemVelocity)
+      .sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, qty]) => ({ name, qty }));
+
+    // Claude insights
+    let insights = [], warnings = [];
+    try {
+      const prompt = `Shop monthly revenue last ${months} months: ${JSON.stringify(monthlyArr)}.
+Peak day: ${peakDay}. Top items: ${topItems.map(i=>i.name).join(', ')}.
+Slow items: ${slowItems.map(i=>i.name).join(', ')}. Projected next month: ₹${projectedNext}.
+Give 3 short actionable Hindi/English insights for Indian shopkeeper. Reply JSON: {"insights":["..."],"warnings":["..."]}`;
+
+      const aiRes = await claudeClient.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }]
+      });
+      const text = aiRes.content[0].text;
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) { const parsed = JSON.parse(match[0]); insights = parsed.insights || []; warnings = parsed.warnings || []; }
+    } catch {}
+
+    res.json({ monthly: monthlyArr, projectedNext, avgRevenue: Math.round(avgRevenue), peakDay, topItems, slowItems, dayOfWeek, insights, warnings });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// WEEK 3 — JEWELLERY MODE
+// ============================================
+
+// Live gold/silver rates (fallback static if API fails)
+app.get("/api/jewellery/rates", async (req, res) => {
+  try {
+    // Static fallback rates (update daily via cron if needed)
+    // In production: fetch from MCX or commodity API
+    res.json({
+      gold22k: 6850,   // per gram INR (approximate)
+      gold18k: 5600,
+      gold24k: 7450,
+      silver: 85,      // per gram
+      platinum: 3200,
+      lastUpdated: new Date().toISOString(),
+      note: "Indicative rates. Verify with current MCX before billing."
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Jewellery invoice: weight-based billing
+app.post("/api/invoices/jewellery", async (req, res) => {
+  try {
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin,
+      items, paymentStatus, showGst } = req.body;
+    // items: [{ designId, weightGrams, metalRate, makingChargesPerGram, purity, hsnCode }]
+
+    const isGst = showGst === true || showGst === 'true';
+    const GST_JEWELLERY = 3; // 3% GST on jewellery
+
+    let totalTaxable = 0, totalGst = 0, finalTotal = 0;
+    const itemCalcs = (items || []).map(item => {
+      const weight = parseFloat(item.weightGrams) || 0;
+      const rate = parseFloat(item.metalRate) || 0;
+      const making = parseFloat(item.makingChargesPerGram) || 0;
+      const metalValue = weight * rate;
+      const makingValue = weight * making;
+      const taxable = metalValue + makingValue;
+      const gst = isGst ? taxable * GST_JEWELLERY / 100 : 0;
+      const lineTotal = taxable + gst;
+      totalTaxable += taxable;
+      totalGst += gst;
+      finalTotal += lineTotal;
+      return { ...item, metalValue: Math.round(metalValue), makingValue: Math.round(makingValue), taxable: Math.round(taxable), gst: Math.round(gst), lineTotal: Math.round(lineTotal) };
+    });
+
+    const cgst = totalGst / 2;
+    const sgst = totalGst / 2;
+    const invoiceType = customerGstin?.length === 15 ? 'B2B' : 'B2C';
+
+    const { data: invoice, error } = await supabase.from("invoices").insert([{
+      shop_id: shopId,
+      invoice_number: `JW-${Date.now()}`,
+      customer_name: customerName,
+      customer_phone: customerPhone || null,
+      customer_address: customerAddress || null,
+      customer_gstin: customerGstin?.toUpperCase() || null,
+      invoice_type: invoiceType,
+      taxable_value: Math.round(totalTaxable * 100) / 100,
+      cgst_amount: Math.round(cgst * 100) / 100,
+      sgst_amount: Math.round(sgst * 100) / 100,
+      gst_rate: GST_JEWELLERY,
+      is_gst_invoice: isGst,
+      payment_status: paymentStatus || 'paid',
+      amount_paid: paymentStatus === 'credit' ? 0 : null,
+    }]).select();
+    if (error) throw error;
+
+    // Insert invoice_items for each jewellery item
+    for (const item of itemCalcs) {
+      await supabase.from("invoice_items").insert([{
+        invoice_id: invoice[0].id,
+        design_id: item.designId || null,
+        quantity_boxes: item.weightGrams,
+        price_per_box: item.metalRate,
+        hsn_code: item.hsnCode || '7113',
+        gst_rate: GST_JEWELLERY,
+      }]);
+    }
+
+    res.json({ message: "✓ Jewellery invoice generated", invoice: { ...invoice[0], items: itemCalcs, grossAmount: Math.round(finalTotal), cgst: Math.round(cgst), sgst: Math.round(sgst), isGstInvoice: isGst } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});

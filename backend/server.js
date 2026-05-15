@@ -162,9 +162,8 @@ app.post("/api/shops/init", async (req, res) => {
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
-    // Generate unique display ID: FB-YYYY-XXXXX
-    const { count } = await supabase.from("shops").select("*", { count: "exact", head: true });
-    const shopIdDisplay = `FB-${new Date().getFullYear()}-${String((count || 0) + 1).padStart(5, "0")}`;
+    // Generate unique display ID: FB-YYYY-XXXXX (random — count+1 had race condition)
+    const shopIdDisplay = `FB-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 100000)).padStart(5, "0")}`;
 
     const { data: shop, error } = await supabase
       .from("shops")
@@ -290,10 +289,16 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 });
 
 // Generate Invoice
+// GSTIN format: 2 digits state + 5 letters PAN + 4 digits + 1 letter + 1 digit/Z + 1 alphanumeric
+const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9][Z][0-9A-Z]$/;
+const isValidGstin = (g) => typeof g === 'string' && GSTIN_REGEX.test(g.toUpperCase());
+
 app.post("/api/invoices/generate", async (req, res) => {
+  let createdInvoiceId = null;
   try {
-    const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstRate, gstMode, items, paymentStatus } = req.body;
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount } = req.body;
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
+    const discount = Math.max(0, parseFloat(discountAmount) || 0);
 
     // Fetch HSN codes for each design from DB
     const designIds = items.map(i => i.designId).filter(Boolean);
@@ -304,20 +309,30 @@ app.post("/api/invoices/generate", async (req, res) => {
     const designMap = {};
     (designsData || []).forEach(d => { designMap[d.id] = d; });
 
-    const totalBoxes = items.reduce((s, i) => s + (parseInt(i.quantityBoxes) || 0), 0);
-    const itemsTotal = items.reduce((s, i) => s + ((parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0)), 0);
+    const qty = (v) => parseFloat(v) || 0;
+    const price = (v) => parseFloat(v) || 0;
+
+    const totalBoxes = items.reduce((s, i) => s + qty(i.quantityBoxes), 0);
+    const itemsTotal = items.reduce((s, i) => s + (qty(i.quantityBoxes) * price(i.pricePerBox)), 0);
 
     // Per-item GST calculation — each product uses its own GST rate from designs table
     const isGstInvoice = (showGst === true || showGst === 'true');
 
-    const itemCalcs = items.map(i => {
+    // Pre-discount line totals (used for proportional discount allocation)
+    const preDiscountLines = items.map(i => qty(i.quantityBoxes) * price(i.pricePerBox));
+    const preDiscountSum = preDiscountLines.reduce((s, n) => s + n, 0) || 1;
+
+    const itemCalcs = items.map((i, idx) => {
       const design = designMap[i.designId] || {};
-      const lineTotal = (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0);
+      const grossLine = preDiscountLines[idx];
+      // Allocate discount proportionally across line items
+      const lineDiscount = preDiscountSum > 0 ? discount * (grossLine / preDiscountSum) : 0;
+      const lineTotal = Math.max(0, grossLine - lineDiscount);
       const itemRate = parseFloat(i.gstRate || design.default_gst_rate || 0);
       const applyGst = isGstInvoice && itemRate > 0;
       const itemTaxable = applyGst && mode === 'included' ? lineTotal / (1 + itemRate / 100) : lineTotal;
       const itemGst = applyGst ? (mode === 'included' ? lineTotal - itemTaxable : lineTotal * itemRate / 100) : 0;
-      return { lineTotal, itemTaxable, itemGst };
+      return { grossLine, lineDiscount, lineTotal, itemTaxable, itemGst, itemRate, applyGst };
     });
 
     const taxableValue = itemCalcs.reduce((s, i) => s + i.itemTaxable, 0);
@@ -326,7 +341,8 @@ app.post("/api/invoices/generate", async (req, res) => {
     const finalGrossAmount = mode === 'exclusive' && isGstInvoice ? grossAmount + gstAmount : grossAmount;
     const cgst = gstAmount / 2;
     const sgst = gstAmount / 2;
-    const invoiceType = (customerGstin && customerGstin.length === 15) ? 'B2B' : 'B2C';
+    const gstinUpper = customerGstin ? customerGstin.toUpperCase() : null;
+    const invoiceType = (gstinUpper && isValidGstin(gstinUpper)) ? 'B2B' : 'B2C';
 
     // Insert invoice
     const { data: invoice, error: invoiceError } = await supabase
@@ -337,7 +353,7 @@ app.post("/api/invoices/generate", async (req, res) => {
         customer_name: customerName,
         customer_phone: customerPhone || null,
         customer_address: customerAddress || null,
-        customer_gstin: customerGstin?.toUpperCase() || null,
+        customer_gstin: gstinUpper,
         invoice_type: invoiceType,
         taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
         cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
@@ -347,31 +363,38 @@ app.post("/api/invoices/generate", async (req, res) => {
         payment_status: paymentStatus || 'paid',
         amount_paid: (paymentStatus === 'credit') ? 0 : null,
         table_number: req.body.tableNumber || null,
+        discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
       }])
       .select();
 
     if (invoiceError) throw invoiceError;
+    createdInvoiceId = invoice[0].id;
 
-    // Insert items with HSN code, update inventory
-    for (const item of items) {
+    // Insert items + decrement inventory in parallel; if anything fails, roll back invoice
+    const itemRows = items.map((item, idx) => {
       const design = designMap[item.designId] || {};
-      const itemHsn = item.hsnCode || design.hsn_code || null;
-      const itemGstRate = item.gstRate || design.default_gst_rate || null;
-
-      await supabase.from("invoice_items").insert([{
-        invoice_id: invoice[0].id,
+      return {
+        invoice_id: createdInvoiceId,
         design_id: item.designId,
-        quantity_boxes: item.quantityBoxes,
-        price_per_box: item.pricePerBox,
-        hsn_code: itemHsn,
-        gst_rate: itemGstRate,
-      }]);
+        quantity_boxes: qty(item.quantityBoxes),
+        price_per_box: price(item.pricePerBox),
+        hsn_code: item.hsnCode || design.hsn_code || null,
+        gst_rate: item.gstRate || design.default_gst_rate || null,
+      };
+    });
 
-      await supabase.rpc("update_inventory_after_invoice", {
+    const { error: itemsErr } = await supabase.from("invoice_items").insert(itemRows);
+    if (itemsErr) throw itemsErr;
+
+    const inventoryUpdates = await Promise.all(items.map(async (item) => {
+      const { error } = await supabase.rpc("update_inventory_after_invoice", {
         design_id: item.designId,
-        quantity: item.quantityBoxes,
+        quantity: qty(item.quantityBoxes),
       });
-    }
+      return error;
+    }));
+    const invErr = inventoryUpdates.find(e => e);
+    if (invErr) throw invErr;
 
     res.json({
       message: "✓ Invoice generated",
@@ -379,6 +402,7 @@ app.post("/api/invoices/generate", async (req, res) => {
         ...invoice[0],
         totalBoxes,
         itemsTotal: Math.round(itemsTotal),
+        discountAmount: Math.round(discount * 100) / 100,
         grossAmount: Math.round(finalGrossAmount),
         finalTotal: Math.round(finalGrossAmount),
         taxableValue: Math.round(taxableValue),
@@ -388,32 +412,35 @@ app.post("/api/invoices/generate", async (req, res) => {
         isGstInvoice,
         gstRate: null,
         gstMode: mode,
-        items: items.map(i => {
+        items: items.map((i, idx) => {
           const design = designMap[i.designId] || {};
-          const lineTotal = (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0);
-          const itemRate = parseFloat(i.gstRate || design.default_gst_rate || 0);
-          const itemIsGst = isGstInvoice && itemRate > 0;
-          const itemTaxable = itemIsGst && mode === 'included' ? lineTotal / (1 + itemRate / 100) : lineTotal;
-          const itemGst = itemIsGst ? (mode === 'included' ? lineTotal - itemTaxable : lineTotal * itemRate / 100) : 0;
-          const itemTotal = mode === 'exclusive' && itemIsGst ? lineTotal + itemGst : lineTotal;
+          const c = itemCalcs[idx];
+          const itemTotal = mode === 'exclusive' && c.applyGst ? c.lineTotal + c.itemGst : c.lineTotal;
           return {
             designId: i.designId,
             designCode: design.design_code || null,
             designName: design.design_name || null,
-            quantityBoxes: i.quantityBoxes,
-            pricePerBox: i.pricePerBox,
+            quantityBoxes: qty(i.quantityBoxes),
+            pricePerBox: price(i.pricePerBox),
             hsnCode: i.hsnCode || design.hsn_code || null,
-            gstRate: itemRate,
-            lineTotal: Math.round(lineTotal * 100) / 100,
-            taxableValue: Math.round(itemTaxable * 100) / 100,
-            cgstAmount: Math.round(itemGst / 2 * 100) / 100,
-            sgstAmount: Math.round(itemGst / 2 * 100) / 100,
+            gstRate: c.itemRate,
+            grossLine: Math.round(c.grossLine * 100) / 100,
+            lineDiscount: Math.round(c.lineDiscount * 100) / 100,
+            lineTotal: Math.round(c.lineTotal * 100) / 100,
+            taxableValue: Math.round(c.itemTaxable * 100) / 100,
+            cgstAmount: Math.round(c.itemGst / 2 * 100) / 100,
+            sgstAmount: Math.round(c.itemGst / 2 * 100) / 100,
             totalWithGst: Math.round(itemTotal * 100) / 100,
           };
         }),
       },
     });
   } catch (error) {
+    // Roll back invoice if items/inventory step failed
+    if (createdInvoiceId) {
+      await supabase.from("invoice_items").delete().eq("invoice_id", createdInvoiceId);
+      await supabase.from("invoices").delete().eq("id", createdInvoiceId);
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -884,25 +911,6 @@ Answer:` }] }],
 });
 
 // ============================================
-// START SERVER
-// ============================================
-
-app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════╗
-║   AI-Powered Shop Management System  ║
-║                                      ║
-║  🏪 Kanhaiya Marbles MVP             ║
-║  ✓ Running on port ${PORT}              ║
-║  ✓ Supabase Connected                ║
-║  ✓ Claude AI Integrated              ║
-║                                      ║
-║  📝 Ready for testing!               ║
-╚══════════════════════════════════════╝
-  `);
-});
-
-// ============================================
 // CREDIT SCORE ENDPOINT (AI-Driven)
 // ============================================
 
@@ -1318,10 +1326,17 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const b2bTaxable = b2bInvoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
     const b2bGst = b2bInvoices.reduce((s, inv) => s + (inv.cgst_amount || 0) + (inv.sgst_amount || 0), 0);
 
-    // Monthly breakdown for GSTR-1
+    // Monthly breakdown for GSTR-1 — bucket by IST month, not UTC
+    const istMonth = (iso) => {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return "";
+      const ist = new Date(d.getTime() + (5.5 * 60 * 60 * 1000));
+      return ist.toISOString().slice(0, 7);
+    };
     const monthlyBreakdown = {};
     invoices.forEach(inv => {
-      const month = (inv.created_at || inv.invoice_date || "").slice(0, 7);
+      const month = istMonth(inv.created_at || inv.invoice_date);
       if (!month) return;
       if (!monthlyBreakdown[month]) monthlyBreakdown[month] = { invoiceCount: 0, taxableValue: 0, cgst: 0, sgst: 0, grossSales: 0, b2bCount: 0 };
       monthlyBreakdown[month].invoiceCount += 1;
@@ -1518,14 +1533,23 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
 
     if (customer) query = query.ilike("customer_name", `%${customer}%`);
     if (month) {
+      // month=YYYY-MM. Use next-month-01 as exclusive upper bound to handle 28/30/31 day months.
+      const [yr, mo] = month.split('-').map(Number);
+      const nextYr = mo === 12 ? yr + 1 : yr;
+      const nextMo = mo === 12 ? 1 : mo + 1;
+      const nextMonth = `${nextYr}-${String(nextMo).padStart(2, '0')}`;
       query = query
-        .gte("created_at", `${month}-01T00:00:00`)
-        .lte("created_at", `${month}-31T23:59:59`);
+        .gte("created_at", `${month}-01T00:00:00+05:30`)
+        .lt("created_at", `${nextMonth}-01T00:00:00+05:30`);
     }
     if (date) {
+      // date=YYYY-MM-DD in IST. Use next-day exclusive bound.
+      const next = new Date(`${date}T00:00:00+05:30`);
+      next.setDate(next.getDate() + 1);
+      const nextDate = next.toISOString().slice(0, 10);
       query = query
-        .gte("created_at", `${date}T00:00:00`)
-        .lte("created_at", `${date}T23:59:59`);
+        .gte("created_at", `${date}T00:00:00+05:30`)
+        .lt("created_at", `${nextDate}T00:00:00+05:30`);
     }
 
     const { data, error } = await query;
@@ -1551,6 +1575,17 @@ app.delete("/api/invoices/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
+    // Fetch invoice to check idempotency + get shop_id
+    const { data: invoiceRow, error: invErr } = await supabase
+      .from("invoices")
+      .select("id, shop_id, payment_status")
+      .eq("id", id)
+      .single();
+    if (invErr || !invoiceRow) return res.status(404).json({ error: "Invoice not found" });
+    if (["cancelled", "returned"].includes(invoiceRow.payment_status)) {
+      return res.json({ success: true, message: "Invoice already cancelled", idempotent: true });
+    }
+
     // Fetch invoice items to restore inventory
     const { data: items, error: itemsErr } = await supabase
       .from("invoice_items")
@@ -1558,19 +1593,20 @@ app.delete("/api/invoices/:id", async (req, res) => {
       .eq("invoice_id", id);
     if (itemsErr) throw itemsErr;
 
-    // Restore inventory for each item
-    for (const item of (items || [])) {
+    // Restore inventory for each item (parallel, shop_id scoped)
+    await Promise.all((items || []).map(async (item) => {
       const { data: inv } = await supabase
         .from("inventory")
         .select("id, quantity_boxes")
+        .eq("shop_id", invoiceRow.shop_id)
         .eq("design_id", item.design_id)
-        .single();
+        .maybeSingle();
       if (inv) {
         await supabase.from("inventory")
-          .update({ quantity_boxes: (inv.quantity_boxes || 0) + item.quantity_boxes })
+          .update({ quantity_boxes: (inv.quantity_boxes || 0) + (item.quantity_boxes || 0) })
           .eq("id", inv.id);
       }
-    }
+    }));
 
     // Mark invoice as cancelled (soft delete)
     const { error: updateErr } = await supabase
@@ -1596,19 +1632,33 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       return res.status(400).json({ error: "returnItems required" });
     }
 
-    // Restore inventory for returned items
-    for (const item of returnItems) {
+    // Lookup invoice for shop_id + idempotency
+    const { data: invoiceRow, error: invErr } = await supabase
+      .from("invoices")
+      .select("id, shop_id, payment_status")
+      .eq("id", id)
+      .single();
+    if (invErr || !invoiceRow) return res.status(404).json({ error: "Invoice not found" });
+    if (invoiceRow.payment_status === "returned") {
+      return res.json({ success: true, message: "Invoice already fully returned", idempotent: true });
+    }
+
+    // Restore inventory for returned items (parallel, shop_id scoped)
+    await Promise.all(returnItems.map(async (item) => {
+      const q = parseFloat(item.quantityBoxes) || 0;
+      if (q <= 0) return;
       const { data: inv } = await supabase
         .from("inventory")
         .select("id, quantity_boxes")
+        .eq("shop_id", invoiceRow.shop_id)
         .eq("design_id", item.designId)
-        .single();
+        .maybeSingle();
       if (inv) {
         await supabase.from("inventory")
-          .update({ quantity_boxes: (inv.quantity_boxes || 0) + item.quantityBoxes })
+          .update({ quantity_boxes: (inv.quantity_boxes || 0) + q })
           .eq("id", inv.id);
       }
-    }
+    }));
 
     // Fetch invoice to check if fully returned
     const { data: allItems } = await supabase
@@ -1616,8 +1666,8 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       .select("design_id, quantity_boxes")
       .eq("invoice_id", id);
 
-    const totalQty = (allItems || []).reduce((s, i) => s + i.quantity_boxes, 0);
-    const returnQty = returnItems.reduce((s, i) => s + i.quantityBoxes, 0);
+    const totalQty = (allItems || []).reduce((s, i) => s + (i.quantity_boxes || 0), 0);
+    const returnQty = returnItems.reduce((s, i) => s + (parseFloat(i.quantityBoxes) || 0), 0);
     const newStatus = returnQty >= totalQty ? "returned" : "partial_return";
 
     await supabase.from("invoices")
@@ -1932,4 +1982,23 @@ app.post("/api/invoices/jewellery", async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// ============================================
+// START SERVER (must be after all routes registered)
+// ============================================
+
+app.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════════╗
+║   AI-Powered Shop Management System  ║
+║                                      ║
+║  🏪 Kanhaiya Marbles MVP             ║
+║  ✓ Running on port ${PORT}              ║
+║  ✓ Supabase Connected                ║
+║  ✓ Claude AI Integrated              ║
+║                                      ║
+║  📝 Ready for testing!               ║
+╚══════════════════════════════════════╝
+  `);
 });

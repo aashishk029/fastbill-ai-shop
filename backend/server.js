@@ -244,7 +244,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
       .from("inventory")
       .select(
         `*,
-        designs(design_code, design_name, color, hsn_code, default_gst_rate,
+        designs(design_code, design_name, color, hsn_code, default_gst_rate, unit_type,
           tile_categories(category_name, base_price_per_box)
         )`
       )
@@ -1736,7 +1736,7 @@ app.get("/api/customers/:shopId", async (req, res) => {
     const { data, error } = await supabase.from("invoices")
       .select("customer_name, customer_phone, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
       .eq("shop_id", shopId)
-      .not("payment_status", "in", '("cancelled")')
+      .not("payment_status", "in", '("cancelled","returned")')
       .order("created_at", { ascending: false });
     if (error) throw error;
 
@@ -1777,7 +1777,7 @@ app.get("/api/customers/:shopId/history", async (req, res) => {
     let query = supabase.from("invoices")
       .select("*, invoice_items(quantity_boxes, price_per_box, design_id, hsn_code, gst_rate, designs(design_code, design_name))")
       .eq("shop_id", shopId)
-      .not("payment_status", "in", '("cancelled")')
+      .not("payment_status", "in", '("cancelled","returned")')
       .order("created_at", { ascending: false });
 
     if (phone) query = query.ilike("customer_phone", `%${phone}%`);

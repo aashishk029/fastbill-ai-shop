@@ -1266,14 +1266,25 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const fyStart = `${fy}-04-01T00:00:00+05:30`;
     const fyEnd   = `${fy + 1}-03-31T23:59:59+05:30`;
 
-    const [invoicesRes, purchasesRes, shopRes] = await Promise.allSettled([
-      // No invoice_items join — use pre-stored aggregated values (O(n) not O(n*m))
+    const [invoicesRes, nonGstInvoicesRes, purchasesRes, shopRes] = await Promise.allSettled([
+      // GST invoices only — pre-stored aggregated values (O(n))
       supabase.from("invoices")
-        .select("id, invoice_number, customer_name, customer_gstin, invoice_type, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate")
+        .select("id, invoice_number, customer_name, customer_gstin, invoice_type, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate, payment_status")
         .eq("shop_id", shopId)
         .gte("created_at", fyStart)
         .lte("created_at", fyEnd)
+        .not("taxable_value", "is", null)
+        .not("payment_status", "in", '("cancelled","returned")')
         .order("created_at", { ascending: true }),
+
+      // Non-GST invoices — need invoice_items to compute revenue (for ITR only)
+      supabase.from("invoices")
+        .select("id, created_at, payment_status, invoice_items(quantity_boxes, price_per_box)")
+        .eq("shop_id", shopId)
+        .gte("created_at", fyStart)
+        .lte("created_at", fyEnd)
+        .is("taxable_value", null)
+        .not("payment_status", "in", '("cancelled","returned")'),
 
       supabase.from("purchases")
         .select("quantity_boxes, cost_per_box, purchase_date, supplier_name")
@@ -1285,31 +1296,29 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     ]);
 
     const invoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
+    const nonGstInvoices = nonGstInvoicesRes.status === "fulfilled" ? nonGstInvoicesRes.value.data || [] : [];
     const purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
     const shop = shopRes.status === "fulfilled" ? shopRes.value.data : {};
 
-    // Gross sales from stored taxable_value + gst (GST invoices only — non-GST invoices have null values)
-    const grossSales = invoices.reduce((s, inv) => {
-      const invGross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
-      return s + invGross;
-    }, 0);
+    // ── GST SECTION (only GST invoices — non-GST bills are outside GST ambit) ──
+    // grossSales for GSTR-1 = full invoice value (taxable + GST collected)
+    const grossSales = invoices.reduce((s, inv) =>
+      s + (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0), 0);
 
-    // GST from actual stored values (null for non-GST invoices → 0)
     const taxableValue = invoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
     const cgst = invoices.reduce((s, inv) => s + (inv.cgst_amount || 0), 0);
     const sgst = invoices.reduce((s, inv) => s + (inv.sgst_amount || 0), 0);
     const gstCollected = cgst + sgst;
 
-    const totalPurchaseCost = purchases.reduce((s, p) => s + ((p.quantity_boxes || 0) * (p.cost_per_box || 0)), 0);
-    const itcAvailable = 0; // ITC requires purchase GST invoices — not tracked yet
+    const itcAvailable = 0; // ITC tracking needs purchase GST invoices — not tracked yet
     const netGstPayable = Math.max(0, gstCollected - itcAvailable);
 
-    // B2B vs B2C split (for GSTR-1 filing)
+    // B2B split for GSTR-1
     const b2bInvoices = invoices.filter(inv => inv.invoice_type === 'B2B' || inv.customer_gstin);
     const b2bTaxable = b2bInvoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
     const b2bGst = b2bInvoices.reduce((s, inv) => s + (inv.cgst_amount || 0) + (inv.sgst_amount || 0), 0);
 
-    // Monthly breakdown for GSTR-1 — O(n) using stored values only
+    // Monthly breakdown for GSTR-1
     const monthlyBreakdown = {};
     invoices.forEach(inv => {
       const month = (inv.created_at || inv.invoice_date || "").slice(0, 7);
@@ -1329,8 +1338,22 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
       monthlyBreakdown[m].grossSales = Math.round(monthlyBreakdown[m].grossSales);
     });
 
-    // P&L for ITR
-    const netProfit = taxableValue - totalPurchaseCost;
+    // ── ITR / P&L SECTION ──
+    // Per CBDT: GST collected & deposited is NOT part of turnover under Sec 44AD.
+    // Turnover = GST-exclusive sales (taxableValue) + non-GST bill revenue
+    const nonGstRevenue = nonGstInvoices.reduce((s, inv) =>
+      s + (inv.invoice_items || []).reduce((ls, item) =>
+        ls + ((item.quantity_boxes || 0) * (item.price_per_box || 0)), 0), 0);
+
+    // Total business turnover (ITR base)
+    const totalTurnover = taxableValue + nonGstRevenue;
+
+    const totalPurchaseCost = purchases.reduce((s, p) => s + ((p.quantity_boxes || 0) * (p.cost_per_box || 0)), 0);
+    const grossProfit = totalTurnover - totalPurchaseCost;
+
+    // Sec 44AD presumptive: 8% of total turnover (6% if digital — we use conservative 8%)
+    // Limit: ₹2 Cr (basic). Extended to ₹3 Cr only if 95%+ receipts are non-cash.
+    const presumptiveTaxableIncome = Math.round(totalTurnover * 0.08);
 
     res.json({
       shop: { name: shop?.name, owner: shop?.owner_name, phone: shop?.phone, gstin: shop?.gstin || null },
@@ -1351,13 +1374,15 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         monthlyBreakdown,
       },
       pnl: {
-        grossIncome: Math.round(grossSales),
-        taxableIncome: Math.round(taxableValue),
+        grossIncome: Math.round(totalTurnover),        // GST-ex turnover + non-GST bills
+        gstInvoiceRevenue: Math.round(taxableValue),  // from GST bills (ex-GST)
+        nonGstRevenue: Math.round(nonGstRevenue),     // from non-GST bills
+        nonGstInvoiceCount: nonGstInvoices.length,
         purchaseExpenses: Math.round(totalPurchaseCost),
-        grossProfit: Math.round(netProfit),
-        presumptiveTaxableIncome: Math.round(taxableValue * 0.08), // 8% of turnover under ITR-4 44AD
+        grossProfit: Math.round(grossProfit),
+        presumptiveTaxableIncome,                     // 8% of totalTurnover (Sec 44AD)
       },
-      itrNote: "ITR-4 (44AD): Agar turnover ₹3Cr se kam hai to 8% ko taxable income maan sakte ho.",
+      itrNote: "Sec 44AD: Turnover < ₹2 Cr → 8% presumptive income. GST collected excluded from turnover (CBDT position). Non-GST bills included in turnover.",
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

@@ -531,7 +531,7 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
 
     for (const item of items) {
       if (!item.designId || !item.quantity) continue;
-      const qty = parseInt(item.quantity) || 0;
+      const qty = parseFloat(item.quantity) || 0;
       if (qty <= 0) continue;
 
       // Increment existing inventory row, or create if missing
@@ -1079,7 +1079,7 @@ app.post("/api/purchases/add", async (req, res) => {
         {
           shop_id: shopId,
           design_id,
-          quantity_boxes: parseInt(quantity_boxes),
+          quantity_boxes: parseFloat(quantity_boxes) || 0,
           supplier_name: supplier_name || "Direct Purchase",
           cost_per_box: parseFloat(cost_per_box) || 0,
           purchase_date: new Date().toISOString(),
@@ -1099,7 +1099,7 @@ app.post("/api/purchases/add", async (req, res) => {
       .maybeSingle();
 
     if (currentInventory) {
-      const newQuantity = currentInventory.quantity_boxes + parseInt(quantity_boxes);
+      const newQuantity = (currentInventory.quantity_boxes || 0) + (parseFloat(quantity_boxes) || 0);
       const { error: updateError } = await supabase
         .from("inventory")
         .update({
@@ -1208,7 +1208,7 @@ app.post("/api/designs/add", async (req, res) => {
       .insert([{
         shop_id: shopId,
         design_id: design.id,
-        quantity_boxes: parseInt(initialQuantity) || 0,
+        quantity_boxes: parseFloat(initialQuantity) || 0,
         low_stock_threshold: 10,
         last_restocked_at: new Date().toISOString(),
       }]);
@@ -1483,7 +1483,7 @@ app.patch("/api/inventory/adjust", async (req, res) => {
   try {
     const { shopId, designId, inventoryId, newQuantity } = req.body;
     if (newQuantity === undefined) return res.status(400).json({ error: "newQuantity required" });
-    const qty = parseInt(newQuantity);
+    const qty = parseFloat(newQuantity);
     if (isNaN(qty) || qty < 0) return res.status(400).json({ error: "Invalid quantity" });
 
     let query = supabase.from("inventory").update({ quantity_boxes: qty });

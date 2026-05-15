@@ -147,7 +147,7 @@ app.get("/api/health", (req, res) => {
 // Initialize Shop
 app.post("/api/shops/init", async (req, res) => {
   try {
-    const { shopName, ownerName, phone, address, shopType, pin, gstin, pan } = req.body;
+    const { shopName, ownerName, phone, address, shopType, pin, gstin, pan, upiId } = req.body;
 
     if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
       return res.status(400).json({ error: "4 digit PIN zaroori hai" });
@@ -172,6 +172,7 @@ app.post("/api/shops/init", async (req, res) => {
         shop_type: shopType, pin_hash,
         gstin: gstin?.toUpperCase() || null,
         pan_number: pan?.toUpperCase() || null,
+        upi_id: upiId || null,
         shop_id_display: shopIdDisplay,
       }])
       .select();
@@ -196,6 +197,32 @@ app.get("/api/shops/:shopId", async (req, res) => {
     if (error) throw error;
 
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update shop details (UPI, GSTIN, address, etc.)
+app.patch("/api/shops/:shopId", async (req, res) => {
+  try {
+    const allowed = ['name', 'owner_name', 'address', 'gstin', 'pan_number', 'upi_id', 'auto_reminder_enabled', 'reminder_threshold_days'];
+    const updates = {};
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) updates[key] = req.body[key];
+    }
+    if (updates.gstin) updates.gstin = updates.gstin.toUpperCase();
+    if (updates.pan_number) updates.pan_number = updates.pan_number.toUpperCase();
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: "No valid fields to update" });
+
+    const { data, error } = await supabase
+      .from("shops")
+      .update(updates)
+      .eq("id", req.params.shopId)
+      .select()
+      .single();
+    if (error) throw error;
+    const { pin_hash, ...safe } = data;
+    res.json({ success: true, shop: safe });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1274,7 +1301,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const fyStart = `${fy}-04-01T00:00:00+05:30`;
     const fyEnd   = `${fy + 1}-03-31T23:59:59+05:30`;
 
-    const [invoicesRes, nonGstInvoicesRes, purchasesRes, shopRes] = await Promise.allSettled([
+    const [invoicesRes, nonGstInvoicesRes, purchasesRes, shopRes, expensesRes] = await Promise.allSettled([
       // GST invoices only — pre-stored aggregated values (O(n))
       supabase.from("invoices")
         .select("id, invoice_number, customer_name, customer_gstin, invoice_type, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate, payment_status")
@@ -1301,12 +1328,20 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         .lte("purchase_date", fyEnd),
 
       supabase.from("shops").select("*").eq("id", shopId).single(),
+
+      // Expenses for the FY
+      supabase.from("expenses")
+        .select("category, amount, expense_date")
+        .eq("shop_id", shopId)
+        .gte("expense_date", fyStart)
+        .lte("expense_date", fyEnd),
     ]);
 
     const invoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
     const nonGstInvoices = nonGstInvoicesRes.status === "fulfilled" ? nonGstInvoicesRes.value.data || [] : [];
     const purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
     const shop = shopRes.status === "fulfilled" ? shopRes.value.data : {};
+    const expenses = expensesRes.status === "fulfilled" ? expensesRes.value.data || [] : [];
 
     // ── GST SECTION (only GST invoices — non-GST bills are outside GST ambit) ──
     // grossSales for GSTR-1 = full invoice value (taxable + GST collected)
@@ -1364,7 +1399,16 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const totalTurnover = taxableValue + nonGstRevenue;
 
     const totalPurchaseCost = purchases.reduce((s, p) => s + ((p.quantity_boxes || 0) * (p.cost_per_box || 0)), 0);
+
+    // Operating expenses (rent/utility/salary/etc.) — separate from COGS
+    const expensesByCategory = {};
+    const totalExpenses = expenses.reduce((s, e) => {
+      expensesByCategory[e.category] = (expensesByCategory[e.category] || 0) + (e.amount || 0);
+      return s + (e.amount || 0);
+    }, 0);
+
     const grossProfit = totalTurnover - totalPurchaseCost;
+    const netProfit = grossProfit - totalExpenses;
 
     // Sec 44AD presumptive: 8% of total turnover (6% if digital — we use conservative 8%)
     // Limit: ₹2 Cr (basic). Extended to ₹3 Cr only if 95%+ receipts are non-cash.
@@ -1394,7 +1438,10 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         nonGstRevenue: Math.round(nonGstRevenue),     // from non-GST bills
         nonGstInvoiceCount: nonGstInvoices.length,
         purchaseExpenses: Math.round(totalPurchaseCost),
+        operatingExpenses: Math.round(totalExpenses),
+        expensesByCategory,
         grossProfit: Math.round(grossProfit),
+        netProfit: Math.round(netProfit),
         presumptiveTaxableIncome,                     // 8% of totalTurnover (Sec 44AD)
       },
       itrNote: "Sec 44AD: Turnover < ₹2 Cr → 8% presumptive income. GST collected excluded from turnover (CBDT position). Non-GST bills included in turnover.",
@@ -1981,6 +2028,149 @@ app.post("/api/invoices/jewellery", async (req, res) => {
     }
 
     res.json({ message: "✓ Jewellery invoice generated", invoice: { ...invoice[0], items: itemCalcs, grossAmount: Math.round(finalTotal), cgst: Math.round(cgst), sgst: Math.round(sgst), isGstInvoice: isGst } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// EXPENSE TRACKER
+// ============================================
+
+const EXPENSE_CATEGORIES = ['rent', 'utility', 'salary', 'transport', 'marketing', 'other'];
+
+app.post("/api/expenses", async (req, res) => {
+  try {
+    const { shopId, category, amount, note, expenseDate } = req.body;
+    if (!shopId || !category || !amount) return res.status(400).json({ error: "shopId, category, amount required" });
+    if (!EXPENSE_CATEGORIES.includes(category)) return res.status(400).json({ error: "Invalid category" });
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: "amount must be > 0" });
+
+    const { data, error } = await supabase.from("expenses").insert([{
+      shop_id: shopId,
+      category,
+      amount: amt,
+      note: note || null,
+      expense_date: expenseDate || new Date().toISOString(),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, expense: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/expenses/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { month, year } = req.query;
+    let query = supabase.from("expenses").select("*").eq("shop_id", shopId).order("expense_date", { ascending: false });
+    if (month) {
+      const [yr, mo] = month.split('-').map(Number);
+      const nextYr = mo === 12 ? yr + 1 : yr;
+      const nextMo = mo === 12 ? 1 : mo + 1;
+      const nextMonth = `${nextYr}-${String(nextMo).padStart(2, '0')}`;
+      query = query.gte("expense_date", `${month}-01T00:00:00+05:30`)
+                   .lt("expense_date", `${nextMonth}-01T00:00:00+05:30`);
+    } else if (year) {
+      const fy = parseInt(year);
+      query = query.gte("expense_date", `${fy}-04-01T00:00:00+05:30`)
+                   .lte("expense_date", `${fy + 1}-03-31T23:59:59+05:30`);
+    }
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const byCategory = {};
+    const total = (data || []).reduce((s, e) => {
+      byCategory[e.category] = (byCategory[e.category] || 0) + (e.amount || 0);
+      return s + (e.amount || 0);
+    }, 0);
+
+    res.json({ expenses: data || [], total: Math.round(total), byCategory });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/expenses/:id", async (req, res) => {
+  try {
+    const { error } = await supabase.from("expenses").delete().eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// OVERDUE BAKAYA REMINDERS
+// ============================================
+
+// List overdue credit/partial invoices grouped by age bucket
+app.get("/api/reminders/overdue/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const now = Date.now();
+    const day = 24 * 60 * 60 * 1000;
+
+    const { data: invoices, error } = await supabase
+      .from("invoices")
+      .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, last_reminder_at, invoice_items(quantity_boxes, price_per_box)")
+      .eq("shop_id", shopId)
+      .in("payment_status", ["credit", "partial"])
+      .not("customer_phone", "is", null)
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+
+    const enriched = (invoices || []).map(inv => {
+      const items = inv.invoice_items || [];
+      const gross = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0)
+        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+      const outstanding = Math.round(gross - (inv.amount_paid || 0));
+      const ageDays = Math.floor((now - new Date(inv.created_at).getTime()) / day);
+      const reminderAgeDays = inv.last_reminder_at
+        ? Math.floor((now - new Date(inv.last_reminder_at).getTime()) / day)
+        : 999;
+      let bucket = 'fresh';
+      if (ageDays >= 30) bucket = 'critical';
+      else if (ageDays >= 15) bucket = 'overdue';
+      else if (ageDays >= 7) bucket = 'due';
+      return {
+        id: inv.id, invoice_number: inv.invoice_number,
+        customer_name: inv.customer_name, customer_phone: inv.customer_phone,
+        outstanding, ageDays, reminderAgeDays, bucket,
+        created_at: inv.created_at, last_reminder_at: inv.last_reminder_at,
+      };
+    }).filter(i => i.outstanding > 0 && i.bucket !== 'fresh');
+
+    const summary = {
+      due: enriched.filter(i => i.bucket === 'due').length,
+      overdue: enriched.filter(i => i.bucket === 'overdue').length,
+      critical: enriched.filter(i => i.bucket === 'critical').length,
+      total: enriched.length,
+      totalAmount: enriched.reduce((s, i) => s + i.outstanding, 0),
+    };
+
+    res.json({ summary, invoices: enriched });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark reminders as sent (bulk update last_reminder_at)
+app.post("/api/reminders/mark-sent", async (req, res) => {
+  try {
+    const { invoiceIds } = req.body;
+    if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+      return res.status(400).json({ error: "invoiceIds array required" });
+    }
+    const { error } = await supabase
+      .from("invoices")
+      .update({ last_reminder_at: new Date().toISOString() })
+      .in("id", invoiceIds);
+    if (error) throw error;
+    res.json({ success: true, count: invoiceIds.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

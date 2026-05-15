@@ -391,7 +391,7 @@ app.post("/api/invoices/generate", async (req, res) => {
         items: items.map(i => {
           const design = designMap[i.designId] || {};
           const lineTotal = (parseInt(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0);
-          const itemRate = parseFloat(i.gstRate || design.default_gst_rate || rate || 0);
+          const itemRate = parseFloat(i.gstRate || design.default_gst_rate || 0);
           const itemIsGst = isGstInvoice && itemRate > 0;
           const itemTaxable = itemIsGst && mode === 'included' ? lineTotal / (1 + itemRate / 100) : lineTotal;
           const itemGst = itemIsGst ? (mode === 'included' ? lineTotal - itemTaxable : lineTotal * itemRate / 100) : 0;
@@ -972,7 +972,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
           const price = i.designs?.tile_categories?.base_price_per_box || 0;
           return s + (i.quantity_boxes * price);
         }, 0),
-        categories: [...new Set(inventory.map(i => i.tile_categories?.category_name).filter(Boolean))],
+        categories: [...new Set(inventory.map(i => i.designs?.tile_categories?.category_name).filter(Boolean))],
       },
       purchaseSummary: {
         totalOrders: purchases.length,
@@ -1088,7 +1088,7 @@ app.post("/api/purchases/add", async (req, res) => {
       .select("quantity_boxes")
       .eq("design_id", design_id)
       .eq("shop_id", shopId)
-      .single();
+      .maybeSingle();
 
     if (currentInventory) {
       const newQuantity = currentInventory.quantity_boxes + parseInt(quantity_boxes);

@@ -1591,9 +1591,9 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
     }
     if (date) {
       // date=YYYY-MM-DD in IST. Use next-day exclusive bound.
-      const next = new Date(`${date}T00:00:00+05:30`);
-      next.setDate(next.getDate() + 1);
-      const nextDate = next.toISOString().slice(0, 10);
+      // Use UTC date arithmetic to avoid IST offset collapsing nextDate back to same day.
+      const [dyr, dmo, ddd] = date.split('-').map(Number);
+      const nextDate = new Date(Date.UTC(dyr, dmo - 1, ddd + 1)).toISOString().slice(0, 10);
       query = query
         .gte("created_at", `${date}T00:00:00+05:30`)
         .lt("created_at", `${nextDate}T00:00:00+05:30`);

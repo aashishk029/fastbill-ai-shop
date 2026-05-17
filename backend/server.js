@@ -953,7 +953,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
 
     const [invoicesRes, inventoryRes, purchasesRes] = await Promise.all([
       supabase.from("invoices")
-        .select("customer_name, total_amount, created_at")
+        .select("customer_name, total_amount, taxable_value, cgst_amount, sgst_amount, created_at")
         .eq("shop_id", shopId)
         .not("payment_status", "in", '("cancelled","returned")')
         .gte("created_at", ninetyDaysAgo.toISOString()),
@@ -972,7 +972,10 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
 
     // ── Rule-based scoring (300–900, CIBIL style) ──────────────────────────
     const invoiceCount   = invoices.length;
-    const totalRevenue   = invoices.reduce((s, i) => s + (parseFloat(i.total_amount) || 0), 0);
+    const totalRevenue   = invoices.reduce((s, i) => {
+      const amt = parseFloat(i.total_amount) || (parseFloat(i.taxable_value) + parseFloat(i.cgst_amount || 0) + parseFloat(i.sgst_amount || 0)) || 0;
+      return s + amt;
+    }, 0);
     const uniqueCustomers = new Set(invoices.map(i => i.customer_name).filter(Boolean)).size;
     const lowStockCount  = inventory.filter(i => i.is_low_stock).length;
     const lowStockRatio  = inventory.length > 0 ? lowStockCount / inventory.length : 0;

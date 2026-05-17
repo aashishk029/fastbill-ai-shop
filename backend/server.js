@@ -611,24 +611,28 @@ app.get("/api/alerts/:shopId", async (req, res) => {
 
     if (error) throw error;
 
-    // Generate alerts using Claude
-    const alertsMessage = await claudeClient.messages.create({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: 500,
-      messages: [
-        {
-          role: "user",
-          content: `You are a shop inventory advisor. Based on these low stock items, provide brief, actionable alerts:
-          ${JSON.stringify(inventory)}
-          
-          Provide alerts as JSON array with fields: message, severity (low/medium/high), actionItem`,
-        },
-      ],
-    });
+    // Generate alert message using Gemini (free, no API key issues)
+    let message = inventory.length > 0
+      ? `${inventory.length} items low stock. Jaldi restock karo.`
+      : "Sab items ka stock theek hai.";
+    try {
+      if (inventory.length > 0) {
+        const names = inventory.slice(0, 5).map(i => i.designs?.design_name || i.designs?.design_code).filter(Boolean).join(', ');
+        const prompt = `Ek dukandar ke paas ye items kam hain: ${names}. 1-2 short Hindi sentences mein urgent restock advice do.`;
+        const gRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 80 } }) }
+        );
+        const gData = await gRes.json();
+        const text = gData?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) message = text.trim();
+      }
+    } catch {}
 
     res.json({
       lowStockItems: inventory,
-      aiInsights: alertsMessage.content[0].text,
+      message,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -944,142 +948,86 @@ Answer:` }] }],
 app.get("/api/credit-score/:shopId", async (req, res) => {
   try {
     const { shopId } = req.params;
-
     const ninetyDaysAgo = new Date();
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
 
-    // Gather ALL available local data in parallel
-    const [shopRes, invoicesRes, inventoryRes, purchasesRes] = await Promise.all([
-      supabase.from("shops").select("*").eq("id", shopId).single(),
-
+    const [invoicesRes, inventoryRes, purchasesRes] = await Promise.all([
       supabase.from("invoices")
-        .select("invoice_number, customer_name, created_at")
+        .select("customer_name, total_amount, created_at")
         .eq("shop_id", shopId)
-        .gte("created_at", ninetyDaysAgo.toISOString())
-        .order("created_at", { ascending: false }),
-
+        .not("payment_status", "in", '("cancelled","returned")')
+        .gte("created_at", ninetyDaysAgo.toISOString()),
       supabase.from("inventory")
-        .select("quantity_boxes, is_low_stock, last_restocked_at, designs(design_name, design_code, tile_categories(category_name, base_price_per_box))")
+        .select("quantity_boxes, is_low_stock, low_stock_threshold")
         .eq("shop_id", shopId),
-
       supabase.from("purchases")
-        .select("quantity_boxes, supplier_name, cost_per_box, purchase_date")
+        .select("quantity_boxes, cost_per_box")
         .eq("shop_id", shopId)
-        .gte("purchase_date", ninetyDaysAgo.toISOString())
-        .order("purchase_date", { ascending: false }),
+        .gte("purchase_date", ninetyDaysAgo.toISOString()),
     ]);
 
-    const shop = shopRes.data;
     const invoices = invoicesRes.data || [];
     const inventory = inventoryRes.data || [];
     const purchases = purchasesRes.data || [];
 
-    // Build monthly revenue summary for trend analysis
-    const monthlyRevenue = {};
-    invoices.forEach(inv => {
-      const month = inv.created_at?.slice(0, 7);
-      if (month) monthlyRevenue[month] = (monthlyRevenue[month] || 0) + 1;
-    });
+    // ── Rule-based scoring (300–900, CIBIL style) ──────────────────────────
+    const invoiceCount   = invoices.length;
+    const totalRevenue   = invoices.reduce((s, i) => s + (parseFloat(i.total_amount) || 0), 0);
+    const uniqueCustomers = new Set(invoices.map(i => i.customer_name).filter(Boolean)).size;
+    const lowStockCount  = inventory.filter(i => i.is_low_stock).length;
+    const lowStockRatio  = inventory.length > 0 ? lowStockCount / inventory.length : 0;
+    const purchaseCount  = purchases.length;
 
-    // Package all data for Claude
-    const shopProfile = {
-      name: shop?.name,
-      owner: shop?.owner_name,
-      address: shop?.address,
-      shopType: shop?.shop_type,
-      dataAvailable: {
-        invoiceCount: invoices.length,
-        inventoryItems: inventory.length,
-        purchaseOrders: purchases.length,
-        dataPeriodDays: 90,
-      },
-      invoiceSummary: {
-        total: invoices.length,
-        totalRevenue: invoices.length,
-        uniqueCustomers: new Set(invoices.map(i => i.customer_name)).size,
-        monthlyRevenueTrend: monthlyRevenue,
-        recentInvoices: invoices.slice(0, 5),
-      },
-      inventorySummary: {
-        totalProducts: inventory.length,
-        lowStockItems: inventory.filter(i => i.is_low_stock).length,
-        totalStockValue: inventory.reduce((s, i) => {
-          const price = i.designs?.tile_categories?.base_price_per_box || 0;
-          return s + (i.quantity_boxes * price);
-        }, 0),
-        categories: [...new Set(inventory.map(i => i.designs?.tile_categories?.category_name).filter(Boolean))],
-      },
-      purchaseSummary: {
-        totalOrders: purchases.length,
-        totalInvested: purchases.reduce((s, p) => s + ((p.cost_per_box || 0) * (p.quantity_boxes || 0)), 0),
-        suppliers: [...new Set(purchases.map(p => p.supplier_name).filter(Boolean))],
-        recentPurchases: purchases.slice(0, 3),
-      },
-    };
+    // Each pillar: 0–150 pts  →  total additional 0–600  →  final 300–900
+    const s1 = invoiceCount  >= 30 ? 150 : invoiceCount  >= 15 ? 120 : invoiceCount  >= 5 ? 80 : invoiceCount  >= 1 ? 40 : 0;
+    const s2 = totalRevenue  >= 100000 ? 150 : totalRevenue >= 50000 ? 120 : totalRevenue >= 20000 ? 80 : totalRevenue >= 5000 ? 40 : 0;
+    const s3 = inventory.length === 0 ? 75
+             : lowStockRatio <= 0.10 ? 150 : lowStockRatio <= 0.25 ? 120 : lowStockRatio <= 0.50 ? 75 : 30;
+    const s4 = purchaseCount >= 5 ? 150 : purchaseCount >= 3 ? 120 : purchaseCount >= 1 ? 70 : 0;
 
-    // Claude analyzes ALL data and scores intelligently
-    const claudeResp = await claudeClient.messages.create({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: 600,
-      messages: [{
-        role: "user",
-        content: `You are a credit scoring AI for Indian SMBs. Analyze this tile shop's business data and generate a credit score.
+    const finalScore = Math.min(900, Math.max(300, 300 + s1 + s2 + s3 + s4));
+    const rating     = finalScore >= 750 ? 'Excellent' : finalScore >= 600 ? 'Good' : finalScore >= 450 ? 'Fair' : 'Poor';
 
-SHOP DATA (last 90 days):
-${JSON.stringify(shopProfile, null, 2)}
+    const lvl = (s, thresholds, labels) => labels[thresholds.findIndex(t => s >= t)] || labels[labels.length - 1];
+    const salesLvl   = lvl(s1, [150, 120, 80, 40], ['Strong','Good','Fair','Weak']);
+    const revLvl     = lvl(s2, [150, 120, 80, 40], ['Strong','Good','Fair','Weak']);
+    const invLvl     = lvl(s3, [150, 120, 75, 30], ['Strong','Good','Fair','Weak']);
+    const purchLvl   = lvl(s4, [150, 120, 70], ['Strong','Good','Fair','Weak']);
 
-INSTRUCTIONS:
-- Score 300-900 (like CIBIL). Only use data that is actually available. If data is missing, note it but don't penalize heavily.
-- Consider: sales activity, revenue consistency/trend, inventory management, purchase regularity, business scale.
-- Return ONLY valid JSON (no extra text):
-
-{
-  "score": <number 300-900>,
-  "rating": "<Excellent|Good|Fair|Poor>",
-  "scoreBreakdown": {
-    "salesActivity": "<Strong|Good|Fair|Weak> - <one line reason>",
-    "revenueHealth": "<Strong|Good|Fair|Weak> - <one line reason>",
-    "inventoryManagement": "<Strong|Good|Fair|Weak> - <one line reason>",
-    "purchaseConsistency": "<Strong|Good|Fair|Weak> - <one line reason>"
-  },
-  "dataQuality": "<how much data was available to score - one line>",
-  "adviceHindi": "<2-3 simple Hindi lines: score ka matlab aur improvement tips>"
-}`
-      }]
-    });
-
-    // Parse Claude's structured response
-    let aiResult;
+    // ── Gemini: Hindi advice (non-blocking, fallback if fails) ────────────
+    let adviceHindi = "Regular bills banao, stock maintain karo, purchases record karo — score automatically badhega.";
     try {
-      const rawText = claudeResp.content[0].text;
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      aiResult = JSON.parse(jsonMatch[0]);
-    } catch {
-      aiResult = {
-        score: 500,
-        rating: "Fair",
-        scoreBreakdown: {},
-        dataQuality: "Partial data available",
-        adviceHindi: "Score calculate karne mein thodi takleef hui. Dobara try karein."
-      };
-    }
+      const prompt = `Ek Indian dukandar ka 90-din ka business summary:\n- ${invoiceCount} bills, revenue ₹${Math.round(totalRevenue).toLocaleString('en-IN')}\n- ${uniqueCustomers} customers, ${inventory.length} products, ${lowStockCount} low-stock\n- Credit score: ${finalScore}/900 (${rating})\n\n2-3 simple Hindi sentences: score ka matlab aur kya kare score badhane ke liye. Sirf Hindi mein.`;
+      const gRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 150, temperature: 0.7 } }) }
+      );
+      const gData = await gRes.json();
+      const text = gData?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) adviceHindi = text.trim();
+    } catch {}
 
     res.json({
-      score: aiResult.score,
-      rating: aiResult.rating,
-      scoreBreakdown: aiResult.scoreBreakdown,
-      dataQuality: aiResult.dataQuality,
-      adviceHindi: aiResult.adviceHindi,
+      score: finalScore,
+      rating,
+      scoreBreakdown: {
+        salesActivity:        `${salesLvl} - ${invoiceCount} bills in 90 days`,
+        revenueHealth:        `${revLvl} - ₹${Math.round(totalRevenue).toLocaleString('en-IN')} revenue`,
+        inventoryManagement:  `${invLvl} - ${lowStockCount}/${inventory.length} items low stock`,
+        purchaseConsistency:  `${purchLvl} - ${purchaseCount} purchase orders`,
+      },
+      dataQuality: `${invoiceCount} invoices, ${inventory.length} products, ${purchaseCount} purchases analyzed (90 days)`,
+      adviceHindi,
       rawStats: {
-        invoicesLast90Days: invoices.length,
-        totalRevenue90Days: shopProfile.invoiceSummary.totalRevenue,
-        inventoryItems: inventory.length,
-        lowStockItems: shopProfile.inventorySummary.lowStockItems,
-        purchaseOrders90Days: purchases.length,
-        uniqueCustomers: shopProfile.invoiceSummary.uniqueCustomers,
-      }
+        invoicesLast90Days:  invoiceCount,
+        totalRevenue90Days:  Math.round(totalRevenue),
+        inventoryItems:      inventory.length,
+        lowStockItems:       lowStockCount,
+        purchaseOrders90Days: purchaseCount,
+        uniqueCustomers,
+      },
     });
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

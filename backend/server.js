@@ -1685,10 +1685,16 @@ app.post("/api/invoices/:id/return", async (req, res) => {
 // Record a payment event (partial/full payment with date)
 app.post("/api/payment-events", async (req, res) => {
   try {
-    const { invoiceId, amount, paymentMode, note } = req.body;
+    const { invoiceId, amount, paymentMode, note, shopId } = req.body;
     if (!invoiceId || !amount) return res.status(400).json({ error: "invoiceId and amount required" });
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: "amount must be > 0" });
+
+    // Verify invoice belongs to this shop
+    if (shopId) {
+      const { data: ownerCheck } = await supabase.from("invoices").select("id").eq("id", invoiceId).eq("shop_id", shopId).single();
+      if (!ownerCheck) return res.status(403).json({ error: "Invoice not found in this shop" });
+    }
 
     const { data, error } = await supabase.from("payment_events").insert([{
       invoice_id: invoiceId,
@@ -2113,14 +2119,14 @@ app.get("/api/reminders/overdue/:shopId", async (req, res) => {
 // Mark reminders as sent (bulk update last_reminder_at)
 app.post("/api/reminders/mark-sent", async (req, res) => {
   try {
-    const { invoiceIds } = req.body;
+    const { invoiceIds, shopId } = req.body;
     if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
       return res.status(400).json({ error: "invoiceIds array required" });
     }
-    const { error } = await supabase
-      .from("invoices")
-      .update({ last_reminder_at: new Date().toISOString() })
-      .in("id", invoiceIds);
+    // Always scope to shopId — prevents cross-shop updates
+    const query = supabase.from("invoices").update({ last_reminder_at: new Date().toISOString() }).in("id", invoiceIds);
+    if (shopId) query.eq("shop_id", shopId);
+    const { error } = await query;
     if (error) throw error;
     res.json({ success: true, count: invoiceIds.length });
   } catch (error) {

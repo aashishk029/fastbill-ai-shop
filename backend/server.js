@@ -1871,20 +1871,21 @@ app.get("/api/analytics/projections/:shopId", async (req, res) => {
     const topItems = Object.entries(itemVelocity)
       .sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, qty]) => ({ name, qty }));
 
-    // Claude insights
+    // Gemini insights
     let insights = [], warnings = [];
     try {
       const prompt = `Shop monthly revenue last ${months} months: ${JSON.stringify(monthlyArr)}.
 Peak day: ${peakDay}. Top items: ${topItems.map(i=>i.name).join(', ')}.
 Slow items: ${slowItems.map(i=>i.name).join(', ')}. Projected next month: ₹${projectedNext}.
-Give 3 short actionable Hindi/English insights for Indian shopkeeper. Reply JSON: {"insights":["..."],"warnings":["..."]}`;
+Give 3 short actionable Hindi/English insights for Indian shopkeeper. Reply JSON only: {"insights":["..."],"warnings":["..."]}`;
 
-      const aiRes = await claudeClient.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 300,
-        messages: [{ role: "user", content: prompt }]
-      });
-      const text = aiRes.content[0].text;
+      const gRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 300, temperature: 0.5 } }) }
+      );
+      const gData = await gRes.json();
+      const text = gData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const match = text.match(/\{[\s\S]*\}/);
       if (match) { const parsed = JSON.parse(match[0]); insights = parsed.insights || []; warnings = parsed.warnings || []; }
     } catch {}

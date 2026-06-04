@@ -5,7 +5,6 @@ const bcrypt = require("bcrypt");
 require("dotenv").config();
 
 const { createClient } = require("@supabase/supabase-js");
-const Anthropic = require("@anthropic-ai/sdk");
 const { createWorker } = require("tesseract.js");
 
 const app = express();
@@ -25,9 +24,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
-
-// Initialize Claude
-const claudeClient = new Anthropic();
 
 // ============================================
 // KANHAIYA MARBLES INITIAL DATA
@@ -228,37 +224,41 @@ app.patch("/api/shops/:shopId", async (req, res) => {
   }
 });
 
-// Login by phone + PIN
+// Login by phone + PIN. One phone may own multiple shops.
 app.post("/api/shops/login", async (req, res) => {
   try {
     const { phone, pin } = req.body;
     if (!phone || !pin) return res.status(400).json({ error: "Phone aur PIN dono chahiye" });
 
-    const { data, error } = await supabase
+    const { data: shops, error } = await supabase
       .from("shops")
       .select("*")
       .eq("phone", phone)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single();
+      .order("created_at", { ascending: false });
 
-    if (error || !data) {
+    if (error) throw error;
+    if (!shops || shops.length === 0) {
       return res.status(404).json({ error: "Koi shop nahi mila is number pe" });
     }
 
-    // Old shops (no PIN set) — allow login without PIN for migration
-    if (!data.pin_hash) {
-      return res.json({ found: true, shop: data, warning: "PIN set nahi hai, please update karo" });
+    // Match PIN against each shop (each shop has own pin_hash).
+    // Shops with no PIN set (legacy) match for migration.
+    const matched = [];
+    for (const shop of shops) {
+      if (!shop.pin_hash || (await bcrypt.compare(pin, shop.pin_hash))) {
+        const { pin_hash, ...safe } = shop;
+        matched.push(safe);
+      }
     }
 
-    const valid = await bcrypt.compare(pin, data.pin_hash);
-    if (!valid) {
+    if (matched.length === 0) {
       return res.status(401).json({ error: "Galat PIN. Dobara try karo." });
     }
-
-    // Don't send pin_hash to client
-    const { pin_hash, ...shopSafe } = data;
-    res.json({ found: true, shop: shopSafe });
+    if (matched.length === 1) {
+      return res.json({ found: true, shop: matched[0] });
+    }
+    // Multiple shops on this phone+PIN — client picks one
+    res.json({ found: true, multiple: true, shops: matched });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1465,11 +1465,14 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
 // Mark invoice payment (paid / partial)
 app.patch("/api/invoices/:id/payment", async (req, res) => {
   try {
-    const { status, amountPaid } = req.body; // status: 'paid'|'partial'|'credit'
-    const { error } = await supabase.from("invoices")
+    const { status, amountPaid, shopId } = req.body; // status: 'paid'|'partial'|'credit'
+    let query = supabase.from("invoices")
       .update({ payment_status: status, amount_paid: amountPaid || 0 })
       .eq("id", req.params.id);
+    if (shopId) query = query.eq("shop_id", shopId);
+    const { data, error } = await query.select();
     if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Invoice not found in this shop" });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1505,11 +1508,14 @@ app.patch("/api/inventory/adjust", async (req, res) => {
 // Mark purchase payment
 app.patch("/api/purchases/:id/payment", async (req, res) => {
   try {
-    const { status, amountPaid } = req.body;
-    const { error } = await supabase.from("purchases")
+    const { status, amountPaid, shopId } = req.body;
+    let query = supabase.from("purchases")
       .update({ payment_status: status, amount_paid: amountPaid || 0 })
       .eq("id", req.params.id);
+    if (shopId) query = query.eq("shop_id", shopId);
+    const { data, error } = await query.select();
     if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Purchase not found in this shop" });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1927,6 +1933,7 @@ app.get("/api/jewellery/rates", async (req, res) => {
 
 // Jewellery invoice: weight-based billing
 app.post("/api/invoices/jewellery", async (req, res) => {
+  let createdInvoiceId = null;
   try {
     const { shopId, customerName, customerPhone, customerAddress, customerGstin,
       items, paymentStatus, showGst } = req.body;
@@ -1953,7 +1960,8 @@ app.post("/api/invoices/jewellery", async (req, res) => {
 
     const cgst = totalGst / 2;
     const sgst = totalGst / 2;
-    const invoiceType = customerGstin?.length === 15 ? 'B2B' : 'B2C';
+    const gstinUpper = customerGstin ? customerGstin.toUpperCase() : null;
+    const invoiceType = (gstinUpper && isValidGstin(gstinUpper)) ? 'B2B' : 'B2C';
 
     const { data: invoice, error } = await supabase.from("invoices").insert([{
       shop_id: shopId,
@@ -1961,7 +1969,7 @@ app.post("/api/invoices/jewellery", async (req, res) => {
       customer_name: customerName,
       customer_phone: customerPhone || null,
       customer_address: customerAddress || null,
-      customer_gstin: customerGstin?.toUpperCase() || null,
+      customer_gstin: gstinUpper,
       invoice_type: invoiceType,
       taxable_value: Math.round(totalTaxable * 100) / 100,
       cgst_amount: Math.round(cgst * 100) / 100,
@@ -1972,21 +1980,26 @@ app.post("/api/invoices/jewellery", async (req, res) => {
       amount_paid: paymentStatus === 'credit' ? 0 : null,
     }]).select();
     if (error) throw error;
+    createdInvoiceId = invoice[0].id;
 
-    // Insert invoice_items for each jewellery item
-    for (const item of itemCalcs) {
-      await supabase.from("invoice_items").insert([{
-        invoice_id: invoice[0].id,
-        design_id: item.designId || null,
-        quantity_boxes: item.weightGrams,
-        price_per_box: item.metalRate,
-        hsn_code: item.hsnCode || '7113',
-        gst_rate: GST_JEWELLERY,
-      }]);
-    }
+    // Batch insert invoice_items; roll back invoice if it fails
+    const itemRows = itemCalcs.map(item => ({
+      invoice_id: createdInvoiceId,
+      design_id: item.designId || null,
+      quantity_boxes: item.weightGrams,
+      price_per_box: item.metalRate,
+      hsn_code: item.hsnCode || '7113',
+      gst_rate: GST_JEWELLERY,
+    }));
+    const { error: itemsErr } = await supabase.from("invoice_items").insert(itemRows);
+    if (itemsErr) throw itemsErr;
 
     res.json({ message: "✓ Jewellery invoice generated", invoice: { ...invoice[0], items: itemCalcs, grossAmount: Math.round(finalTotal), cgst: Math.round(cgst), sgst: Math.round(sgst), isGstInvoice: isGst } });
   } catch (error) {
+    if (createdInvoiceId) {
+      await supabase.from("invoice_items").delete().eq("invoice_id", createdInvoiceId);
+      await supabase.from("invoices").delete().eq("id", createdInvoiceId);
+    }
     res.status(500).json({ error: error.message });
   }
 });

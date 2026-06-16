@@ -1609,6 +1609,8 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
       .from("invoices")
       .select(`*, invoice_items(quantity_boxes, price_per_box, design_id, hsn_code, gst_rate, designs(design_code, design_name, hsn_code, default_gst_rate))`)
       .eq("shop_id", shopId)
+      // Hide cancelled + fully-returned bills from history (partial_return stays — still a real sale).
+      .not("payment_status", "in", '("cancelled","returned")')
       .order("created_at", { ascending: false })
       .limit(100);
 

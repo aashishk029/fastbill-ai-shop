@@ -7,23 +7,40 @@ require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { createWorker } = require("tesseract.js");
 
+// Rate limiter — optional dependency. If not installed, falls back to no-op so server still boots.
+let rateLimit = null;
+try { rateLimit = require("express-rate-limit"); } catch (e) { console.warn("express-rate-limit not installed — rate limiting disabled"); }
+const makeLimiter = (max, windowMs) =>
+  rateLimit ? rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests, thodi der baad try karein" } })
+            : (req, res, next) => next();
+// Tight limit on auth (brute-force) + expensive AI routes (cost abuse).
+const authLimiter = makeLimiter(20, 15 * 60 * 1000);   // 20 / 15min per IP
+const aiLimiter = makeLimiter(30, 15 * 60 * 1000);     // 30 / 15min per IP
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware
+// CORS: restrict to ALLOWED_ORIGINS (comma-separated) when set, else allow all (dev/back-compat).
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  : null;
 app.use(cors({
-  origin: '*',
+  origin: ALLOWED_ORIGINS || '*',
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(bodyParser.json({ limit: '20mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
 
-// Initialize Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+// Initialize Supabase.
+// Accept either SUPABASE_ANON_KEY (code default) or SUPABASE_KEY (render.yaml legacy name).
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("FATAL: SUPABASE_URL / SUPABASE_ANON_KEY (or SUPABASE_KEY) missing in env. DB calls will fail.");
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ============================================
 // KANHAIYA MARBLES INITIAL DATA
@@ -149,10 +166,12 @@ app.post("/api/shops/init", async (req, res) => {
       return res.status(400).json({ error: "4 digit PIN zaroori hai" });
     }
 
-    // Check phone not already registered
+    // Check phone not already registered.
+    // Use list (not .single()) — .single() throws when duplicates already exist, which used to
+    // let yet another duplicate slip through. Any existing row blocks re-registration.
     const { data: existing } = await supabase
-      .from("shops").select("id").eq("phone", phone).single();
-    if (existing) {
+      .from("shops").select("id").eq("phone", phone).limit(1);
+    if (existing && existing.length > 0) {
       return res.status(409).json({ error: "Ye phone number pehle se registered hai. Login karo." });
     }
 
@@ -192,7 +211,9 @@ app.get("/api/shops/:shopId", async (req, res) => {
 
     if (error) throw error;
 
-    res.json(data);
+    // Never expose the password hash to clients.
+    const { pin_hash, ...safe } = data;
+    res.json(safe);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -225,10 +246,11 @@ app.patch("/api/shops/:shopId", async (req, res) => {
 });
 
 // Login by phone + PIN. One phone may own multiple shops.
-app.post("/api/shops/login", async (req, res) => {
+app.post("/api/shops/login", authLimiter, async (req, res) => {
   try {
     const { phone, pin } = req.body;
     if (!phone || !pin) return res.status(400).json({ error: "Phone aur PIN dono chahiye" });
+    if (!/^\d{4,6}$/.test(String(pin))) return res.status(400).json({ error: "PIN 4-6 digit ka hona chahiye" });
 
     const { data: shops, error } = await supabase
       .from("shops")
@@ -242,10 +264,20 @@ app.post("/api/shops/login", async (req, res) => {
     }
 
     // Match PIN against each shop (each shop has own pin_hash).
-    // Shops with no PIN set (legacy) match for migration.
+    // SECURITY: never allow login on a null pin_hash with any PIN (old bypass).
+    // Migration: a legacy shop with no pin_hash adopts the PIN typed on this first login (self-enroll),
+    // then is protected by it on every future login.
     const matched = [];
     for (const shop of shops) {
-      if (!shop.pin_hash || (await bcrypt.compare(pin, shop.pin_hash))) {
+      let ok = false;
+      if (!shop.pin_hash) {
+        const newHash = await bcrypt.hash(String(pin), 10);
+        await supabase.from("shops").update({ pin_hash: newHash }).eq("id", shop.id);
+        ok = true; // first-login enrollment
+      } else {
+        ok = await bcrypt.compare(String(pin), shop.pin_hash);
+      }
+      if (ok) {
         const { pin_hash, ...safe } = shop;
         matched.push(safe);
       }
@@ -324,8 +356,13 @@ app.post("/api/invoices/generate", async (req, res) => {
   let createdInvoiceId = null;
   try {
     const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Items required" });
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
     const discount = Math.max(0, parseFloat(discountAmount) || 0);
+
+    const qty = (v) => parseFloat(v) || 0;
+    const price = (v) => parseFloat(v) || 0;
 
     // Fetch HSN codes for each design from DB
     const designIds = items.map(i => i.designId).filter(Boolean);
@@ -336,8 +373,24 @@ app.post("/api/invoices/generate", async (req, res) => {
     const designMap = {};
     (designsData || []).forEach(d => { designMap[d.id] = d; });
 
-    const qty = (v) => parseFloat(v) || 0;
-    const price = (v) => parseFloat(v) || 0;
+    // SECURITY + STOCK: only sell items that exist in THIS shop's inventory, and never oversell.
+    // (designs has no shop_id; a shop's inventory row is the ownership proof.)
+    const { data: invRows, error: invFetchErr } = await supabase
+      .from("inventory")
+      .select("design_id, quantity_boxes")
+      .eq("shop_id", shopId)
+      .in("design_id", designIds);
+    if (invFetchErr) throw invFetchErr;
+    const stockMap = {};
+    (invRows || []).forEach(r => { stockMap[r.design_id] = r.quantity_boxes; });
+    for (const it of items) {
+      if (!(it.designId in stockMap)) {
+        return res.status(400).json({ error: `Yeh product is shop ke inventory me nahi hai (designId: ${it.designId})` });
+      }
+      if (qty(it.quantityBoxes) > (stockMap[it.designId] || 0)) {
+        return res.status(400).json({ error: `Stock kam hai. Available: ${stockMap[it.designId] || 0}, maanga: ${qty(it.quantityBoxes)}` });
+      }
+    }
 
     const totalBoxes = items.reduce((s, i) => s + qty(i.quantityBoxes), 0);
     const itemsTotal = items.reduce((s, i) => s + (qty(i.quantityBoxes) * price(i.pricePerBox)), 0);
@@ -1088,6 +1141,18 @@ app.post("/api/purchases/add", async (req, res) => {
         .eq("shop_id", shopId);
 
       if (updateError) throw updateError;
+    } else {
+      // No inventory row yet for this design — create one so stock is not silently lost.
+      const { error: createError } = await supabase
+        .from("inventory")
+        .insert([{
+          shop_id: shopId,
+          design_id,
+          quantity_boxes: parseFloat(quantity_boxes) || 0,
+          low_stock_threshold: 10,
+          last_restocked_at: new Date().toISOString(),
+        }]);
+      if (createError) throw createError;
     }
 
     res.json({
@@ -1466,11 +1531,12 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
 app.patch("/api/invoices/:id/payment", async (req, res) => {
   try {
     const { status, amountPaid, shopId } = req.body; // status: 'paid'|'partial'|'credit'
-    let query = supabase.from("invoices")
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    const { data, error } = await supabase.from("invoices")
       .update({ payment_status: status, amount_paid: amountPaid || 0 })
-      .eq("id", req.params.id);
-    if (shopId) query = query.eq("shop_id", shopId);
-    const { data, error } = await query.select();
+      .eq("id", req.params.id)
+      .eq("shop_id", shopId)
+      .select();
     if (error) throw error;
     if (!data || data.length === 0) return res.status(404).json({ error: "Invoice not found in this shop" });
     res.json({ success: true });
@@ -1483,17 +1549,19 @@ app.patch("/api/invoices/:id/payment", async (req, res) => {
 app.patch("/api/inventory/adjust", async (req, res) => {
   try {
     const { shopId, designId, inventoryId, newQuantity } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
     if (newQuantity === undefined) return res.status(400).json({ error: "newQuantity required" });
     const qty = parseFloat(newQuantity);
     if (isNaN(qty) || qty < 0) return res.status(400).json({ error: "Invalid quantity" });
 
-    let query = supabase.from("inventory").update({ quantity_boxes: qty });
+    // Always scope to shopId so one shop can never edit another's stock.
+    let query = supabase.from("inventory").update({ quantity_boxes: qty }).eq("shop_id", shopId);
     if (inventoryId) {
       query = query.eq("id", inventoryId);
-    } else if (shopId && designId) {
-      query = query.eq("shop_id", shopId).eq("design_id", designId);
+    } else if (designId) {
+      query = query.eq("design_id", designId);
     } else {
-      return res.status(400).json({ error: "inventoryId or (shopId + designId) required" });
+      return res.status(400).json({ error: "inventoryId or designId required" });
     }
 
     const { data, error } = await query.select();
@@ -1509,11 +1577,12 @@ app.patch("/api/inventory/adjust", async (req, res) => {
 app.patch("/api/purchases/:id/payment", async (req, res) => {
   try {
     const { status, amountPaid, shopId } = req.body;
-    let query = supabase.from("purchases")
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    const { data, error } = await supabase.from("purchases")
       .update({ payment_status: status, amount_paid: amountPaid || 0 })
-      .eq("id", req.params.id);
-    if (shopId) query = query.eq("shop_id", shopId);
-    const { data, error } = await query.select();
+      .eq("id", req.params.id)
+      .eq("shop_id", shopId)
+      .select();
     if (error) throw error;
     if (!data || data.length === 0) return res.status(404).json({ error: "Purchase not found in this shop" });
     res.json({ success: true });
@@ -1578,6 +1647,8 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
 app.delete("/api/invoices/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const shopId = req.body?.shopId || req.query.shopId;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
 
     // Fetch invoice to check idempotency + get shop_id
     const { data: invoiceRow, error: invErr } = await supabase
@@ -1586,6 +1657,7 @@ app.delete("/api/invoices/:id", async (req, res) => {
       .eq("id", id)
       .single();
     if (invErr || !invoiceRow) return res.status(404).json({ error: "Invoice not found" });
+    if (invoiceRow.shop_id !== shopId) return res.status(403).json({ error: "Yeh invoice aapke shop ka nahi hai" });
     if (["cancelled", "returned"].includes(invoiceRow.payment_status)) {
       return res.json({ success: true, message: "Invoice already cancelled", idempotent: true });
     }
@@ -1629,9 +1701,10 @@ app.delete("/api/invoices/:id", async (req, res) => {
 app.post("/api/invoices/:id/return", async (req, res) => {
   try {
     const { id } = req.params;
-    const { returnItems, reason } = req.body;
+    const { returnItems, reason, shopId } = req.body;
     // returnItems: [{ designId, quantityBoxes }]
 
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
     if (!returnItems || returnItems.length === 0) {
       return res.status(400).json({ error: "returnItems required" });
     }
@@ -1643,6 +1716,7 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       .eq("id", id)
       .single();
     if (invErr || !invoiceRow) return res.status(404).json({ error: "Invoice not found" });
+    if (invoiceRow.shop_id !== shopId) return res.status(403).json({ error: "Yeh invoice aapke shop ka nahi hai" });
     if (invoiceRow.payment_status === "returned") {
       return res.json({ success: true, message: "Invoice already fully returned", idempotent: true });
     }
@@ -1939,6 +2013,8 @@ app.post("/api/invoices/jewellery", async (req, res) => {
       items, paymentStatus, showGst } = req.body;
     // items: [{ designId, weightGrams, metalRate, makingChargesPerGram, purity, hsnCode }]
 
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Items required" });
     const isGst = showGst === true || showGst === 'true';
     const GST_JEWELLERY = 3; // 3% GST on jewellery
 

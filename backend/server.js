@@ -1731,38 +1731,65 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       return res.json({ success: true, message: "Invoice already fully returned", idempotent: true });
     }
 
-    // Restore inventory for returned items (parallel, shop_id scoped)
-    await Promise.all(returnItems.map(async (item) => {
-      const q = parseFloat(item.quantityBoxes) || 0;
-      if (q <= 0) return;
+    // Current invoice items (with price) — used to reduce lines + recompute totals.
+    const { data: itemsData } = await supabase
+      .from("invoice_items")
+      .select("id, design_id, quantity_boxes, price_per_box")
+      .eq("invoice_id", id);
+    const itemList = itemsData || [];
+    const originalValue = itemList.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+
+    // Aggregate returned qty per design (handles duplicate rows in returnItems).
+    const returnByDesign = {};
+    returnItems.forEach(r => {
+      const q = parseFloat(r.quantityBoxes) || 0;
+      if (q > 0) returnByDesign[r.designId] = (returnByDesign[r.designId] || 0) + q;
+    });
+
+    // For each returned design: restore inventory + reduce the invoice line qty.
+    await Promise.all(Object.entries(returnByDesign).map(async ([designId, q]) => {
       const { data: inv } = await supabase
         .from("inventory")
         .select("id, quantity_boxes")
         .eq("shop_id", invoiceRow.shop_id)
-        .eq("design_id", item.designId)
+        .eq("design_id", designId)
         .maybeSingle();
       if (inv) {
         await supabase.from("inventory")
           .update({ quantity_boxes: (inv.quantity_boxes || 0) + q })
           .eq("id", inv.id);
       }
+      const line = itemList.find(it => it.design_id === designId);
+      if (line) {
+        const newQty = Math.max(0, (line.quantity_boxes || 0) - q);
+        line.quantity_boxes = newQty; // keep local copy in sync for remainingValue
+        await supabase.from("invoice_items").update({ quantity_boxes: newQty }).eq("id", line.id);
+      }
     }));
 
-    // Fetch invoice to check if fully returned
-    const { data: allItems } = await supabase
-      .from("invoice_items")
-      .select("design_id, quantity_boxes")
-      .eq("invoice_id", id);
+    // Recompute invoice totals by scaling stored values to the remaining proportion.
+    // Linear scaling preserves GST mode (included/exclusive) + discount split correctly.
+    const remainingValue = itemList.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+    const ratio = originalValue > 0 ? remainingValue / originalValue : 0;
+    const newStatus = remainingValue <= 0 ? "returned" : "partial_return";
 
-    const totalQty = (allItems || []).reduce((s, i) => s + (i.quantity_boxes || 0), 0);
-    const returnQty = returnItems.reduce((s, i) => s + (parseFloat(i.quantityBoxes) || 0), 0);
-    const newStatus = returnQty >= totalQty ? "returned" : "partial_return";
+    const { data: invFull } = await supabase
+      .from("invoices")
+      .select("taxable_value, cgst_amount, sgst_amount, discount_amount")
+      .eq("id", id)
+      .single();
+    const scale = (v) => (v == null ? null : Math.round(v * ratio * 100) / 100);
 
-    await supabase.from("invoices")
-      .update({ payment_status: newStatus, return_note: reason || "Customer return" })
-      .eq("id", id);
+    await supabase.from("invoices").update({
+      payment_status: newStatus,
+      return_note: reason || "Customer return",
+      taxable_value: scale(invFull?.taxable_value),
+      cgst_amount: scale(invFull?.cgst_amount),
+      sgst_amount: scale(invFull?.sgst_amount),
+      discount_amount: scale(invFull?.discount_amount),
+    }).eq("id", id);
 
-    res.json({ success: true, returnStatus: newStatus, itemsRestored: returnItems.length });
+    res.json({ success: true, returnStatus: newStatus, itemsRestored: Object.keys(returnByDesign).length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

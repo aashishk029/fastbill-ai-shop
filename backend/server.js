@@ -1426,9 +1426,16 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const grossProfit = totalTurnover - totalPurchaseCost;
     const netProfit = grossProfit - totalExpenses;
 
-    // Sec 44AD presumptive: 8% of total turnover (6% if digital — we use conservative 8%)
-    // Limit: ₹2 Cr (basic). Extended to ₹3 Cr only if 95%+ receipts are non-cash.
-    const presumptiveTaxableIncome = Math.round(totalTurnover * 0.08);
+    // Sec 44AD presumptive (FY 2025-26 / AY 2026-27):
+    //  - 8% of turnover on CASH receipts; 6% on DIGITAL receipts (bank/UPI/cheque).
+    //  - Eligibility limit: ₹2 Cr turnover, or ₹3 Cr if cash receipts ≤ 5% (95%+ digital).
+    // App does not yet capture per-invoice receipt mode reliably, so we surface BOTH:
+    // 8% (conservative, all-cash) and 6% (best case, all-digital). CA picks the real split.
+    const presumptive8 = Math.round(totalTurnover * 0.08); // cash receipts
+    const presumptive6 = Math.round(totalTurnover * 0.06); // digital receipts (>=95% digital)
+    const presumptiveTaxableIncome = presumptive8; // backward-compat (conservative default)
+    const turnoverLimit44AD = 30000000; // ₹3 Cr (digital); ₹2 Cr if cash > 5%
+    const eligible44AD = totalTurnover <= turnoverLimit44AD;
 
     res.json({
       shop: { name: shop?.name, owner: shop?.owner_name, phone: shop?.phone, gstin: shop?.gstin || null },
@@ -1458,9 +1465,13 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         expensesByCategory,
         grossProfit: Math.round(grossProfit),
         netProfit: Math.round(netProfit),
-        presumptiveTaxableIncome,                     // 8% of totalTurnover (Sec 44AD)
+        presumptiveTaxableIncome,                     // 8% (conservative) — backward compat
+        presumptiveIncome8Cash: presumptive8,         // 8% if receipts in cash
+        presumptiveIncome6Digital: presumptive6,      // 6% if 95%+ receipts digital
+        eligible44AD,                                 // turnover within limit?
+        turnoverLimit44AD,
       },
-      itrNote: "Sec 44AD: Turnover < ₹2 Cr → 8% presumptive income. GST collected excluded from turnover (CBDT position). Non-GST bills included in turnover.",
+      itrNote: "Sec 44AD (AY 2026-27): presumptive income = 6% of turnover on digital receipts, 8% on cash. Eligible if turnover ≤ ₹3 Cr (cash ≤ 5%) else ₹2 Cr. Income tax is on PROFIT and includes ALL sales — GST and non-GST bills both count as income. GST tax collected is excluded from turnover (CBDT). File ITR-4.",
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

@@ -1,0 +1,7 @@
+# Supabase CLI config (groundwork for future GitHub→Supabase auto-migrations).
+# NOT active yet — integration requires Supabase paid plan + dashboard connect.
+# For now, migrations are run MANUALLY in Supabase SQL Editor (see supabase/migrations/README.md).
+project_id = "fastbill"
+
+[db]
+major_version = 15

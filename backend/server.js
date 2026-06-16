@@ -1473,7 +1473,7 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
     const { shopId } = req.params;
     const [invoicesRes, purchasesRes] = await Promise.allSettled([
       supabase.from("invoices")
-        .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
+        .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, invoice_items(quantity_boxes, price_per_box)")
         .eq("shop_id", shopId)
         .in("payment_status", ["credit", "partial"])
         .order("created_at", { ascending: false })
@@ -1506,10 +1506,18 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
 
     const enrichedInvoices = creditInvoices.map(inv => {
       const items = itemsByInvoice[inv.id] || inv.invoice_items || [];
-      const gross = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0)
-        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
-      const outstanding = Math.round(gross - (inv.amount_paid || 0));
-      return { ...inv, grossAmount: Math.round(gross), outstanding };
+      // Net payable = what customer actually owes (AFTER discount).
+      let net;
+      if (inv.taxable_value != null) {
+        // GST invoice: stored taxable + GST is already net of discount.
+        net = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      } else {
+        // Non-GST invoice: items gross minus discount.
+        const itemsGross = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+        net = Math.max(0, itemsGross - (inv.discount_amount || 0));
+      }
+      const outstanding = Math.round(net - (inv.amount_paid || 0));
+      return { ...inv, grossAmount: Math.round(net), outstanding };
     });
 
     const enrichedPurchases = unpaidPurchases.map(p => {
@@ -1885,10 +1893,16 @@ app.get("/api/customers/:shopId/history", async (req, res) => {
     }
 
     const enriched = (invoices || []).map(inv => {
-      const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
-        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
-      const paid = inv.amount_paid || (inv.payment_status === 'paid' ? gross : 0);
-      return { ...inv, grossAmount: Math.round(gross), amountPaid: Math.round(paid), outstanding: Math.round(gross - paid), paymentEvents: eventsByInvoice[inv.id] || [] };
+      // Net payable = AFTER discount (what customer actually owes).
+      let net;
+      if (inv.taxable_value != null) {
+        net = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      } else {
+        const itemsGross = (inv.invoice_items || []).reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+        net = Math.max(0, itemsGross - (inv.discount_amount || 0));
+      }
+      const paid = inv.amount_paid || (inv.payment_status === 'paid' ? net : 0);
+      return { ...inv, grossAmount: Math.round(net), amountPaid: Math.round(paid), outstanding: Math.round(net - paid), paymentEvents: eventsByInvoice[inv.id] || [] };
     });
 
     const totalBilled = enriched.reduce((s, i) => s + i.grossAmount, 0);

@@ -10,7 +10,13 @@
 --          → wrong stock counts and wrong bill amounts.
 -- Fix: widen to NUMERIC(12,3) in all 3 tables + the inventory RPC.
 -- ------------------------------------------------------------
-ALTER TABLE inventory      ALTER COLUMN quantity_boxes TYPE NUMERIC(12,3);
+-- inventory.quantity_boxes is referenced by GENERATED column is_low_stock,
+-- so drop it first, alter the type, then re-create it.
+ALTER TABLE inventory DROP COLUMN is_low_stock;
+ALTER TABLE inventory ALTER COLUMN quantity_boxes TYPE NUMERIC(12,3);
+ALTER TABLE inventory ADD COLUMN is_low_stock BOOLEAN
+  GENERATED ALWAYS AS (quantity_boxes < low_stock_threshold) STORED;
+
 ALTER TABLE invoice_items  ALTER COLUMN quantity_boxes TYPE NUMERIC(12,3);
 ALTER TABLE purchases      ALTER COLUMN quantity_boxes TYPE NUMERIC(12,3);
 

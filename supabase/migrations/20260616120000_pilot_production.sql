@@ -21,6 +21,9 @@ ALTER TABLE invoice_items  ALTER COLUMN quantity_boxes TYPE NUMERIC(12,3);
 ALTER TABLE purchases      ALTER COLUMN quantity_boxes TYPE NUMERIC(12,3);
 
 -- RPC used by invoice generation — quantity param must also accept decimals.
+-- Drop the old INTEGER-arg version first: changing the arg type creates a NEW
+-- overload (not a replace), which makes .rpc() calls ambiguous.
+DROP FUNCTION IF EXISTS update_inventory_after_invoice(uuid, integer);
 CREATE OR REPLACE FUNCTION update_inventory_after_invoice(design_id UUID, quantity NUMERIC)
 RETURNS void AS $$
 BEGIN

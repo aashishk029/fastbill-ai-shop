@@ -1145,7 +1145,9 @@ FACTS:
 ${factBlock}
 
 Output exactly 3 numbered lines (1., 2., 3.) and nothing else:` }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 300 }
+          // thinkingBudget 0 disables 2.5-flash internal reasoning, which would
+          // otherwise eat the output budget and truncate the answer mid-line.
+          generationConfig: { temperature: 0.3, maxOutputTokens: 400, thinkingConfig: { thinkingBudget: 0 } }
         };
         const gr = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,

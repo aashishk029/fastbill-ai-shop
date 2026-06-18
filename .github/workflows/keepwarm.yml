@@ -1,0 +1,32 @@
+name: keep-warm
+
+# Pings /api/health on a schedule so the Render free service never cold-sleeps
+# and the Supabase free project never hits its week-idle auto-pause (the health
+# route runs a cheap DB query). Prevents the "login dead during a demo" outage.
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub may delay scheduled runs under load; that is fine
+    # for keep-warm. Render sleeps after ~15 min idle, so 10 min has margin.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}   # allow manual run from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          URL="https://fastbill-ai-shop.onrender.com/api/health"
+          echo "Pinging $URL"
+          code=$(curl -s -o /tmp/body.json -w "%{http_code}" --max-time 90 "$URL" || echo "000")
+          echo "HTTP $code"
+          cat /tmp/body.json || true
+          echo ""
+          if [ "$code" != "200" ]; then
+            echo "Health check failed (HTTP $code)"; exit 1
+          fi
+          if ! grep -q '"db":true' /tmp/body.json; then
+            echo "Warning: DB not reachable (Supabase may be paused)"; exit 1
+          fi
+          echo "OK — Render awake + Supabase warm"

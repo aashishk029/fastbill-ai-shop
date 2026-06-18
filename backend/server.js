@@ -147,11 +147,24 @@ const KANHAIYA_MARBLES = {
 // ROUTES
 // ============================================
 
-// Health Check
-app.get("/api/health", (req, res) => {
+// Health Check — also does a cheap Supabase query so a periodic ping
+// keeps BOTH Render (no cold sleep) AND the Supabase free project (no
+// week-idle pause) warm. See .github/workflows/keepwarm.yml.
+app.get("/api/health", async (req, res) => {
+  let db = false;
+  try {
+    // Lightweight: count-only, no rows returned. Touches Postgres → resets idle timer.
+    const { error } = await supabase
+      .from("shops")
+      .select("id", { count: "exact", head: true });
+    db = !error;
+  } catch (_) {
+    db = false;
+  }
   res.json({
     status: "✓ AI Shop System Running",
     timestamp: new Date(),
+    db,
     gemini: !!process.env.GEMINI_API_KEY,
     hf: !!process.env.HF_TOKEN,
   });

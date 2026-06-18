@@ -112,8 +112,13 @@ Reusable: `PrestigeButton` (variants + press feedback), `PrestigeCard`, `Prestig
 
 ### i18n (`src/i18n/`)
 `strings.js` = key → per-language map. `LanguageContext.js` exposes `useLanguage()` + `t('key')`.
-**Current: EN + HI only.** Architecture supports more langs by adding a lang block per key.
-Planned: Tamil, Kannada, Gujarati, Marathi (content not yet written).
+`t()` **falls back to English** for any missing key — so partial language coverage never breaks UI.
+**10 languages:** English + Hindi (full, 258 keys) and Tamil, Telugu, Kannada, Malayalam,
+Gujarati, Marathi, Bengali, Punjabi (core ~123 keys — high-frequency screens; dense GST/tax
+jargon falls back to English, which is how those technical terms are used in practice).
+Picker (`LanguagePickerScreen.js`) is data-driven from a `LANGUAGES` array (native endonyms).
+**To extend a language:** add the missing keys to its block in `strings.js` — no other change.
+Regional translations are best-effort and should be spot-checked by a native speaker before scale.
 
 ---
 

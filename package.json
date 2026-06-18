@@ -1,7 +1,7 @@
 {
-  "name": "kanhaiya-marbles-inventory",
+  "name": "fastbill-backend",
   "version": "0.1.0",
-  "description": "AI-enabled universal shop management system - MVP for tile shop",
+  "description": "FastBill — AI-powered shop management backend (Bharat Ananta Energy)",
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",

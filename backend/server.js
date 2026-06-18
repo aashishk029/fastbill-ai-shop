@@ -1144,8 +1144,8 @@ Rules: use ONLY these numbers (do not invent any). Friendly Hindi/English mix (H
 FACTS:
 ${factBlock}
 
-Top 3 aaj ke kaam:` }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 220 }
+Output exactly 3 numbered lines (1., 2., 3.) and nothing else:` }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 300 }
         };
         const gr = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
@@ -1153,8 +1153,13 @@ Top 3 aaj ke kaam:` }] }],
         );
         if (gr.ok) {
           const gd = await gr.json();
-          const txt = gd?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-          if (txt) narration = txt;
+          let txt = (gd?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+          // Strip any echoed heading like "Top 3 ...:" the model sometimes prepends.
+          txt = txt.replace(/^top\s*3[^\n:]*:?\s*/i, "").trim();
+          // Only override the deterministic fallback if the model actually said
+          // something substantive (real length + contains a number).
+          const looksReal = txt.length > 15 && /\d/.test(txt);
+          if (looksReal) narration = txt;
         }
       } catch (_) { /* keep deterministic fallback */ }
     }

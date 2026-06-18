@@ -1008,6 +1008,164 @@ Answer:` }] }],
 });
 
 // ============================================
+// BAE BRIEFING — proactive daily intelligence
+// GET /api/bae/briefing/:shopId
+// All ₹/counts computed deterministically here (NEVER by the LLM — money data
+// must not hallucinate). Gemini only narrates the pre-computed facts into a
+// short Hindi/English action list. Returns { briefing, narration }.
+// ============================================
+app.get("/api/bae/briefing/:shopId", async (req, res) => {
+  const { shopId } = req.params;
+  if (!shopId) return res.status(400).json({ error: "shopId required" });
+
+  try {
+    // IST day boundaries
+    const IST = 5.5 * 60 * 60 * 1000;
+    const nowIst = new Date(Date.now() + IST);
+    const istMidnight = new Date(nowIst); istMidnight.setUTCHours(0, 0, 0, 0);
+    const todayStartUTC = new Date(istMidnight.getTime() - IST).toISOString();
+    const since14UTC = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+
+    const gross = (inv) => (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+
+    const [invRes, bakayaRes, stockRes] = await Promise.allSettled([
+      // Last 14 days of revenue invoices (for today + week-over-week trend)
+      supabase.from("invoices")
+        .select("created_at,taxable_value,cgst_amount,sgst_amount,payment_status")
+        .eq("shop_id", shopId)
+        .gte("created_at", since14UTC)
+        .not("payment_status", "in", '("cancelled","returned")')
+        .limit(500),
+
+      // Outstanding credit/partial invoices (for payment risk by age)
+      supabase.from("invoices")
+        .select("customer_name,customer_phone,created_at,taxable_value,cgst_amount,sgst_amount,amount_paid")
+        .eq("shop_id", shopId)
+        .in("payment_status", ["credit", "partial"])
+        .limit(300),
+
+      // Low stock items
+      supabase.from("inventory")
+        .select("quantity_boxes,low_stock_threshold,designs(design_name,design_code,unit_type)")
+        .eq("shop_id", shopId)
+        .eq("is_low_stock", true)
+        .limit(50),
+    ]);
+
+    const invoices = (invRes.status === "fulfilled" && invRes.value.data) || [];
+    const dayMs = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    // --- Sales: today + this-week vs last-week ---
+    let todaySales = 0, todayCount = 0, weekSales = 0, prevWeekSales = 0;
+    for (const inv of invoices) {
+      const g = gross(inv);
+      const t = new Date(inv.created_at).getTime();
+      if (inv.created_at >= todayStartUTC) { todaySales += g; todayCount++; }
+      const ageDays = (now - t) / dayMs;
+      if (ageDays <= 7) weekSales += g;
+      else if (ageDays <= 14) prevWeekSales += g;
+    }
+    const weekTrendPct = prevWeekSales > 0
+      ? Math.round(((weekSales - prevWeekSales) / prevWeekSales) * 100)
+      : null;
+
+    // --- Bakaya: outstanding + oldest/highest-risk customers ---
+    const bakayaRows = (bakayaRes.status === "fulfilled" && bakayaRes.value.data) || [];
+    const custMap = {};
+    for (const inv of bakayaRows) {
+      const out = Math.round(gross(inv) - (inv.amount_paid || 0));
+      if (out <= 0) continue;
+      const key = inv.customer_phone || inv.customer_name || "?";
+      const ageDays = Math.floor((now - new Date(inv.created_at).getTime()) / dayMs);
+      if (!custMap[key]) custMap[key] = { name: inv.customer_name || "Customer", phone: inv.customer_phone || null, outstanding: 0, oldestDays: 0 };
+      custMap[key].outstanding += out;
+      custMap[key].oldestDays = Math.max(custMap[key].oldestDays, ageDays);
+    }
+    const overdue = Object.values(custMap)
+      .sort((a, b) => (b.oldestDays - a.oldestDays) || (b.outstanding - a.outstanding))
+      .slice(0, 3);
+    const totalOutstanding = Object.values(custMap).reduce((s, c) => s + c.outstanding, 0);
+
+    // --- Low stock ---
+    const lowStockRows = (stockRes.status === "fulfilled" && stockRes.value.data) || [];
+    const lowStock = lowStockRows.slice(0, 5).map(s => ({
+      name: s.designs?.design_name || s.designs?.design_code || "Item",
+      qty: s.quantity_boxes,
+      unit: s.designs?.unit_type || "boxes",
+    }));
+
+    const briefing = {
+      generatedAt: new Date().toISOString(),
+      todaySales: Math.round(todaySales),
+      todayCount,
+      weekSales: Math.round(weekSales),
+      prevWeekSales: Math.round(prevWeekSales),
+      weekTrendPct,
+      totalOutstanding,
+      lowStockCount: lowStockRows.length,
+      lowStock,
+      overdue,
+    };
+
+    // --- Deterministic fallback action items (used if Gemini down) ---
+    const facts = [];
+    if (weekTrendPct !== null) {
+      facts.push(weekTrendPct >= 0
+        ? `Is hafte sales ${weekTrendPct}% upar (₹${briefing.weekSales}).`
+        : `Is hafte sales ${Math.abs(weekTrendPct)}% kam (₹${briefing.weekSales}). Dhyan dein.`);
+    }
+    if (overdue.length) {
+      const top = overdue[0];
+      facts.push(`${top.name} se ₹${top.outstanding} lena hai (${top.oldestDays} din purana). Reminder bhejein.`);
+    }
+    if (lowStock.length) {
+      facts.push(`${briefing.lowStockCount} item low stock — jaise ${lowStock[0].name} (${lowStock[0].qty} ${lowStock[0].unit}). Reorder karein.`);
+    }
+    if (!facts.length) facts.push("Aaj sab theek hai. Koi urgent kaam nahi.");
+
+    // --- Gemini narration (language only, over the computed facts) ---
+    let narration = facts.map((f, i) => `${i + 1}. ${f}`).join("\n");
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (geminiKey) {
+      try {
+        const factBlock = `
+Today's sales: ₹${briefing.todaySales} (${briefing.todayCount} bills)
+This week vs last week: ₹${briefing.weekSales} vs ₹${briefing.prevWeekSales}${weekTrendPct !== null ? ` (${weekTrendPct}%)` : ""}
+Total udhaar baaki: ₹${totalOutstanding}
+Top overdue: ${overdue.map(o => `${o.name} ₹${o.outstanding} (${o.oldestDays}d)`).join("; ") || "none"}
+Low stock items (${briefing.lowStockCount}): ${lowStock.map(l => `${l.name} ${l.qty}${l.unit}`).join("; ") || "none"}`.trim();
+
+        const body = {
+          contents: [{ parts: [{ text: `You are BAE, an AI business co-pilot for an Indian shopkeeper using FastBill.
+From the FACTS below, write the TOP 3 most important things the owner should do today.
+Rules: use ONLY these numbers (do not invent any). Friendly Hindi/English mix (Hinglish). Each point ONE short line, action-oriented. Number them 1-3. No preamble.
+
+FACTS:
+${factBlock}
+
+Top 3 aaj ke kaam:` }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 220 }
+        };
+        const gr = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(20000) }
+        );
+        if (gr.ok) {
+          const gd = await gr.json();
+          const txt = gd?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+          if (txt) narration = txt;
+        }
+      } catch (_) { /* keep deterministic fallback */ }
+    }
+
+    res.json({ briefing, narration });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // CREDIT SCORE ENDPOINT (AI-Driven)
 // ============================================
 

@@ -1014,9 +1014,16 @@ Answer:` }] }],
 // must not hallucinate). Gemini only narrates the pre-computed facts into a
 // short Hindi/English action list. Returns { briefing, narration }.
 // ============================================
+const LANG_NAMES = {
+  en: "English", hi: "Hindi", bn: "Bengali", mr: "Marathi", te: "Telugu",
+  ta: "Tamil", gu: "Gujarati", kn: "Kannada", ml: "Malayalam", pa: "Punjabi",
+};
+
 app.get("/api/bae/briefing/:shopId", async (req, res) => {
   const { shopId } = req.params;
   if (!shopId) return res.status(400).json({ error: "shopId required" });
+  const langCode = (req.query.lang || "en").toString().toLowerCase();
+  const langName = LANG_NAMES[langCode] || "English";
 
   try {
     // IST day boundaries
@@ -1108,21 +1115,22 @@ app.get("/api/bae/briefing/:shopId", async (req, res) => {
       overdue,
     };
 
-    // --- Deterministic fallback action items (used if Gemini down) ---
+    // --- Deterministic fallback action items (used only if Gemini down) ---
+    // Kept in plain English (universal) — the per-language narration comes from Gemini.
     const facts = [];
     if (weekTrendPct !== null) {
       facts.push(weekTrendPct >= 0
-        ? `Is hafte sales ${weekTrendPct}% upar (₹${briefing.weekSales}).`
-        : `Is hafte sales ${Math.abs(weekTrendPct)}% kam (₹${briefing.weekSales}). Dhyan dein.`);
+        ? `This week sales up ${weekTrendPct}% (₹${briefing.weekSales}).`
+        : `This week sales down ${Math.abs(weekTrendPct)}% (₹${briefing.weekSales}).`);
     }
     if (overdue.length) {
       const top = overdue[0];
-      facts.push(`${top.name} se ₹${top.outstanding} lena hai (${top.oldestDays} din purana). Reminder bhejein.`);
+      facts.push(`Collect ₹${top.outstanding} from ${top.name} (${top.oldestDays} days overdue).`);
     }
     if (lowStock.length) {
-      facts.push(`${briefing.lowStockCount} item low stock — jaise ${lowStock[0].name} (${lowStock[0].qty} ${lowStock[0].unit}). Reorder karein.`);
+      facts.push(`${briefing.lowStockCount} item(s) low on stock, e.g. ${lowStock[0].name} (${lowStock[0].qty} ${lowStock[0].unit}).`);
     }
-    if (!facts.length) facts.push("Aaj sab theek hai. Koi urgent kaam nahi.");
+    if (!facts.length) facts.push("All good today. Nothing urgent.");
 
     // --- Gemini narration (language only, over the computed facts) ---
     let narration = facts.map((f, i) => `${i + 1}. ${f}`).join("\n");
@@ -1139,7 +1147,7 @@ Low stock items (${briefing.lowStockCount}): ${lowStock.map(l => `${l.name} ${l.
         const body = {
           contents: [{ parts: [{ text: `You are BAE, an AI business co-pilot for an Indian shopkeeper using FastBill.
 From the FACTS below, write the TOP 3 most important things the owner should do today.
-Rules: use ONLY these numbers (do not invent any). Friendly Hindi/English mix (Hinglish). Each point ONE short line, action-oriented. Number them 1-3. No preamble.
+Rules: use ONLY these numbers (do not invent any). Write the ENTIRE response ONLY in ${langName} language (its native script) — no other language mixed in (keep ₹ amounts and proper names as-is). Each point ONE short line, action-oriented. Number them 1-3. No preamble.
 
 FACTS:
 ${factBlock}

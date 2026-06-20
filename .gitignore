@@ -35,3 +35,6 @@ Thumbs.db
 # Build artifacts
 *.log
 .cache/
+
+frontend/build/
+frontend/package-lock.json

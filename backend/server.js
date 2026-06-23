@@ -349,11 +349,22 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 
     const lowStock = enrichedInventory.filter((item) => item.is_low_stock);
 
+    // Expiry: flag items already expired or expiring within 30 days (grocery/pharmacy).
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const dayMs = 24 * 60 * 60 * 1000;
+    const expiringItems = enrichedInventory
+      .filter(i => i.expiry_date && (i.quantity_boxes || 0) > 0)
+      .map(i => ({ ...i, daysToExpiry: Math.floor((new Date(i.expiry_date) - today) / dayMs) }))
+      .filter(i => i.daysToExpiry <= 30)
+      .sort((a, b) => a.daysToExpiry - b.daysToExpiry);
+
     res.json({
       totalItems: enrichedInventory.length,
       lowStockCount: lowStock.length,
       inventory: enrichedInventory,
       lowStockItems: lowStock,
+      expiringCount: expiringItems.length,
+      expiringItems,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1432,15 +1443,17 @@ app.post("/api/designs/add", async (req, res) => {
     if (designError) throw designError;
 
     // Create inventory entry (is_low_stock is GENERATED column, don't insert it)
-    const { error: invError } = await supabase
-      .from("inventory")
-      .insert([{
-        shop_id: shopId,
-        design_id: design.id,
-        quantity_boxes: parseFloat(initialQuantity) || 0,
-        low_stock_threshold: 10,
-        last_restocked_at: new Date().toISOString(),
-      }]);
+    const invRow = {
+      shop_id: shopId,
+      design_id: design.id,
+      quantity_boxes: parseFloat(initialQuantity) || 0,
+      low_stock_threshold: 10,
+      last_restocked_at: new Date().toISOString(),
+    };
+    // expiry_date is optional (grocery/pharmacy). Only set when provided so this
+    // insert still works before the expiry migration has been applied.
+    if (req.body.expiryDate) invRow.expiry_date = req.body.expiryDate;
+    const { error: invError } = await supabase.from("inventory").insert([invRow]);
     if (invError) throw invError;
 
     res.json({ success: true, design, message: "Naya product add ho gaya!" });

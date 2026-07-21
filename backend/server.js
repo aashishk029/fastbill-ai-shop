@@ -207,7 +207,8 @@ app.post("/api/shops/init", async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ message: "✓ Shop initialized", shop: shop[0] });
+    const { pin_hash: _hash, ...safeShop } = shop[0];
+    res.json({ message: "✓ Shop initialized", shop: safeShop });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

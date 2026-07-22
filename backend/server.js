@@ -572,19 +572,21 @@ function parseBillText(text) {
 
 app.post("/api/inventory/scan-purchase", async (req, res) => {
   try {
-    const { imageBase64 } = req.body;
-    if (!imageBase64) return res.status(400).json({ error: "No image data provided" });
+    const { imageBase64, mimeType } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "No file data provided" });
+    const isPdf = mimeType === "application/pdf";
 
     let rawText = "";
     let items = [];
 
-    // Primary: Gemini 1.5 Flash — reads bills perfectly, returns structured JSON
+    // Primary: Gemini — reads bill images AND PDFs directly (native document understanding), returns structured JSON
     if (process.env.GEMINI_API_KEY) {
       const geminiText = await geminiVision(
         imageBase64,
-        `This is a purchase bill/invoice. Extract ALL line items. Return ONLY valid JSON array, no other text:
-[{"designCode":"product name or code","quantity":10,"rate":250}]
-Rules: quantity and rate must be numbers. Use null if not visible. Return [] if no items found.`
+        `This is a purchase bill/invoice${isPdf ? " (PDF, may have multiple pages)" : ""}. Extract ALL line items. Return ONLY valid JSON array, no other text:
+[{"designCode":"product name or code","hsnCode":"HSN code if printed on bill","quantity":10,"rate":250}]
+Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code near the item row. Use null if not visible. Return [] if no items found.`,
+        isPdf ? "application/pdf" : "image/jpeg"
       );
       if (geminiText) {
         try {
@@ -598,8 +600,8 @@ Rules: quantity and rate must be numbers. Use null if not visible. Return [] if 
       }
     }
 
-    // Fallback: Tesseract OCR + regex parser
-    if (!items.length) {
+    // Fallback: Tesseract OCR + regex parser (images only — can't OCR raw PDF bytes)
+    if (!items.length && !isPdf) {
       try {
         const imgBuffer = Buffer.from(imageBase64, 'base64');
         const worker = await createWorker('eng+hin', 1, { logger: () => {} });
@@ -610,8 +612,8 @@ Rules: quantity and rate must be numbers. Use null if not visible. Return [] if 
       } catch (e) { console.error("Tesseract error:", e.message); }
     }
 
-    // Last fallback: local Ollama moondream
-    if (!items.length && process.env.OLLAMA_URL) {
+    // Last fallback: local Ollama moondream (images only)
+    if (!items.length && !isPdf && process.env.OLLAMA_URL) {
       try {
         const r = await fetch(`${process.env.OLLAMA_URL}/api/generate`, {
           method: "POST", headers: { "Content-Type": "application/json" },

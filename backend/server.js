@@ -665,14 +665,39 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         if (!insData || insData.length === 0) throw new Error("Inventory row insert returned no data (possibly blocked by RLS)");
       }
 
+      // Transportation/misc cost + margin, same as manual add-stock — blended into
+      // per-unit cost and the product's selling price, no separate step needed.
+      const baseCost = parseFloat(item.rate) || 0;
+      const extra = Math.max(0, parseFloat(item.extraCost) || 0);
+      const effectiveCost = baseCost + (qty > 0 ? extra / qty : 0);
+      const marginPct = item.marginPercent !== undefined && item.marginPercent !== null && item.marginPercent !== '' ? parseFloat(item.marginPercent) : null;
+      const marginAmt = item.marginAmount !== undefined && item.marginAmount !== null && item.marginAmount !== '' ? parseFloat(item.marginAmount) : null;
+      const suggestedPrice = marginPct !== null ? effectiveCost * (1 + marginPct / 100)
+        : marginAmt !== null ? effectiveCost + marginAmt
+        : null;
+
       // Record purchase for profit/credit scoring
       await supabase.from("purchases").insert({
         shop_id: shopId,
         design_id: item.designId,
         quantity_boxes: qty,
-        cost_per_box: parseFloat(item.rate) || 0,
+        cost_per_box: baseCost,
+        extra_cost: extra,
+        margin_percent: marginPct,
+        margin_amount: marginAmt,
+        suggested_price: suggestedPrice,
         purchase_date: new Date().toISOString(),
       });
+
+      if (suggestedPrice !== null) {
+        const { data: designRow } = await supabase
+          .from("designs").select("category_id").eq("id", item.designId).maybeSingle();
+        if (designRow?.category_id) {
+          await supabase.from("tile_categories")
+            .update({ base_price_per_box: suggestedPrice })
+            .eq("id", designRow.category_id);
+        }
+      }
     }
 
     res.json({ message: "✓ Stock updated successfully" });
@@ -1303,11 +1328,22 @@ module.exports = app;
 
 app.post("/api/purchases/add", async (req, res) => {
   try {
-    const { shopId, design_id, quantity_boxes, supplier_name, cost_per_box } = req.body;
+    const { shopId, design_id, quantity_boxes, supplier_name, cost_per_box, extraCost, marginPercent, marginAmount } = req.body;
 
     if (!shopId || !design_id || !quantity_boxes) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+
+    const qty = parseFloat(quantity_boxes) || 0;
+    const baseCost = parseFloat(cost_per_box) || 0;
+    const extra = Math.max(0, parseFloat(extraCost) || 0);
+    // Transportation/misc cost spread across the units bought, so it's blended into per-unit cost.
+    const effectiveCost = baseCost + (qty > 0 ? extra / qty : 0);
+    const marginPct = marginPercent !== undefined && marginPercent !== null && marginPercent !== '' ? parseFloat(marginPercent) : null;
+    const marginAmt = marginAmount !== undefined && marginAmount !== null && marginAmount !== '' ? parseFloat(marginAmount) : null;
+    const suggestedPrice = marginPct !== null ? effectiveCost * (1 + marginPct / 100)
+      : marginAmt !== null ? effectiveCost + marginAmt
+      : null;
 
     // Insert purchase record
     const { data: purchase, error: purchaseError } = await supabase
@@ -1316,9 +1352,13 @@ app.post("/api/purchases/add", async (req, res) => {
         {
           shop_id: shopId,
           design_id,
-          quantity_boxes: parseFloat(quantity_boxes) || 0,
+          quantity_boxes: qty,
           supplier_name: supplier_name || "Direct Purchase",
-          cost_per_box: parseFloat(cost_per_box) || 0,
+          cost_per_box: baseCost,
+          extra_cost: extra,
+          margin_percent: marginPct,
+          margin_amount: marginAmt,
+          suggested_price: suggestedPrice,
           purchase_date: new Date().toISOString(),
         },
       ])
@@ -1326,6 +1366,18 @@ app.post("/api/purchases/add", async (req, res) => {
       .single();
 
     if (purchaseError) throw purchaseError;
+
+    // Blend the computed selling price straight into the product's price —
+    // so the shopkeeper never has to separately go set it before the next invoice.
+    if (suggestedPrice !== null) {
+      const { data: designRow } = await supabase
+        .from("designs").select("category_id").eq("id", design_id).maybeSingle();
+      if (designRow?.category_id) {
+        await supabase.from("tile_categories")
+          .update({ base_price_per_box: suggestedPrice })
+          .eq("id", designRow.category_id);
+      }
+    }
 
     // Update inventory - increase quantity
     const { data: currentInventory } = await supabase

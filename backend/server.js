@@ -648,13 +648,16 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         .maybeSingle();
 
       if (invRow) {
-        await supabase.from("inventory")
+        const { error: updErr } = await supabase.from("inventory")
           .update({ quantity_boxes: invRow.quantity_boxes + qty })
           .eq("id", invRow.id);
+        if (updErr) throw updErr;
       } else {
-        await supabase.from("inventory").insert({
-          shop_id: shopId, design_id: item.designId, quantity_boxes: qty, is_low_stock: false,
+        // is_low_stock is a GENERATED column — never insert it, Postgres rejects explicit values.
+        const { error: insErr } = await supabase.from("inventory").insert({
+          shop_id: shopId, design_id: item.designId, quantity_boxes: qty,
         });
+        if (insErr) throw insErr;
       }
 
       // Record purchase for profit/credit scoring

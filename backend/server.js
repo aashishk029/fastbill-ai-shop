@@ -654,10 +654,13 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         if (updErr) throw updErr;
       } else {
         // is_low_stock is a GENERATED column — never insert it, Postgres rejects explicit values.
-        const { error: insErr } = await supabase.from("inventory").insert({
+        // .select() forces PostgREST to return the inserted row so RLS-denied inserts surface as errors
+        // instead of silently returning success with zero rows written.
+        const { data: insData, error: insErr } = await supabase.from("inventory").insert({
           shop_id: shopId, design_id: item.designId, quantity_boxes: qty,
-        });
+        }).select();
         if (insErr) throw insErr;
+        if (!insData || insData.length === 0) throw new Error("Inventory row insert returned no data (possibly blocked by RLS)");
       }
 
       // Record purchase for profit/credit scoring

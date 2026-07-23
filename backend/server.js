@@ -583,20 +583,27 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
     if (process.env.GEMINI_API_KEY) {
       const geminiText = await geminiVision(
         imageBase64,
-        `This is a purchase bill/invoice${isPdf ? " (PDF, may have multiple pages)" : ""}. Extract ALL line items. Return ONLY valid JSON array, no other text:
+        `This is a purchase bill/invoice${isPdf ? " (PDF, may have multiple pages)" : ""}, possibly a photo taken at an angle or with a shaky hand — read through blur/skew/glare as best you can. Extract ALL line items. Return ONLY valid JSON array, no markdown, no code fences, no other text:
 [{"designCode":"product name or code","hsnCode":"HSN code if printed on bill","quantity":10,"rate":250}]
-Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code near the item row. Use null if not visible. Return [] if no items found.`,
-        isPdf ? "application/pdf" : "image/jpeg"
+Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code near the item row. Use null if a field is not visible. Return [] only if truly no item rows exist.`,
+        isPdf ? "application/pdf" : "image/jpeg",
+        2048
       );
       if (geminiText) {
         try {
-          const start = geminiText.indexOf('[');
-          const end = geminiText.lastIndexOf(']') + 1;
+          // Strip markdown code fences some responses wrap the JSON in, despite instructions not to.
+          const cleaned = geminiText.replace(/```json/gi, '').replace(/```/g, '');
+          const start = cleaned.indexOf('[');
+          const end = cleaned.lastIndexOf(']') + 1;
           if (start !== -1 && end > start) {
-            items = JSON.parse(geminiText.slice(start, end));
+            items = JSON.parse(cleaned.slice(start, end));
             rawText = `Gemini extracted ${items.length} items`;
+          } else {
+            console.error("Gemini returned no JSON array:", cleaned.slice(0, 300));
           }
-        } catch (e) { console.error("Gemini JSON parse error:", e.message, geminiText.slice(0, 200)); }
+        } catch (e) { console.error("Gemini JSON parse error:", e.message, geminiText.slice(0, 300)); }
+      } else {
+        console.error("Gemini returned empty response for scan-purchase");
       }
     }
 
@@ -604,7 +611,9 @@ Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code ne
     if (!items.length && !isPdf) {
       try {
         const imgBuffer = Buffer.from(imageBase64, 'base64');
-        const worker = await createWorker('eng+hin', 1, { logger: () => {} });
+        // Purchase bills from suppliers are printed in English/GST-standard format almost always —
+        // 'eng+hin' misreads Latin characters as Devanagari glyphs on this kind of text, producing garbage.
+        const worker = await createWorker('eng', 1, { logger: () => {} });
         const { data } = await worker.recognize(imgBuffer);
         await worker.terminate();
         rawText = data.text || "";
@@ -751,7 +760,7 @@ app.get("/api/alerts/:shopId", async (req, res) => {
 });
 
 // Shared Gemini vision helper
-async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg") {
+async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg", maxOutputTokens = 800) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return null;
   const body = {
@@ -761,14 +770,16 @@ async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg") {
         { text: prompt }
       ]
     }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 800 }
+    generationConfig: { temperature: 0.2, maxOutputTokens }
   };
   const r = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) }
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(45000) }
   );
   if (!r.ok) { console.error("Gemini error:", r.status, (await r.text()).slice(0, 200)); return null; }
   const data = await r.json();
+  const finishReason = data?.candidates?.[0]?.finishReason;
+  if (finishReason === "MAX_TOKENS") console.error("Gemini response truncated (MAX_TOKENS) — raise maxOutputTokens for this call");
   return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
 }
 

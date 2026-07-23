@@ -1863,6 +1863,47 @@ app.patch("/api/inventory/adjust", async (req, res) => {
   }
 });
 
+// Remove a product from a shop's Current Inventory. Deletes only the inventory row (this shop's
+// stock listing) — never the design or past invoices/purchases, so billing history stays intact.
+app.delete("/api/inventory/:inventoryId", async (req, res) => {
+  try {
+    const { shopId } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    const { data, error } = await supabase.from("inventory")
+      .delete()
+      .eq("id", req.params.inventoryId)
+      .eq("shop_id", shopId)
+      .select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Inventory row not found in this shop" });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Fix a product's unit of measurement (e.g. was created as sqft, should be boxes for a ceramic
+// tile) — same shop-ownership check as other design edits, via its inventory row.
+app.patch("/api/designs/:designId/unit", async (req, res) => {
+  try {
+    const { shopId, unitType } = req.body;
+    if (!shopId || !unitType) return res.status(400).json({ error: "shopId and unitType required" });
+    const { data: invRow } = await supabase
+      .from("inventory").select("id").eq("shop_id", shopId).eq("design_id", req.params.designId).maybeSingle();
+    if (!invRow) return res.status(404).json({ error: "Product not found in this shop's inventory" });
+
+    const { data, error } = await supabase.from("designs")
+      .update({ unit_type: unitType })
+      .eq("id", req.params.designId)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ success: true, design: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Set a product's selling price from cost + transport/misc + margin, without touching stock quantity.
 // Same blend-it-in formula as purchases/add and confirm-scan, so a shopkeeper can fix pricing
 // on an already-stocked product straight from the Current Inventory list.

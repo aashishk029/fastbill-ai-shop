@@ -688,9 +688,10 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         : marginAmt !== null ? effectiveCost + marginAmt
         : null;
 
-      await supabase.from("inventory")
+      const { error: breakdownErr } = await supabase.from("inventory")
         .update({ last_cost_price: baseCost, last_extra_cost: extra, last_margin_percent: marginPct, last_margin_amount: marginAmt })
         .eq("id", inventoryRowId);
+      if (breakdownErr) console.error("confirm-scan: failed to persist price breakdown:", breakdownErr.message);
 
       // Record purchase for profit/credit scoring
       await supabase.from("purchases").insert({
@@ -1950,9 +1951,10 @@ app.patch("/api/inventory/set-price", async (req, res) => {
 
     // Remember exactly what was entered here, so reopening this editor later shows the
     // last-set breakdown instead of a stale historical purchase cost.
-    await supabase.from("inventory")
+    const { error: breakdownErr } = await supabase.from("inventory")
       .update({ last_cost_price: cost, last_extra_cost: extra, last_margin_percent: marginPct, last_margin_amount: marginAmt })
       .eq("id", invRow.id);
+    if (breakdownErr) console.error("set-price: failed to persist price breakdown:", breakdownErr.message);
 
     res.json({ success: true, suggestedPrice });
   } catch (error) {

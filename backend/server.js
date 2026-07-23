@@ -707,12 +707,11 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
       });
 
       if (suggestedPrice !== null) {
-        const { data: designRow } = await supabase
-          .from("designs").select("category_id").eq("id", item.designId).maybeSingle();
-        if (designRow?.category_id) {
+        const categoryId = await ensureExclusiveCategory(item.designId);
+        if (categoryId) {
           await supabase.from("tile_categories")
             .update({ base_price_per_box: suggestedPrice })
-            .eq("id", designRow.category_id);
+            .eq("id", categoryId);
         }
       }
     }
@@ -766,6 +765,40 @@ app.get("/api/alerts/:shopId", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Selling price lives on tile_categories.base_price_per_box, shared by every design in that
+// category — fine when a category genuinely is one priced product line, but scanned/quick-added
+// products were being dumped into one shared "General" category per shop, so setting one
+// product's price silently changed every other product sharing that category (and vice versa —
+// the invoice screen and the inventory price-editor could show completely different numbers for
+// the same-looking product because they were reading two different designs' shared category).
+// Self-heals a shop the first time ANY price-setting action touches a design that's still sharing
+// a category with siblings: clones the category exclusively for this design, keeping its current
+// price/size as the starting point, then callers update price on the clone. No schema change,
+// no data loss — just splits an over-shared row apart the first time it matters.
+async function ensureExclusiveCategory(designId) {
+  const { data: design } = await supabase.from("designs").select("category_id").eq("id", designId).maybeSingle();
+  if (!design?.category_id) return null;
+
+  const { data: siblings } = await supabase.from("designs").select("id").eq("category_id", design.category_id);
+  if (!siblings || siblings.length <= 1) return design.category_id; // already exclusive to this design
+
+  const { data: origCat, error: fetchErr } = await supabase
+    .from("tile_categories").select("*").eq("id", design.category_id).single();
+  if (fetchErr || !origCat) return design.category_id;
+
+  const { data: newCat, error: insErr } = await supabase.from("tile_categories").insert({
+    shop_id: origCat.shop_id,
+    category_name: origCat.category_name,
+    size_mm: origCat.size_mm,
+    coverage_sqft: origCat.coverage_sqft,
+    base_price_per_box: origCat.base_price_per_box,
+  }).select().single();
+  if (insErr || !newCat) return design.category_id;
+
+  await supabase.from("designs").update({ category_id: newCat.id }).eq("id", designId);
+  return newCat.id;
+}
 
 // Shared Gemini vision helper
 async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg", maxOutputTokens = 800) {
@@ -1389,12 +1422,11 @@ app.post("/api/purchases/add", async (req, res) => {
     // Blend the computed selling price straight into the product's price —
     // so the shopkeeper never has to separately go set it before the next invoice.
     if (suggestedPrice !== null) {
-      const { data: designRow } = await supabase
-        .from("designs").select("category_id").eq("id", design_id).maybeSingle();
-      if (designRow?.category_id) {
+      const categoryId = await ensureExclusiveCategory(design_id);
+      if (categoryId) {
         await supabase.from("tile_categories")
           .update({ base_price_per_box: suggestedPrice })
-          .eq("id", designRow.category_id);
+          .eq("id", categoryId);
       }
     }
 
@@ -1940,13 +1972,12 @@ app.patch("/api/inventory/set-price", async (req, res) => {
       : marginAmt !== null ? effectiveCost + marginAmt
       : effectiveCost;
 
-    const { data: designRow } = await supabase
-      .from("designs").select("category_id").eq("id", designId).maybeSingle();
-    if (!designRow?.category_id) return res.status(404).json({ error: "Product category not found" });
+    const categoryId = await ensureExclusiveCategory(designId);
+    if (!categoryId) return res.status(404).json({ error: "Product category not found" });
 
     const { error: updErr } = await supabase.from("tile_categories")
       .update({ base_price_per_box: suggestedPrice })
-      .eq("id", designRow.category_id);
+      .eq("id", categoryId);
     if (updErr) throw updErr;
 
     // Remember exactly what was entered here, so reopening this editor later shows the

@@ -658,11 +658,13 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         .eq("design_id", item.designId)
         .maybeSingle();
 
+      let inventoryRowId;
       if (invRow) {
         const { error: updErr } = await supabase.from("inventory")
           .update({ quantity_boxes: invRow.quantity_boxes + qty })
           .eq("id", invRow.id);
         if (updErr) throw updErr;
+        inventoryRowId = invRow.id;
       } else {
         // is_low_stock is a GENERATED column — never insert it, Postgres rejects explicit values.
         // .select() forces PostgREST to return the inserted row so RLS-denied inserts surface as errors
@@ -672,6 +674,7 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         }).select();
         if (insErr) throw insErr;
         if (!insData || insData.length === 0) throw new Error("Inventory row insert returned no data (possibly blocked by RLS)");
+        inventoryRowId = insData[0].id;
       }
 
       // Transportation/misc cost + margin, same as manual add-stock — blended into
@@ -684,6 +687,10 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
       const suggestedPrice = marginPct !== null ? effectiveCost * (1 + marginPct / 100)
         : marginAmt !== null ? effectiveCost + marginAmt
         : null;
+
+      await supabase.from("inventory")
+        .update({ last_cost_price: baseCost, last_extra_cost: extra, last_margin_percent: marginPct, last_margin_amount: marginAmt })
+        .eq("id", inventoryRowId);
 
       // Record purchase for profit/credit scoring
       await supabase.from("purchases").insert({
@@ -1398,6 +1405,10 @@ app.post("/api/purchases/add", async (req, res) => {
       .eq("shop_id", shopId)
       .maybeSingle();
 
+    // Remember this purchase's cost/transport/margin breakdown on the inventory row, so
+    // reopening "Set Selling Price" later shows what was actually last entered here.
+    const priceBreakdown = { last_cost_price: baseCost, last_extra_cost: extra, last_margin_percent: marginPct, last_margin_amount: marginAmt };
+
     if (currentInventory) {
       const newQuantity = (currentInventory.quantity_boxes || 0) + (parseFloat(quantity_boxes) || 0);
       const { error: updateError } = await supabase
@@ -1405,6 +1416,7 @@ app.post("/api/purchases/add", async (req, res) => {
         .update({
           quantity_boxes: newQuantity,
           last_restocked_at: new Date().toISOString(),
+          ...priceBreakdown,
         })
         .eq("design_id", design_id)
         .eq("shop_id", shopId);
@@ -1420,6 +1432,7 @@ app.post("/api/purchases/add", async (req, res) => {
           quantity_boxes: parseFloat(quantity_boxes) || 0,
           low_stock_threshold: 10,
           last_restocked_at: new Date().toISOString(),
+          ...priceBreakdown,
         }]);
       if (createError) throw createError;
     }
@@ -1934,6 +1947,12 @@ app.patch("/api/inventory/set-price", async (req, res) => {
       .update({ base_price_per_box: suggestedPrice })
       .eq("id", designRow.category_id);
     if (updErr) throw updErr;
+
+    // Remember exactly what was entered here, so reopening this editor later shows the
+    // last-set breakdown instead of a stale historical purchase cost.
+    await supabase.from("inventory")
+      .update({ last_cost_price: cost, last_extra_cost: extra, last_margin_percent: marginPct, last_margin_amount: marginAmt })
+      .eq("id", invRow.id);
 
     res.json({ success: true, suggestedPrice });
   } catch (error) {

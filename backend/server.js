@@ -1863,6 +1863,43 @@ app.patch("/api/inventory/adjust", async (req, res) => {
   }
 });
 
+// Set a product's selling price from cost + transport/misc + margin, without touching stock quantity.
+// Same blend-it-in formula as purchases/add and confirm-scan, so a shopkeeper can fix pricing
+// on an already-stocked product straight from the Current Inventory list.
+app.patch("/api/inventory/set-price", async (req, res) => {
+  try {
+    const { shopId, designId, baseCost, extraCost, marginPercent, marginAmount } = req.body;
+    if (!shopId || !designId) return res.status(400).json({ error: "shopId and designId required" });
+
+    // Ownership proof: this shop must actually stock this design.
+    const { data: invRow } = await supabase
+      .from("inventory").select("id").eq("shop_id", shopId).eq("design_id", designId).maybeSingle();
+    if (!invRow) return res.status(404).json({ error: "Product not found in this shop's inventory" });
+
+    const cost = parseFloat(baseCost) || 0;
+    const extra = Math.max(0, parseFloat(extraCost) || 0);
+    const effectiveCost = cost + extra;
+    const marginPct = marginPercent !== undefined && marginPercent !== null && marginPercent !== '' ? parseFloat(marginPercent) : null;
+    const marginAmt = marginAmount !== undefined && marginAmount !== null && marginAmount !== '' ? parseFloat(marginAmount) : null;
+    const suggestedPrice = marginPct !== null ? effectiveCost * (1 + marginPct / 100)
+      : marginAmt !== null ? effectiveCost + marginAmt
+      : effectiveCost;
+
+    const { data: designRow } = await supabase
+      .from("designs").select("category_id").eq("id", designId).maybeSingle();
+    if (!designRow?.category_id) return res.status(404).json({ error: "Product category not found" });
+
+    const { error: updErr } = await supabase.from("tile_categories")
+      .update({ base_price_per_box: suggestedPrice })
+      .eq("id", designRow.category_id);
+    if (updErr) throw updErr;
+
+    res.json({ success: true, suggestedPrice });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Mark purchase payment
 app.patch("/api/purchases/:id/payment", async (req, res) => {
   try {

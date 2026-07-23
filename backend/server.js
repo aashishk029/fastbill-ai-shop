@@ -584,8 +584,8 @@ app.post("/api/inventory/scan-purchase", async (req, res) => {
       const geminiText = await geminiVision(
         imageBase64,
         `This is a purchase bill/invoice${isPdf ? " (PDF, may have multiple pages)" : ""}, possibly a photo taken at an angle or with a shaky hand — read through blur/skew/glare as best you can. Extract ALL line items. Return ONLY valid JSON array, no markdown, no code fences, no other text:
-[{"designCode":"product name or code","hsnCode":"HSN code if printed on bill","quantity":10,"rate":250}]
-Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code near the item row. Use null if a field is not visible. Return [] only if truly no item rows exist.`,
+[{"designCode":"product name or code","hsnCode":"HSN code if printed on bill","unit":"unit of measure exactly as printed (e.g. BOX, SQFT, NOS, KG, PCS)","quantity":10,"rate":250}]
+Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code near the item row. Tiles are usually billed in BOX, marble/granite in SQFT — read the actual unit column/abbreviation on the bill rather than guessing. Use null if a field is not visible. Return [] only if truly no item rows exist.`,
         isPdf ? "application/pdf" : "image/jpeg",
         2048
       );

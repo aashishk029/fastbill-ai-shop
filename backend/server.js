@@ -1950,6 +1950,37 @@ app.patch("/api/designs/:designId/unit", async (req, res) => {
   }
 });
 
+// One-time repair: split EVERY design in a shop into its own exclusive tile_categories row right
+// now, instead of waiting for each product's price to be individually re-saved (ensureExclusiveCategory
+// normally only decouples lazily, the first time a given design's price is touched). Needed for shops
+// that had products sharing a category (e.g. all bill-scanned products previously landed in one
+// "General" bucket) before that was fixed — those already-contaminated prices stay wrong until each
+// affected product is split out. This does NOT recover which distinct price each product should have
+// had (that information was already overwritten by the sharing bug) — it only stops further
+// cross-contamination. Shopkeeper must still re-enter the correct price per product afterwards.
+app.post("/api/shops/:shopId/repair-shared-pricing", async (req, res) => {
+  try {
+    const { data: invRows, error } = await supabase
+      .from("inventory").select("design_id").eq("shop_id", req.params.shopId);
+    if (error) throw error;
+
+    const designIds = [...new Set((invRows || []).map(r => r.design_id))];
+    let splitCount = 0;
+    for (const designId of designIds) {
+      const { data: design } = await supabase.from("designs").select("category_id").eq("id", designId).maybeSingle();
+      if (!design?.category_id) continue;
+      const { data: siblings } = await supabase.from("designs").select("id").eq("category_id", design.category_id);
+      const wasShared = siblings && siblings.length > 1;
+      await ensureExclusiveCategory(designId);
+      if (wasShared) splitCount++;
+    }
+
+    res.json({ success: true, totalProducts: designIds.length, splitIntoExclusiveCategories: splitCount });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Set a product's selling price from cost + transport/misc + margin, without touching stock quantity.
 // Same blend-it-in formula as purchases/add and confirm-scan, so a shopkeeper can fix pricing
 // on an already-stocked product straight from the Current Inventory list.

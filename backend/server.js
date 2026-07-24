@@ -377,12 +377,14 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9][Z][0-9A-Z]$/;
 const isValidGstin = (g) => typeof g === 'string' && GSTIN_REGEX.test(g.toUpperCase());
 
-app.post("/api/invoices/generate", async (req, res) => {
+// Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
+// scheduler (both need identical math/rollback behavior — duplicating it would risk the two
+// drifting apart, like the client/backend discount-order bug did earlier).
+async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount, tableNumber }) {
   let createdInvoiceId = null;
   try {
-    const { shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount } = req.body;
-    if (!shopId) return res.status(400).json({ error: "shopId required" });
-    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Items required" });
+    if (!shopId) throw Object.assign(new Error("shopId required"), { status: 400 });
+    if (!Array.isArray(items) || items.length === 0) throw Object.assign(new Error("Items required"), { status: 400 });
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
     const discount = Math.max(0, parseFloat(discountAmount) || 0);
 
@@ -410,10 +412,10 @@ app.post("/api/invoices/generate", async (req, res) => {
     (invRows || []).forEach(r => { stockMap[r.design_id] = r.quantity_boxes; });
     for (const it of items) {
       if (!(it.designId in stockMap)) {
-        return res.status(400).json({ error: `Yeh product is shop ke inventory me nahi hai (designId: ${it.designId})` });
+        throw Object.assign(new Error(`Yeh product is shop ke inventory me nahi hai (designId: ${it.designId})`), { status: 400 });
       }
       if (qty(it.quantityBoxes) > (stockMap[it.designId] || 0)) {
-        return res.status(400).json({ error: `Stock kam hai. Available: ${stockMap[it.designId] || 0}, maanga: ${qty(it.quantityBoxes)}` });
+        throw Object.assign(new Error(`Stock kam hai. Available: ${stockMap[it.designId] || 0}, maanga: ${qty(it.quantityBoxes)}`), { status: 400 });
       }
     }
 
@@ -467,7 +469,7 @@ app.post("/api/invoices/generate", async (req, res) => {
         is_gst_invoice: isGstInvoice,
         payment_status: paymentStatus || 'paid',
         amount_paid: (paymentStatus === 'credit') ? 0 : null,
-        table_number: req.body.tableNumber || null,
+        table_number: tableNumber || null,
         discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
       }])
       .select();
@@ -501,7 +503,7 @@ app.post("/api/invoices/generate", async (req, res) => {
     const invErr = inventoryUpdates.find(e => e);
     if (invErr) throw invErr;
 
-    res.json({
+    return {
       message: "✓ Invoice generated",
       invoice: {
         ...invoice[0],
@@ -539,13 +541,143 @@ app.post("/api/invoices/generate", async (req, res) => {
           };
         }),
       },
-    });
+    };
   } catch (error) {
     // Roll back invoice if items/inventory step failed
     if (createdInvoiceId) {
       await supabase.from("invoice_items").delete().eq("invoice_id", createdInvoiceId);
       await supabase.from("invoices").delete().eq("id", createdInvoiceId);
     }
+    throw error;
+  }
+}
+
+app.post("/api/invoices/generate", async (req, res) => {
+  try {
+    const result = await createInvoiceCore(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// RECURRING INVOICES
+// ============================================
+
+function advanceRecurringDate(dateStr, frequency) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  if (frequency === "daily") d.setUTCDate(d.getUTCDate() + 1);
+  else if (frequency === "weekly") d.setUTCDate(d.getUTCDate() + 7);
+  else d.setUTCMonth(d.getUTCMonth() + 1); // monthly
+  return d.toISOString().slice(0, 10);
+}
+
+app.post("/api/recurring-invoices", async (req, res) => {
+  try {
+    const { shopId, customerName, customerPhone, customerAddress, customerGstin,
+      items, showGst, gstMode, discountAmount, frequency, startDate } = req.body;
+    if (!shopId || !customerName) return res.status(400).json({ error: "shopId and customerName required" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Items required" });
+    if (!["daily", "weekly", "monthly"].includes(frequency)) return res.status(400).json({ error: "frequency must be daily/weekly/monthly" });
+
+    const { data, error } = await supabase.from("recurring_invoices").insert([{
+      shop_id: shopId,
+      customer_name: customerName,
+      customer_phone: customerPhone || null,
+      customer_address: customerAddress || null,
+      customer_gstin: customerGstin || null,
+      items,
+      show_gst: showGst !== false,
+      gst_mode: gstMode || "included",
+      discount_amount: discountAmount || 0,
+      frequency,
+      next_run_date: startDate || new Date().toISOString().slice(0, 10),
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, recurringInvoice: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/recurring-invoices/:shopId", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("recurring_invoices")
+      .select("*").eq("shop_id", req.params.shopId).order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json({ recurringInvoices: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch("/api/recurring-invoices/:id", async (req, res) => {
+  try {
+    const { shopId, active } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    const { data, error } = await supabase.from("recurring_invoices")
+      .update({ active: !!active })
+      .eq("id", req.params.id).eq("shop_id", shopId).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Not found in this shop" });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/recurring-invoices/:id", async (req, res) => {
+  try {
+    const { shopId } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    const { data, error } = await supabase.from("recurring_invoices")
+      .delete().eq("id", req.params.id).eq("shop_id", shopId).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Not found in this shop" });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cron entry point (called daily by a GitHub Action, same pattern as keep-warm) — generates
+// a real invoice for every active template whose next_run_date has arrived, for every shop.
+app.post("/api/recurring-invoices/run-due", async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: due, error } = await supabase.from("recurring_invoices")
+      .select("*").eq("active", true).lte("next_run_date", today);
+    if (error) throw error;
+
+    const results = [];
+    for (const tpl of due || []) {
+      try {
+        const result = await createInvoiceCore({
+          shopId: tpl.shop_id,
+          customerName: tpl.customer_name,
+          customerPhone: tpl.customer_phone,
+          customerAddress: tpl.customer_address,
+          customerGstin: tpl.customer_gstin,
+          items: tpl.items,
+          showGst: tpl.show_gst,
+          gstMode: tpl.gst_mode,
+          discountAmount: tpl.discount_amount,
+          paymentStatus: "paid",
+        });
+        const nextDate = advanceRecurringDate(tpl.next_run_date, tpl.frequency);
+        await supabase.from("recurring_invoices").update({
+          next_run_date: nextDate,
+          last_generated_invoice_id: result.invoice.id,
+          last_generated_at: new Date().toISOString(),
+        }).eq("id", tpl.id);
+        results.push({ id: tpl.id, invoiceId: result.invoice.id, status: "generated" });
+      } catch (e) {
+        results.push({ id: tpl.id, status: "failed", error: e.message });
+      }
+    }
+    res.json({ success: true, processed: results.length, results });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });

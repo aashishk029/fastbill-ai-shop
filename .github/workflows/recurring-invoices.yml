@@ -1,0 +1,25 @@
+name: recurring-invoices
+
+# Runs once a day and asks the backend to generate any recurring-invoice templates
+# that have come due (daily/weekly/monthly billing set up by a shopkeeper).
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 3:00 UTC = 8:30 AM IST daily
+  workflow_dispatch: {}   # allow manual run from the Actions tab
+
+jobs:
+  run-due:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run due recurring invoices
+        run: |
+          URL="https://fastbill-ai-shop.onrender.com/api/recurring-invoices/run-due"
+          echo "Calling $URL"
+          code=$(curl -s -o /tmp/body.json -w "%{http_code}" -X POST --max-time 120 "$URL" || echo "000")
+          echo "HTTP $code"
+          cat /tmp/body.json || true
+          echo ""
+          if [ "$code" != "200" ]; then
+            echo "run-due failed (HTTP $code)"; exit 1
+          fi

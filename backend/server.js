@@ -978,6 +978,105 @@ app.get("/api/ads/active", async (req, res) => {
   }
 });
 
+// ============================================
+// BANK RECONCILIATION (CSV import — no live bank API)
+// ============================================
+
+app.post("/api/bank-transactions/import", async (req, res) => {
+  try {
+    const { shopId, transactions } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!Array.isArray(transactions) || transactions.length === 0) return res.status(400).json({ error: "transactions array required" });
+
+    const rows = transactions.map(t => ({
+      shop_id: shopId,
+      txn_date: t.date,
+      description: t.description || null,
+      amount: Math.abs(parseFloat(t.amount) || 0),
+      txn_type: t.type === 'debit' ? 'debit' : 'credit',
+    })).filter(r => r.txn_date && r.amount > 0);
+
+    if (rows.length === 0) return res.status(400).json({ error: "No valid rows to import" });
+
+    const { data, error } = await supabase.from("bank_transactions").insert(rows).select();
+    if (error) throw error;
+    res.json({ success: true, imported: data.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/bank-transactions/:shopId", async (req, res) => {
+  try {
+    const { unreconciled } = req.query;
+    let query = supabase.from("bank_transactions").select("*").eq("shop_id", req.params.shopId).order("txn_date", { ascending: false });
+    if (unreconciled === 'true') query = query.eq("reconciled", false);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ transactions: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Suggest matches — credit txns against unpaid/partial invoices, debit txns against unpaid
+// purchases, same shop, matching amount (±₹1 rounding tolerance) within a 7-day window.
+// Suggestions only — nothing is auto-marked reconciled, the shopkeeper confirms each one.
+app.get("/api/bank-transactions/:shopId/suggestions", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { data: unreconciled, error } = await supabase.from("bank_transactions")
+      .select("*").eq("shop_id", shopId).eq("reconciled", false);
+    if (error) throw error;
+
+    const { data: invoices } = await supabase.from("invoices")
+      .select("id, invoice_number, customer_name, taxable_value, cgst_amount, sgst_amount, discount_amount, payment_status, created_at")
+      .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]);
+    const { data: purchases } = await supabase.from("purchases")
+      .select("id, supplier_name, cost_per_box, quantity_boxes, extra_cost, payment_status, purchase_date")
+      .eq("shop_id", shopId).in("payment_status", ["unpaid", "partial"]);
+
+    const withinDays = (a, b, days) => Math.abs(new Date(a) - new Date(b)) <= days * 86400000;
+
+    const suggestions = (unreconciled || []).map(txn => {
+      let candidates = [];
+      if (txn.txn_type === 'credit') {
+        candidates = (invoices || []).filter(inv => {
+          const total = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+          return Math.abs(total - txn.amount) <= 1 && withinDays(inv.created_at, txn.txn_date, 7);
+        }).map(inv => ({ type: 'invoice', id: inv.id, label: `${inv.invoice_number} — ${inv.customer_name}` }));
+      } else {
+        candidates = (purchases || []).filter(p => {
+          const total = (p.cost_per_box || 0) * (p.quantity_boxes || 0) + (p.extra_cost || 0);
+          return Math.abs(total - txn.amount) <= 1 && withinDays(p.purchase_date, txn.txn_date, 7);
+        }).map(p => ({ type: 'purchase', id: p.id, label: `${p.supplier_name} — ₹${Math.round((p.cost_per_box || 0) * (p.quantity_boxes || 0))}` }));
+      }
+      return { transactionId: txn.id, amount: txn.amount, date: txn.txn_date, description: txn.description, txnType: txn.txn_type, candidates };
+    }).filter(s => s.candidates.length > 0);
+
+    res.json({ suggestions });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch("/api/bank-transactions/:id/match", async (req, res) => {
+  try {
+    const { shopId, invoiceId, purchaseId, reconciled } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    const updates = { reconciled: reconciled !== false };
+    if (invoiceId) updates.matched_invoice_id = invoiceId;
+    if (purchaseId) updates.matched_purchase_id = purchaseId;
+    const { data, error } = await supabase.from("bank_transactions")
+      .update(updates).eq("id", req.params.id).eq("shop_id", shopId).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Transaction not found in this shop" });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/alerts/:shopId", async (req, res) => {
   try {
     const { data: inventory, error } = await supabase
@@ -2442,6 +2541,62 @@ app.delete("/api/invoices/:id", async (req, res) => {
 });
 
 // Return / Exchange invoice items — partial or full return
+// E-way bill DATA PREP — no live NIC e-way-bill portal API access (needs government API
+// credentials the shop doesn't have), so this doesn't file anything automatically. It builds
+// the exact fields the NIC EWB-01 form asks for from the invoice + transport details the
+// shopkeeper types in, so they can paste/type them into ewaybillgst.gov.in in under a minute
+// instead of hunting for each number across the invoice.
+app.post("/api/invoices/:id/eway-bill-data", async (req, res) => {
+  try {
+    const { shopId, transporterName, transporterId, vehicleNumber, distanceKm } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+
+    const { data: invoice, error } = await supabase.from("invoices")
+      .select("*, invoice_items(quantity_boxes, price_per_box, hsn_code, gst_rate, designs(design_name))")
+      .eq("id", req.params.id).eq("shop_id", shopId).single();
+    if (error || !invoice) return res.status(404).json({ error: "Invoice not found in this shop" });
+
+    const { data: shop } = await supabase.from("shops").select("name, gstin, address").eq("id", shopId).single();
+
+    const grossValue = (invoice.taxable_value || 0) + (invoice.cgst_amount || 0) + (invoice.sgst_amount || 0);
+    // E-way bill is mandatory above ₹50,000 goods value (CGST Rules 138) — flagging so the
+    // shopkeeper isn't left guessing whether this invoice even needs one.
+    const required = grossValue > 50000;
+
+    res.json({
+      required,
+      thresholdNote: "E-way bill mandatory for goods value > ₹50,000 (CGST Rule 138). Below that it's optional unless your state requires it for intrastate movement.",
+      ewbData: {
+        supplierGstin: shop?.gstin || null,
+        supplierName: shop?.name || null,
+        supplierAddress: shop?.address || null,
+        documentNumber: invoice.invoice_number,
+        documentDate: invoice.created_at?.slice(0, 10),
+        recipientName: invoice.customer_name,
+        recipientGstin: invoice.customer_gstin || null,
+        invoiceType: invoice.invoice_type,
+        totalTaxableValue: invoice.taxable_value,
+        cgstAmount: invoice.cgst_amount,
+        sgstAmount: invoice.sgst_amount,
+        totalInvoiceValue: Math.round(grossValue),
+        transporterName: transporterName || null,
+        transporterId: transporterId || null,
+        vehicleNumber: vehicleNumber || null,
+        approxDistanceKm: distanceKm || null,
+        items: (invoice.invoice_items || []).map(i => ({
+          productName: i.designs?.design_name || null,
+          hsnCode: i.hsn_code,
+          quantity: i.quantity_boxes,
+          taxableValue: (i.quantity_boxes || 0) * (i.price_per_box || 0),
+          gstRate: i.gst_rate,
+        })),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/invoices/:id/return", async (req, res) => {
   try {
     const { id } = req.params;

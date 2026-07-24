@@ -2247,7 +2247,7 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       .single();
     const scale = (v) => (v == null ? null : Math.round(v * ratio * 100) / 100);
 
-    await supabase.from("invoices").update({
+    const { error: finalUpdErr } = await supabase.from("invoices").update({
       payment_status: newStatus,
       return_note: reason || "Customer return",
       taxable_value: scale(invFull?.taxable_value),
@@ -2255,6 +2255,7 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       sgst_amount: scale(invFull?.sgst_amount),
       discount_amount: scale(invFull?.discount_amount),
     }).eq("id", id);
+    if (finalUpdErr) throw finalUpdErr;
 
     res.json({ success: true, returnStatus: newStatus, itemsRestored: Object.keys(returnByDesign).length });
   } catch (error) {

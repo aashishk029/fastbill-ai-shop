@@ -694,7 +694,7 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
       if (breakdownErr) console.error("confirm-scan: failed to persist price breakdown:", breakdownErr.message);
 
       // Record purchase for profit/credit scoring
-      await supabase.from("purchases").insert({
+      const { error: purchInsErr } = await supabase.from("purchases").insert({
         shop_id: shopId,
         design_id: item.designId,
         quantity_boxes: qty,
@@ -705,13 +705,15 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
         suggested_price: suggestedPrice,
         purchase_date: new Date().toISOString(),
       });
+      if (purchInsErr) console.error("confirm-scan: failed to record purchase:", purchInsErr.message);
 
       if (suggestedPrice !== null) {
         const categoryId = await ensureExclusiveCategory(item.designId);
         if (categoryId) {
-          await supabase.from("tile_categories")
+          const { error: priceErr } = await supabase.from("tile_categories")
             .update({ base_price_per_box: suggestedPrice })
             .eq("id", categoryId);
+          if (priceErr) console.error("confirm-scan: failed to blend price:", priceErr.message);
         }
       }
     }
@@ -1424,9 +1426,10 @@ app.post("/api/purchases/add", async (req, res) => {
     if (suggestedPrice !== null) {
       const categoryId = await ensureExclusiveCategory(design_id);
       if (categoryId) {
-        await supabase.from("tile_categories")
+        const { error: priceErr } = await supabase.from("tile_categories")
           .update({ base_price_per_box: suggestedPrice })
           .eq("id", categoryId);
+        if (priceErr) console.error("purchases/add: failed to blend price:", priceErr.message);
       }
     }
 
@@ -2149,9 +2152,10 @@ app.delete("/api/invoices/:id", async (req, res) => {
         .eq("design_id", item.design_id)
         .maybeSingle();
       if (inv) {
-        await supabase.from("inventory")
+        const { error: restoreErr } = await supabase.from("inventory")
           .update({ quantity_boxes: (inv.quantity_boxes || 0) + (item.quantity_boxes || 0) })
           .eq("id", inv.id);
+        if (restoreErr) throw restoreErr;
       }
     }));
 
@@ -2216,15 +2220,17 @@ app.post("/api/invoices/:id/return", async (req, res) => {
         .eq("design_id", designId)
         .maybeSingle();
       if (inv) {
-        await supabase.from("inventory")
+        const { error: restoreErr } = await supabase.from("inventory")
           .update({ quantity_boxes: (inv.quantity_boxes || 0) + q })
           .eq("id", inv.id);
+        if (restoreErr) throw restoreErr;
       }
       const line = itemList.find(it => it.design_id === designId);
       if (line) {
         const newQty = Math.max(0, (line.quantity_boxes || 0) - q);
         line.quantity_boxes = newQty; // keep local copy in sync for remainingValue
-        await supabase.from("invoice_items").update({ quantity_boxes: newQty }).eq("id", line.id);
+        const { error: lineErr } = await supabase.from("invoice_items").update({ quantity_boxes: newQty }).eq("id", line.id);
+        if (lineErr) throw lineErr;
       }
     }));
 
@@ -2293,7 +2299,8 @@ app.post("/api/payment-events", async (req, res) => {
       const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
         || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
       const status = totalPaid >= gross ? "paid" : "partial";
-      await supabase.from("invoices").update({ amount_paid: totalPaid, payment_status: status }).eq("id", invoiceId);
+      const { error: statusErr } = await supabase.from("invoices").update({ amount_paid: totalPaid, payment_status: status }).eq("id", invoiceId);
+      if (statusErr) throw statusErr;
     }
     res.json({ success: true, event: data[0] });
   } catch (error) {

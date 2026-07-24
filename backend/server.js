@@ -2732,9 +2732,12 @@ app.post("/api/reminders/mark-sent", async (req, res) => {
     if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
       return res.status(400).json({ error: "invoiceIds array required" });
     }
-    // Always scope to shopId — prevents cross-shop updates
-    const query = supabase.from("invoices").update({ last_reminder_at: new Date().toISOString() }).in("id", invoiceIds);
-    if (shopId) query.eq("shop_id", shopId);
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    // Supabase's query builder is immutable — .eq() returns a NEW query rather than mutating
+    // the existing one, so the old "if (shopId) query.eq(...)" (discarding the return value)
+    // never actually applied the shop filter. Reassigning here is what makes it take effect.
+    let query = supabase.from("invoices").update({ last_reminder_at: new Date().toISOString() }).in("id", invoiceIds);
+    query = query.eq("shop_id", shopId);
     const { error } = await query;
     if (error) throw error;
     res.json({ success: true, count: invoiceIds.length });

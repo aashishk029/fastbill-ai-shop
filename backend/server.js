@@ -2271,14 +2271,14 @@ app.post("/api/payment-events", async (req, res) => {
   try {
     const { invoiceId, amount, paymentMode, note, shopId } = req.body;
     if (!invoiceId || !amount) return res.status(400).json({ error: "invoiceId and amount required" });
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: "amount must be > 0" });
 
-    // Verify invoice belongs to this shop
-    if (shopId) {
-      const { data: ownerCheck } = await supabase.from("invoices").select("id").eq("id", invoiceId).eq("shop_id", shopId).single();
-      if (!ownerCheck) return res.status(403).json({ error: "Invoice not found in this shop" });
-    }
+    // Verify invoice belongs to this shop — was previously skipped entirely when shopId was
+    // omitted from the request, letting a payment event be logged against any shop's invoice.
+    const { data: ownerCheck } = await supabase.from("invoices").select("id").eq("id", invoiceId).eq("shop_id", shopId).single();
+    if (!ownerCheck) return res.status(403).json({ error: "Invoice not found in this shop" });
 
     const { data, error } = await supabase.from("payment_events").insert([{
       invoice_id: invoiceId,

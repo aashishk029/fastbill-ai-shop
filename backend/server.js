@@ -2653,8 +2653,17 @@ app.get("/api/expenses/:shopId", async (req, res) => {
 
 app.delete("/api/expenses/:id", async (req, res) => {
   try {
-    const { error } = await supabase.from("expenses").delete().eq("id", req.params.id);
+    const shopId = req.body?.shopId || req.query.shopId;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    // Scope the delete to this shop — without this, any shop could delete another
+    // shop's expense record just by knowing/guessing its id.
+    const { data, error } = await supabase.from("expenses")
+      .delete()
+      .eq("id", req.params.id)
+      .eq("shop_id", shopId)
+      .select();
     if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Expense not found in this shop" });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });

@@ -954,6 +954,30 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
 });
 
 // AI-Powered Alerts
+// Dashboard ad slot — returns the single highest-priority active ad, optionally targeted to
+// this shop's type. Content is managed directly in the ads table (Supabase), no app update needed.
+app.get("/api/ads/active", async (req, res) => {
+  try {
+    const { shopType } = req.query;
+    const now = new Date().toISOString();
+    let query = supabase.from("ads").select("*")
+      .eq("active", true)
+      .lte("starts_at", now)
+      .order("priority", { ascending: false })
+      .order("created_at", { ascending: false });
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const live = (data || []).filter(ad => !ad.ends_at || ad.ends_at > now);
+    const targeted = shopType ? live.find(ad => ad.shop_type === shopType) : null;
+    const generic = live.find(ad => !ad.shop_type);
+    const ad = targeted || generic || live[0] || null;
+    res.json({ ad });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/alerts/:shopId", async (req, res) => {
   try {
     const { data: inventory, error } = await supabase

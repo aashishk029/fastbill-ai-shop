@@ -274,7 +274,29 @@ app.post("/api/shops/login", authLimiter, async (req, res) => {
 
     if (error) throw error;
     if (!shops || shops.length === 0) {
-      return res.status(404).json({ error: "Koi shop nahi mila is number pe" });
+      // Not an owner phone — check if it's a staff account added under some shop.
+      const { data: staffRow } = await supabase
+        .from("shop_staff").select("*").eq("phone", phone).eq("active", true).maybeSingle();
+      if (!staffRow) return res.status(404).json({ error: "Koi shop nahi mila is number pe" });
+      const staffOk = await bcrypt.compare(String(pin), staffRow.pin_hash);
+      if (!staffOk) return res.status(401).json({ error: "Galat PIN. Dobara try karo." });
+
+      const { data: parentShop, error: shopErr } = await supabase
+        .from("shops").select("*").eq("id", staffRow.shop_id).single();
+      if (shopErr || !parentShop) return res.status(404).json({ error: "Shop nahi mila" });
+      const { pin_hash, ...safeShop } = parentShop;
+      return res.json({
+        found: true,
+        shop: safeShop,
+        isStaff: true,
+        staffId: staffRow.id,
+        staffName: staffRow.staff_name,
+        staffPermissions: {
+          canEditPrice: staffRow.can_edit_price,
+          canDelete: staffRow.can_delete,
+          canManageStaff: staffRow.can_manage_staff,
+        },
+      });
     }
 
     // Match PIN against each shop (each shop has own pin_hash).
@@ -305,6 +327,81 @@ app.post("/api/shops/login", authLimiter, async (req, res) => {
     }
     // Multiple shops on this phone+PIN — client picks one
     res.json({ found: true, multiple: true, shops: matched });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// STAFF / MULTI-USER LOGIN
+// ============================================
+
+app.post("/api/shops/:shopId/staff", async (req, res) => {
+  try {
+    const { staffName, phone, pin, canEditPrice, canDelete, canManageStaff } = req.body;
+    if (!staffName || !phone || !pin) return res.status(400).json({ error: "staffName, phone, pin required" });
+    if (!/^\d{4,6}$/.test(String(pin))) return res.status(400).json({ error: "PIN 4-6 digit ka hona chahiye" });
+
+    // A phone can't be both an owner account and a staff account, or staff on two shops.
+    const { data: existingShop } = await supabase.from("shops").select("id").eq("phone", phone).maybeSingle();
+    if (existingShop) return res.status(409).json({ error: "Ye phone number pehle se ek shop-owner account hai" });
+    const { data: existingStaff } = await supabase.from("shop_staff").select("id").eq("phone", phone).maybeSingle();
+    if (existingStaff) return res.status(409).json({ error: "Ye phone number pehle se staff account hai" });
+
+    const pin_hash = await bcrypt.hash(String(pin), 10);
+    const { data, error } = await supabase.from("shop_staff").insert([{
+      shop_id: req.params.shopId,
+      staff_name: staffName,
+      phone,
+      pin_hash,
+      can_edit_price: !!canEditPrice,
+      can_delete: !!canDelete,
+      can_manage_staff: !!canManageStaff,
+    }]).select("id, staff_name, phone, can_edit_price, can_delete, can_manage_staff, active, created_at").single();
+    if (error) throw error;
+    res.json({ success: true, staff: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/shops/:shopId/staff", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("shop_staff")
+      .select("id, staff_name, phone, can_edit_price, can_delete, can_manage_staff, active, created_at")
+      .eq("shop_id", req.params.shopId).order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json({ staff: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch("/api/shops/:shopId/staff/:staffId", async (req, res) => {
+  try {
+    const allowed = ['can_edit_price', 'can_delete', 'can_manage_staff', 'active'];
+    const updates = {};
+    for (const [camelKey, snakeKey] of [['canEditPrice', 'can_edit_price'], ['canDelete', 'can_delete'], ['canManageStaff', 'can_manage_staff'], ['active', 'active']]) {
+      if (req.body[camelKey] !== undefined) updates[snakeKey] = !!req.body[camelKey];
+    }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: "No valid fields to update" });
+    const { data, error } = await supabase.from("shop_staff")
+      .update(updates).eq("id", req.params.staffId).eq("shop_id", req.params.shopId).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Staff not found in this shop" });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/shops/:shopId/staff/:staffId", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("shop_staff")
+      .delete().eq("id", req.params.staffId).eq("shop_id", req.params.shopId).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: "Staff not found in this shop" });
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

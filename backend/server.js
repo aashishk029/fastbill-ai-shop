@@ -1961,21 +1961,39 @@ app.patch("/api/designs/:designId/unit", async (req, res) => {
 app.post("/api/shops/:shopId/repair-shared-pricing", async (req, res) => {
   try {
     const { data: invRows, error } = await supabase
-      .from("inventory").select("design_id").eq("shop_id", req.params.shopId);
+      .from("inventory")
+      .select("design_id, last_cost_price, last_extra_cost, last_margin_percent, last_margin_amount")
+      .eq("shop_id", req.params.shopId);
     if (error) throw error;
 
-    const designIds = [...new Set((invRows || []).map(r => r.design_id))];
-    let splitCount = 0;
-    for (const designId of designIds) {
+    let splitCount = 0, recomputedCount = 0;
+    for (const row of invRows || []) {
+      const designId = row.design_id;
       const { data: design } = await supabase.from("designs").select("category_id").eq("id", designId).maybeSingle();
       if (!design?.category_id) continue;
       const { data: siblings } = await supabase.from("designs").select("id").eq("category_id", design.category_id);
       const wasShared = siblings && siblings.length > 1;
-      await ensureExclusiveCategory(designId);
+      const categoryId = await ensureExclusiveCategory(designId);
       if (wasShared) splitCount++;
+
+      // Not just isolate — recompute this design's OWN price from the cost/transport/margin it
+      // was last set with, so a shared/contaminated price gets actually corrected here too,
+      // instead of leaving the stale shared number sitting in the now-exclusive category.
+      if (categoryId && row.last_cost_price !== null && row.last_cost_price !== undefined) {
+        const cost = parseFloat(row.last_cost_price) || 0;
+        const extra = Math.max(0, parseFloat(row.last_extra_cost) || 0);
+        const effectiveCost = cost + extra;
+        const marginPct = row.last_margin_percent !== null && row.last_margin_percent !== undefined ? parseFloat(row.last_margin_percent) : null;
+        const marginAmt = row.last_margin_amount !== null && row.last_margin_amount !== undefined ? parseFloat(row.last_margin_amount) : null;
+        const suggestedPrice = marginPct !== null ? effectiveCost * (1 + marginPct / 100)
+          : marginAmt !== null ? effectiveCost + marginAmt
+          : effectiveCost;
+        await supabase.from("tile_categories").update({ base_price_per_box: suggestedPrice }).eq("id", categoryId);
+        recomputedCount++;
+      }
     }
 
-    res.json({ success: true, totalProducts: designIds.length, splitIntoExclusiveCategories: splitCount });
+    res.json({ success: true, totalProducts: invRows.length, splitIntoExclusiveCategories: splitCount, pricesRecomputed: recomputedCount });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

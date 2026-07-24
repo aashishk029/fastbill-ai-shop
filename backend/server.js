@@ -2143,10 +2143,23 @@ app.patch("/api/inventory/adjust", async (req, res) => {
 
 // Remove a product from a shop's Current Inventory. Deletes only the inventory row (this shop's
 // stock listing) — never the design or past invoices/purchases, so billing history stays intact.
+// If a request carries a staffId, verify that staff member belongs to this shop and has the
+// named permission — enforced server-side so hiding a button in the app isn't the only thing
+// stopping a staff account from calling these endpoints directly.
+async function checkStaffPermission(shopId, staffId, permissionColumn) {
+  if (!staffId) return true; // owner request — no staffId sent
+  const { data } = await supabase.from("shop_staff")
+    .select(permissionColumn).eq("id", staffId).eq("shop_id", shopId).eq("active", true).maybeSingle();
+  return !!data?.[permissionColumn];
+}
+
 app.delete("/api/inventory/:inventoryId", async (req, res) => {
   try {
-    const { shopId } = req.body;
+    const { shopId, staffId } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!(await checkStaffPermission(shopId, staffId, "can_delete"))) {
+      return res.status(403).json({ error: "Aapko delete karne ki permission nahi hai" });
+    }
     const { data, error } = await supabase.from("inventory")
       .delete()
       .eq("id", req.params.inventoryId)
@@ -2236,8 +2249,11 @@ app.post("/api/shops/:shopId/repair-shared-pricing", async (req, res) => {
 // on an already-stocked product straight from the Current Inventory list.
 app.patch("/api/inventory/set-price", async (req, res) => {
   try {
-    const { shopId, designId, baseCost, extraCost, marginPercent, marginAmount } = req.body;
+    const { shopId, designId, baseCost, extraCost, marginPercent, marginAmount, staffId } = req.body;
     if (!shopId || !designId) return res.status(400).json({ error: "shopId and designId required" });
+    if (!(await checkStaffPermission(shopId, staffId, "can_edit_price"))) {
+      return res.status(403).json({ error: "Aapko price change karne ki permission nahi hai" });
+    }
 
     // Ownership proof: this shop must actually stock this design.
     const { data: invRow } = await supabase

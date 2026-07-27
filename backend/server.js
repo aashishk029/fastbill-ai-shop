@@ -953,6 +953,40 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
   }
 });
 
+// ============================================
+// PILOT FEEDBACK — in-app "something is wrong / missing" capture
+// ============================================
+
+// Rate-limited with the shared auth limiter tier if available (spam guard), else open.
+app.post("/api/feedback", async (req, res) => {
+  try {
+    const { shopId, shopName, phone, rating, message, screen, appVersion, platform, lang } = req.body;
+    const text = (message || "").trim();
+    if (!text) return res.status(400).json({ error: "message required" });
+    if (text.length > 2000) return res.status(400).json({ error: "message too long" });
+    if (rating != null && (!Number.isInteger(rating) || rating < 1 || rating > 5)) {
+      return res.status(400).json({ error: "rating must be 1-5" });
+    }
+
+    const { error } = await supabase.from("feedback").insert([{
+      shop_id: shopId || null,
+      shop_name: shopName || null,
+      phone: phone || null,
+      rating: rating ?? null,
+      message: text,
+      screen: screen || null,
+      app_version: appVersion || null,
+      platform: platform || null,
+      lang: lang || null,
+    }]);
+    if (error) throw error;
+
+    res.json({ message: "✓ Feedback received" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // AI-Powered Alerts
 // Dashboard ad slot — returns the single highest-priority active ad, optionally targeted to
 // this shop's type. Content is managed directly in the ads table (Supabase), no app update needed.

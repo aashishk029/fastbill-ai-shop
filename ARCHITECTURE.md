@@ -1,6 +1,10 @@
 # FastBill — System Architecture (Mainframe Reference)
 
-> Single source of truth for any developer joining FastBill. Read this first.
+> **See `AI_HANDOFF.md` first — it is newer (verified 2026-07-29) and covers the
+> July 2026 features (staff/multi-user, recurring invoices, ad slot, bank
+> reconciliation, e-way prep, in-app feedback) that this file predates.**
+> This file remains the deeper narrative reference for the pre-July system.
+>
 > Last full audit: 2026-06-18. Keep this file updated whenever you build/modify.
 
 FastBill = bilingual, GST-compliant billing + shop-management app for Indian

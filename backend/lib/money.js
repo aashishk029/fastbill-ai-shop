@@ -234,6 +234,30 @@ function purchaseCostForPnl(purchases) {
   }, 0));
 }
 
+/**
+ * The tax on an invoice row, whichever way it was split.
+ *
+ * Before IGST existed this was written inline as cgst + sgst in seventeen
+ * places. Every one of them would silently under-report an inter-state bill,
+ * so the definition lives here once and callers use it.
+ */
+function invoiceTaxTotal(inv) {
+  if (!inv) return 0;
+  return round2(num(inv.cgst_amount) + num(inv.sgst_amount) + num(inv.igst_amount));
+}
+
+/**
+ * What the customer owes on an invoice: taxable value plus tax.
+ *
+ * For a non-GST bill there is no stored taxable value, so the caller must pass
+ * the item gross; that path stays with the caller because only it knows whether
+ * the items were loaded.
+ */
+function invoiceGrossValue(inv) {
+  if (!inv) return 0;
+  return round2(num(inv.taxable_value) + invoiceTaxTotal(inv));
+}
+
 module.exports = {
   GSTIN_REGEX,
   GST_JEWELLERY,
@@ -247,4 +271,6 @@ module.exports = {
   suggestedPrice,
   summariseItc,
   purchaseCostForPnl,
+  invoiceTaxTotal,
+  invoiceGrossValue,
 };

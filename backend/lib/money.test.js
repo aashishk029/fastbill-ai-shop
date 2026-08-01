@@ -220,3 +220,26 @@ test("purchases recorded before GST capture existed still count as cost", () => 
   const legacy = purchaseCostForPnl([{ quantity_boxes: 5, cost_per_box: 200 }]);
   close(legacy, 1000, "no GST columns must not mean zero cost of goods");
 });
+
+// ── Invoice value, however the tax was split ───────────────────────────────
+const { invoiceTaxTotal, invoiceGrossValue } = require("./money");
+
+test("an intra-state bill's value is taxable plus CGST plus SGST", () => {
+  const inv = { taxable_value: 1000, cgst_amount: 90, sgst_amount: 90 };
+  assert.equal(invoiceTaxTotal(inv), 180);
+  assert.equal(invoiceGrossValue(inv), 1180);
+});
+
+test("an inter-state bill counts its IGST — the bug this helper exists to prevent", () => {
+  // Written inline as cgst + sgst, this bill would have reported 1000 instead
+  // of 1180 in every ledger, ageing bucket, day-close and export.
+  const inv = { taxable_value: 1000, cgst_amount: 0, sgst_amount: 0, igst_amount: 180 };
+  assert.equal(invoiceTaxTotal(inv), 180);
+  assert.equal(invoiceGrossValue(inv), 1180);
+});
+
+test("missing tax fields are zero, not NaN", () => {
+  assert.equal(invoiceGrossValue({ taxable_value: 500 }), 500);
+  assert.equal(invoiceGrossValue({}), 0);
+  assert.equal(invoiceGrossValue(null), 0);
+});

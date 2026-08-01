@@ -491,16 +491,35 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // or a running server (`npm test`). Route handlers must call these rather than
 // re-implementing arithmetic inline — a second copy is how the client and server
 // discount ordering silently drifted apart once before.
-const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl } = require("./lib/money");
+const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl, invoiceTaxTotal, invoiceGrossValue } = require("./lib/money");
 const { toCsv } = require("./lib/csv");
 const { ageingSummary, groupByParty } = require("./lib/ageing");
 const { customerKey, currentExposure, paymentBehaviour, evaluateCreditSale, creditSummaryLine } = require("./lib/credit");
 const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbook");
+const { resolveSupply, splitTaxComponents, stateCodeFromGstin, stateName } = require("./lib/gstPlace");
+
+// Whether migration 20260804000000 has been applied. PostgREST errors on an
+// unknown column, so a query that asks for igst_amount before the migration
+// would fail outright — the flag lets one set of queries serve both states.
+// Probed once at boot and re-probed if a query later disagrees.
+let HAS_IGST_COLUMN = false;
+// Both columns arrive in the same migration, so one flag governs both.
+const igstCol = () => (HAS_IGST_COLUMN ? ", igst_amount, is_inter_state" : "");
+async function probeIgstColumn() {
+  try {
+    const { error } = await supabase.from("invoices").select("igst_amount").limit(1);
+    HAS_IGST_COLUMN = !error;
+    if (!HAS_IGST_COLUMN) console.warn("igst_amount not present — run migration 20260804000000 for inter-state billing");
+  } catch {
+    HAS_IGST_COLUMN = false;
+  }
+}
+probeIgstColumn();
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
 // drifting apart, like the client/backend discount-order bug did earlier).
-async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, creditLimitOverridden = false }) {
+async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, placeOfSupply, creditLimitOverridden = false }) {
   let createdInvoiceId = null;
   try {
     if (!shopId) throw Object.assign(new Error("shopId required"), { status: 400 });
@@ -566,10 +585,23 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     const gstAmount = itemCalcs.reduce((s, i) => s + i.itemGst, 0);
     const grossAmount = itemCalcs.reduce((s, i) => s + i.lineTotal, 0);
     const finalGrossAmount = mode === 'exclusive' && isGstInvoice ? grossAmount + gstAmount : grossAmount;
-    const cgst = gstAmount / 2;
-    const sgst = gstAmount / 2;
     const gstinUpper = customerGstin ? customerGstin.toUpperCase() : null;
     const invoiceType = (gstinUpper && isValidGstin(gstinUpper)) ? 'B2B' : 'B2C';
+
+    // Place of supply decides whether this is CGST+SGST or IGST. Selling to a
+    // buyer in another state attracts IGST at the full rate; billing it as
+    // CGST+SGST is legally wrong and breaks the buyer's credit and the seller's
+    // GSTR-1. The seller's own state comes from their GSTIN (or an explicitly
+    // recorded state_code when the shop is unregistered).
+    const { data: sellerShop } = await supabase
+      .from("shops").select("gstin, state_code").eq("id", shopId).maybeSingle();
+    const sellerGstin = sellerShop?.gstin || null;
+    const supply = resolveSupply({
+      sellerGstin: sellerGstin || (sellerShop?.state_code ? `${sellerShop.state_code}AAAAA0000A1Z0` : null),
+      buyerGstin: gstinUpper,
+      placeOfSupply,
+    });
+    const { igst, cgst, sgst } = splitTaxComponents(gstAmount, supply.interState);
 
     // Insert invoice
     const invoiceRow = {
@@ -581,8 +613,8 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
       customer_gstin: gstinUpper,
       invoice_type: invoiceType,
       taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
-      cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
-      sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
+      cgst_amount: isGstInvoice ? cgst : null,
+      sgst_amount: isGstInvoice ? sgst : null,
       gst_rate: null, // mixed per-item rates — see invoice_items
       is_gst_invoice: isGstInvoice,
       payment_status: paymentStatus || 'paid',
@@ -595,6 +627,12 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     // bill has not been paid by anything yet. Left null when not supplied, and
     // reported as "not recorded" rather than assumed to be cash, because
     // assuming would make every day-close wrong.
+    // Columns added by migration 20260804000000; stripped by the fallback below
+    // if the database has not caught up yet.
+    if (isGstInvoice && supply.interState) invoiceRow.igst_amount = igst;
+    invoiceRow.place_of_supply = supply.placeOfSupply || null;
+    invoiceRow.is_inter_state = supply.interState;
+
     const PAYMENT_MODES = ["cash", "upi", "card", "bank"];
     const settledBy = String(paymentMode || "").toLowerCase();
     if ((paymentStatus || "paid") === "paid" && PAYMENT_MODES.includes(settledBy)) {
@@ -610,7 +648,19 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     if (invoiceError && /column|schema cache/i.test(invoiceError.message || "")) {
       // Retry without the columns added by later migrations. Billing must work
       // on a database that has not caught up yet; the audit detail can wait.
-      const { credit_limit_overridden, payment_mode, ...preMigration } = { ...invoiceRow };
+      const { credit_limit_overridden, payment_mode, igst_amount, place_of_supply, is_inter_state, ...preMigration } = { ...invoiceRow };
+
+      // But tax must never vanish. On an inter-state bill the tax was placed in
+      // igst_amount and cgst/sgst were zero — dropping the column here would
+      // store a bill with no tax at all. Record it the way this app always did
+      // until the migration lands: half in each. The total stays correct; only
+      // the legally required split is postponed.
+      if (isGstInvoice && supply.interState) {
+        const half = Math.round((gstAmount / 2) * 100) / 100;
+        preMigration.cgst_amount = Math.round((gstAmount - half) * 100) / 100;
+        preMigration.sgst_amount = half;
+        console.warn("inter-state bill recorded as CGST+SGST — run migration 20260804000000 to bill IGST correctly");
+      }
       ({ data: invoice, error: invoiceError } = await supabase.from("invoices").insert([preMigration]).select());
     }
 
@@ -665,8 +715,12 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
         grossAmount: Math.round(finalGrossAmount),
         finalTotal: Math.round(finalGrossAmount),
         taxableValue: Math.round(taxableValue),
-        cgst: Math.round(cgst * 100) / 100,
-        sgst: Math.round(sgst * 100) / 100,
+        cgst,
+        sgst,
+        igst,
+        interState: supply.interState,
+        placeOfSupply: supply.placeOfSupply,
+        placeOfSupplyName: supply.placeOfSupplyName,
         gstAmount: Math.round(gstAmount * 100) / 100,
         isGstInvoice,
         gstRate: null,
@@ -687,8 +741,9 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
             lineDiscount: Math.round(c.lineDiscount * 100) / 100,
             lineTotal: Math.round(c.lineTotal * 100) / 100,
             taxableValue: Math.round(c.itemTaxable * 100) / 100,
-            cgstAmount: Math.round(c.itemGst / 2 * 100) / 100,
-            sgstAmount: Math.round(c.itemGst / 2 * 100) / 100,
+            cgstAmount: supply.interState ? 0 : Math.round(c.itemGst / 2 * 100) / 100,
+            sgstAmount: supply.interState ? 0 : Math.round(c.itemGst / 2 * 100) / 100,
+            igstAmount: supply.interState ? Math.round(c.itemGst * 100) / 100 : 0,
             totalWithGst: Math.round(itemTotal * 100) / 100,
           };
         }),
@@ -722,7 +777,7 @@ async function assessCustomerCredit(shopId, customerName, newAmount) {
 
   const [openRes, settledRes, customerRes] = await Promise.allSettled([
     supabase.from("invoices")
-      .select("id, customer_name, created_at, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, invoice_items(quantity_boxes, price_per_box)")
+      .select(`id, customer_name, created_at, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, invoice_items(quantity_boxes, price_per_box)`)
       .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]).limit(500),
     supabase.from("invoices")
       .select("customer_name, created_at, updated_at")
@@ -737,7 +792,7 @@ async function assessCustomerCredit(shopId, customerName, newAmount) {
   const mine = rows(openRes).filter(i => customerKey(i.customer_name) === key).map(inv => {
     const items = inv.invoice_items || [];
     const net = inv.taxable_value != null
-      ? (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0)
+      ? invoiceGrossValue(inv)
       : Math.max(0, items.reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0) - (inv.discount_amount || 0));
     return { ...inv, outstanding: Math.round(net - (inv.amount_paid || 0)) };
   });
@@ -814,7 +869,7 @@ app.get("/api/customers/:shopId/limits", async (req, res) => {
     const [custRes, openRes] = await Promise.allSettled([
       supabase.from("customers").select("*").eq("shop_id", shopId).order("name"),
       supabase.from("invoices")
-        .select("customer_name, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, created_at, invoice_items(quantity_boxes, price_per_box)")
+        .select(`customer_name, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, created_at, invoice_items(quantity_boxes, price_per_box)`)
         .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]).limit(2000),
     ]);
 
@@ -831,7 +886,7 @@ app.get("/api/customers/:shopId/limits", async (req, res) => {
       const key = customerKey(inv.customer_name);
       const items = inv.invoice_items || [];
       const net = inv.taxable_value != null
-        ? (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0)
+        ? invoiceGrossValue(inv)
         : Math.max(0, items.reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0) - (inv.discount_amount || 0));
       exposureByKey[key] = (exposureByKey[key] || 0) + Math.round(net - (inv.amount_paid || 0));
     }
@@ -1196,7 +1251,7 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
 async function cashMovementsSince(shopId, since) {
   const [invRes, eventRes, expRes, purchaseRes] = await Promise.allSettled([
     supabase.from("invoices")
-      .select("payment_mode, payment_status, taxable_value, cgst_amount, sgst_amount, discount_amount, created_at, invoice_items(quantity_boxes, price_per_box)")
+      .select(`payment_mode, payment_status, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, created_at, invoice_items(quantity_boxes, price_per_box)`)
       .eq("shop_id", shopId).gte("created_at", since)
       .not("payment_status", "in", '("cancelled","returned","credit")'),
     supabase.from("payment_events")
@@ -1213,7 +1268,7 @@ async function cashMovementsSince(shopId, since) {
   // for a non-GST bill.
   const billValue = (inv) => {
     if (inv.taxable_value != null) {
-      return (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      return invoiceGrossValue(inv);
     }
     const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0);
     return Math.max(0, gross - (inv.discount_amount || 0));
@@ -1458,12 +1513,12 @@ app.post("/api/export/:shopId/csv", exportLimiter, async (req, res) => {
 
     if (entity === "invoices") {
       const { data } = await supabase.from("invoices")
-        .select("invoice_number, created_at, customer_name, customer_phone, customer_gstin, invoice_type, is_gst_invoice, taxable_value, cgst_amount, sgst_amount, discount_amount, payment_status, amount_paid")
+        .select(`invoice_number, created_at, customer_name, customer_phone, customer_gstin, invoice_type, is_gst_invoice, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, payment_status, amount_paid`)
         .eq("shop_id", shopId).order("created_at");
       rows = (data || []).map(r => ({
         ...r,
         // The figure a shopkeeper actually recognises as the bill amount.
-        total: Math.round(((r.taxable_value || 0) + (r.cgst_amount || 0) + (r.sgst_amount || 0)) * 100) / 100,
+        total: Math.round((invoiceGrossValue(r)) * 100) / 100,
       }));
     } else if (entity === "invoice_items") {
       const { data } = await supabase.from("invoices")
@@ -1629,7 +1684,7 @@ app.get("/api/bank-transactions/:shopId/suggestions", async (req, res) => {
     if (error) throw error;
 
     const { data: invoices } = await supabase.from("invoices")
-      .select("id, invoice_number, customer_name, taxable_value, cgst_amount, sgst_amount, discount_amount, payment_status, created_at")
+      .select(`id, invoice_number, customer_name, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, payment_status, created_at`)
       .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]);
     const { data: purchases } = await supabase.from("purchases")
       .select("id, supplier_name, cost_per_box, quantity_boxes, extra_cost, payment_status, purchase_date")
@@ -1641,7 +1696,7 @@ app.get("/api/bank-transactions/:shopId/suggestions", async (req, res) => {
       let candidates = [];
       if (txn.txn_type === 'credit') {
         candidates = (invoices || []).filter(inv => {
-          const total = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+          const total = invoiceGrossValue(inv);
           return Math.abs(total - txn.amount) <= 1 && withinDays(inv.created_at, txn.txn_date, 7);
         }).map(inv => ({ type: 'invoice', id: inv.id, label: `${inv.invoice_number} — ${inv.customer_name}` }));
       } else {
@@ -1840,7 +1895,7 @@ app.get("/api/customers/credit-score/:shopId/:customerName", async (req, res) =>
     const { shopId, customerName } = req.params;
     const { data: invoices } = await supabase
       .from("invoices")
-      .select("payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, created_at, invoice_items(quantity_boxes, price_per_box)")
+      .select(`payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, created_at, invoice_items(quantity_boxes, price_per_box)`)
       .eq("shop_id", shopId)
       .ilike("customer_name", `%${customerName}%`)
       .order("created_at", { ascending: false })
@@ -1856,7 +1911,7 @@ app.get("/api/customers/credit-score/:shopId/:customerName", async (req, res) =>
     const partial = invoices.filter(i => i.payment_status === "partial").length;
     const totalAmount = invoices.reduce((s, inv) => {
       const gross = (inv.invoice_items || []).reduce((a, i) => a + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0)
-        || (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        || invoiceGrossValue(inv);
       return s + gross;
     }, 0);
     const paidAmount = invoices.reduce((s, i) => s + (i.amount_paid || 0), 0);
@@ -1960,7 +2015,7 @@ app.post("/api/bae/query", async (req, res) => {
     const monthlyRev = {};
     if (invRes.status === "fulfilled" && invRes.value.data) {
       for (const inv of invRes.value.data) {
-        const gross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        const gross = invoiceGrossValue(inv);
         const paid  = inv.payment_status === "paid" ? gross : (inv.amount_paid || 0);
         totalBilled += gross;
         totalCollected += paid;
@@ -1979,7 +2034,7 @@ app.post("/api/bae/query", async (req, res) => {
     const customerBakaya = {};
     if (bakayaRes.status === "fulfilled" && bakayaRes.value.data) {
       for (const inv of bakayaRes.value.data) {
-        const gross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        const gross = invoiceGrossValue(inv);
         const key   = inv.customer_phone || inv.customer_name;
         if (!customerBakaya[key]) customerBakaya[key] = { name: inv.customer_name, billed: 0, paid: 0 };
         customerBakaya[key].billed += gross;
@@ -1993,7 +2048,7 @@ app.post("/api/bae/query", async (req, res) => {
     // Recent invoices
     const recentInvLines = (invCtRes.status === "fulfilled" && invCtRes.value.data || [])
       .map(inv => {
-        const gross = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        const gross = invoiceGrossValue(inv);
         return `${inv.created_at.slice(0, 10)} ${inv.customer_name} ₹${Math.round(gross)} (${inv.payment_status})`;
       }).join("\n") || "None";
 
@@ -2083,7 +2138,7 @@ app.get("/api/bae/briefing/:shopId", async (req, res) => {
     const todayStartUTC = new Date(istMidnight.getTime() - IST).toISOString();
     const since14UTC = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
 
-    const gross = (inv) => (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+    const gross = (inv) => invoiceGrossValue(inv);
 
     const [invRes, bakayaRes, stockRes] = await Promise.allSettled([
       // Last 14 days of revenue invoices (for today + week-over-week trend)
@@ -2242,7 +2297,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
 
     const [invoicesRes, inventoryRes, purchasesRes] = await Promise.all([
       supabase.from("invoices")
-        .select("customer_name, total_amount, taxable_value, cgst_amount, sgst_amount, created_at")
+        .select(`customer_name, total_amount, taxable_value, cgst_amount, sgst_amount${igstCol()}, created_at`)
         .eq("shop_id", shopId)
         .not("payment_status", "in", '("cancelled","returned")')
         .gte("created_at", ninetyDaysAgo.toISOString()),
@@ -2620,7 +2675,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const [invoicesRes, nonGstInvoicesRes, purchasesRes, shopRes, expensesRes] = await Promise.allSettled([
       // GST invoices only — pre-stored aggregated values (O(n))
       supabase.from("invoices")
-        .select("id, invoice_number, customer_name, customer_gstin, invoice_type, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount, gst_rate, payment_status")
+        .select(`id, invoice_number, customer_name, customer_gstin, invoice_type, invoice_date, created_at, taxable_value, cgst_amount, sgst_amount${igstCol()}, gst_rate, payment_status`)
         .eq("shop_id", shopId)
         .gte("created_at", fyStart)
         .lte("created_at", fyEnd)
@@ -2673,12 +2728,16 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // ── GST SECTION (only GST invoices — non-GST bills are outside GST ambit) ──
     // grossSales for GSTR-1 = full invoice value (taxable + GST collected)
     const grossSales = invoices.reduce((s, inv) =>
-      s + (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0), 0);
+      s + invoiceGrossValue(inv), 0);
 
     const taxableValue = invoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
     const cgst = invoices.reduce((s, inv) => s + (inv.cgst_amount || 0), 0);
     const sgst = invoices.reduce((s, inv) => s + (inv.sgst_amount || 0), 0);
-    const gstCollected = cgst + sgst;
+    // Inter-state sales sit in IGST and belong in a separate GSTR-1 table, so
+    // they are reported as their own line rather than folded into CGST+SGST.
+    const igstCollected = invoices.reduce((s, inv) => s + (inv.igst_amount || 0), 0);
+    const interStateInvoices = invoices.filter(inv => inv.is_inter_state).length;
+    const gstCollected = cgst + sgst + igstCollected;
 
     // ── INPUT TAX CREDIT ──
     // GST paid to suppliers, split by whether it is actually claimable. A purchase only
@@ -2691,7 +2750,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // B2B split for GSTR-1
     const b2bInvoices = invoices.filter(inv => inv.invoice_type === 'B2B' || inv.customer_gstin);
     const b2bTaxable = b2bInvoices.reduce((s, inv) => s + (inv.taxable_value || 0), 0);
-    const b2bGst = b2bInvoices.reduce((s, inv) => s + (inv.cgst_amount || 0) + (inv.sgst_amount || 0), 0);
+    const b2bGst = b2bInvoices.reduce((s, inv) => s + invoiceTaxTotal(inv), 0);
 
     // Monthly breakdown for GSTR-1 — bucket by IST month, not UTC
     const istMonth = (iso) => {
@@ -2710,7 +2769,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
       monthlyBreakdown[month].taxableValue += inv.taxable_value || 0;
       monthlyBreakdown[month].cgst += inv.cgst_amount || 0;
       monthlyBreakdown[month].sgst += inv.sgst_amount || 0;
-      monthlyBreakdown[month].grossSales += (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+      monthlyBreakdown[month].grossSales += invoiceGrossValue(inv);
       if (inv.invoice_type === 'B2B' || inv.customer_gstin) monthlyBreakdown[month].b2bCount += 1;
     });
     Object.keys(monthlyBreakdown).forEach(m => {
@@ -2763,6 +2822,8 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         cgst: Math.round(cgst),
         sgst: Math.round(sgst),
         totalGstCollected: Math.round(gstCollected),
+        igst: Math.round(igstCollected),
+        interStateInvoices,
         gstPaidOnPurchases: Math.round(gstPaidOnPurchases),
         itcAvailable: Math.round(itcAvailable),
         itcBlocked: Math.round(itcBlocked),          // GST paid where no supplier GSTIN was recorded
@@ -2809,7 +2870,7 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
     const OPEN_BILL_CAP = 2000;
     const [invoicesRes, purchasesRes] = await Promise.allSettled([
       supabase.from("invoices")
-        .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, invoice_items(quantity_boxes, price_per_box)")
+        .select(`id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, invoice_items(quantity_boxes, price_per_box)`)
         .eq("shop_id", shopId)
         .in("payment_status", ["credit", "partial"])
         .order("created_at", { ascending: false })
@@ -2846,7 +2907,7 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
       let net;
       if (inv.taxable_value != null) {
         // GST invoice: stored taxable + GST is already net of discount.
-        net = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        net = invoiceGrossValue(inv);
       } else {
         // Non-GST invoice: items gross minus discount.
         const itemsGross = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
@@ -3230,7 +3291,7 @@ app.post("/api/invoices/:id/eway-bill-data", async (req, res) => {
 
     const { data: shop } = await supabase.from("shops").select("name, gstin, address").eq("id", shopId).single();
 
-    const grossValue = (invoice.taxable_value || 0) + (invoice.cgst_amount || 0) + (invoice.sgst_amount || 0);
+    const grossValue = invoiceGrossValue(invoice);
     // E-way bill is mandatory above ₹50,000 goods value (CGST Rules 138) — flagging so the
     // shopkeeper isn't left guessing whether this invoice even needs one.
     const required = grossValue > 50000;
@@ -3338,7 +3399,7 @@ app.post("/api/invoices/:id/return", async (req, res) => {
 
     const { data: invFull } = await supabase
       .from("invoices")
-      .select("taxable_value, cgst_amount, sgst_amount, discount_amount")
+      .select(`taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount`)
       .eq("id", id)
       .single();
     const scale = (v) => (v == null ? null : Math.round(v * ratio * 100) / 100);
@@ -3387,14 +3448,14 @@ app.post("/api/payment-events", async (req, res) => {
 
     // Also update invoice amount_paid + status
     const { data: inv } = await supabase.from("invoices")
-      .select("id, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
+      .select(`id, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, invoice_items(quantity_boxes, price_per_box)`)
       .eq("id", invoiceId).single();
     if (inv) {
       const { data: allEvents } = await supabase.from("payment_events")
         .select("amount").eq("invoice_id", invoiceId);
       const totalPaid = (allEvents || []).reduce((s, e) => s + e.amount, 0);
       const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
-        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+        || (invoiceGrossValue(inv));
       const status = totalPaid >= gross ? "paid" : "partial";
       const { error: statusErr } = await supabase.from("invoices").update({ amount_paid: totalPaid, payment_status: status }).eq("id", invoiceId);
       if (statusErr) throw statusErr;
@@ -3422,7 +3483,7 @@ app.get("/api/customers/:shopId", async (req, res) => {
   try {
     const { shopId } = req.params;
     const { data, error } = await supabase.from("invoices")
-      .select("customer_name, customer_phone, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, invoice_items(quantity_boxes, price_per_box)")
+      .select(`customer_name, customer_phone, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, invoice_items(quantity_boxes, price_per_box)`)
       .eq("shop_id", shopId)
       .not("payment_status", "in", '("cancelled","returned")')
       .order("created_at", { ascending: false });
@@ -3433,7 +3494,7 @@ app.get("/api/customers/:shopId", async (req, res) => {
     for (const inv of (data || [])) {
       const key = inv.customer_phone || inv.customer_name;
       const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes * i.price_per_box), 0)
-        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+        || (invoiceGrossValue(inv));
       if (!customerMap[key]) {
         customerMap[key] = { name: inv.customer_name, phone: inv.customer_phone, totalBilled: 0, totalPaid: 0, invoiceCount: 0 };
       }
@@ -3490,7 +3551,7 @@ app.get("/api/customers/:shopId/history", async (req, res) => {
       // Net payable = AFTER discount (what customer actually owes).
       let net;
       if (inv.taxable_value != null) {
-        net = (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+        net = invoiceGrossValue(inv);
       } else {
         const itemsGross = (inv.invoice_items || []).reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
         net = Math.max(0, itemsGross - (inv.discount_amount || 0));
@@ -3780,7 +3841,7 @@ app.get("/api/reminders/overdue/:shopId", async (req, res) => {
 
     const { data: invoices, error } = await supabase
       .from("invoices")
-      .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, last_reminder_at, invoice_items(quantity_boxes, price_per_box)")
+      .select(`id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, last_reminder_at, invoice_items(quantity_boxes, price_per_box)`)
       .eq("shop_id", shopId)
       .in("payment_status", ["credit", "partial"])
       .not("customer_phone", "is", null)
@@ -3790,7 +3851,7 @@ app.get("/api/reminders/overdue/:shopId", async (req, res) => {
     const enriched = (invoices || []).map(inv => {
       const items = inv.invoice_items || [];
       const gross = items.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0)
-        || ((inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0));
+        || (invoiceGrossValue(inv));
       const outstanding = Math.round(gross - (inv.amount_paid || 0));
       const ageDays = Math.floor((now - new Date(inv.created_at).getTime()) / day);
       const reminderAgeDays = inv.last_reminder_at

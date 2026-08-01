@@ -37,10 +37,26 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
 // Accept either SUPABASE_ANON_KEY (code default) or SUPABASE_KEY (render.yaml legacy name).
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+// Misconfigured credentials must not crash the process. createClient() throws on an
+// empty URL, which turned a bad env var into a boot loop — the server would die before
+// it could serve /api/health and say what was wrong. Now it starts, every DB call
+// returns a clear error, and health reports db:false so the fault is visible.
+let supabase;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("FATAL: SUPABASE_URL / SUPABASE_ANON_KEY (or SUPABASE_KEY) missing in env. DB calls will fail.");
+  const dbError = { message: "Database not configured (SUPABASE_URL / SUPABASE_ANON_KEY missing)" };
+  const failing = {
+    select: () => failing, insert: () => failing, update: () => failing, delete: () => failing,
+    upsert: () => failing, eq: () => failing, neq: () => failing, gt: () => failing, gte: () => failing,
+    lt: () => failing, lte: () => failing, in: () => failing, is: () => failing, not: () => failing,
+    ilike: () => failing, like: () => failing, order: () => failing, limit: () => failing,
+    range: () => failing, single: () => failing, maybeSingle: () => failing,
+    then: (resolve) => resolve({ data: null, error: dbError }),
+  };
+  supabase = { from: () => failing, rpc: async () => ({ data: null, error: dbError }) };
+} else {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 }
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ============================================
 // KANHAIYA MARBLES INITIAL DATA
@@ -3274,16 +3290,18 @@ app.post("/api/reminders/mark-sent", async (req, res) => {
 // ============================================
 
 app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════╗
-║   AI-Powered Shop Management System  ║
-║                                      ║
-║  🏪 Kanhaiya Marbles MVP             ║
-║  ✓ Running on port ${PORT}              ║
-║  ✓ Supabase Connected                ║
-║  ✓ Claude AI Integrated              ║
-║                                      ║
-║  📝 Ready for testing!               ║
-╚══════════════════════════════════════╝
-  `);
+  // Report what is actually configured. The banner used to claim "Supabase Connected"
+  // unconditionally, which is exactly the wrong thing to read while debugging an outage.
+  const dbState = SUPABASE_URL && SUPABASE_KEY ? "configured" : "NOT CONFIGURED";
+  const aiState = process.env.GEMINI_API_KEY ? "configured" : "not configured";
+  console.log([
+    "FastBill backend",
+    `  port:     ${PORT}`,
+    `  database: ${dbState}`,
+    `  ai:       ${aiState}`,
+    `  env:      ${process.env.NODE_ENV || "development"}`,
+    dbState === "NOT CONFIGURED"
+      ? "  WARNING: every database call will fail until SUPABASE_URL and SUPABASE_ANON_KEY are set."
+      : "",
+  ].filter(Boolean).join("\n"));
 });

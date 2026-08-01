@@ -2646,7 +2646,11 @@ Output exactly 3 numbered lines (1., 2., 3.) and nothing else:` }] }],
       } catch (_) { /* keep deterministic fallback */ }
     }
 
-    res.json({ briefing, narration });
+    // The computed findings ship alongside the narration. It makes the guarantee
+    // auditable — anyone can check that what the shopkeeper was told matches what
+    // was calculated — and gives the app something to fall back on when a model
+    // is unavailable.
+    res.json({ briefing, narration, facts, source: decisionFacts.length ? "decision-engine" : "basic" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

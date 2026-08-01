@@ -492,6 +492,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // re-implementing arithmetic inline — a second copy is how the client and server
 // discount ordering silently drifted apart once before.
 const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl } = require("./lib/money");
+const { toCsv } = require("./lib/csv");
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
@@ -979,6 +980,169 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
     }
 
     res.json({ message: "✓ Stock updated successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// DATA EXPORT — the shopkeeper's own data, on demand
+//
+// A business asked to run itself inside FastBill must be able to take everything
+// back out: for their accountant, for their own records, and as the honest answer
+// to "what happens if you shut down". Nothing here is a favour to the user; a
+// system of record that cannot be exported is a hostage.
+//
+// This is a bulk exfiltration endpoint, so it is deliberately stricter than the
+// rest of the API: POST (never a shareable GET URL), the account PIN must be
+// re-entered, and it is rate limited. Until proper sessions exist, knowing a
+// shop's UUID must not be enough to walk away with the whole business.
+// ============================================
+
+const exportLimiter = makeLimiter(10, 60 * 60 * 1000); // 10 exports/hour per IP
+
+// Shared gate: verify the PIN belongs to this shop before releasing any bulk data.
+async function verifyShopPin(shopId, pin) {
+  if (!shopId) return { ok: false, status: 400, error: "shopId required" };
+  if (!pin || !/^\d{4,6}$/.test(String(pin))) return { ok: false, status: 400, error: "PIN 4-6 digit ka hona chahiye" };
+
+  const { data: shop, error } = await supabase
+    .from("shops").select("id, name, owner_name, phone, address, shop_type, gstin, pan_number, upi_id, shop_id_display, pin_hash, created_at")
+    .eq("id", shopId).maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  if (!shop) return { ok: false, status: 404, error: "Shop nahi mila" };
+  if (!shop.pin_hash) return { ok: false, status: 403, error: "Pehle app me PIN set karein" };
+
+  const match = await bcrypt.compare(String(pin), shop.pin_hash);
+  if (!match) return { ok: false, status: 401, error: "Galat PIN" };
+
+  const { pin_hash, ...safeShop } = shop;
+  return { ok: true, shop: safeShop };
+}
+
+// Everything this shop owns, as one JSON document.
+app.post("/api/export/:shopId", exportLimiter, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const gate = await verifyShopPin(shopId, req.body?.pin);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    // Invoices carry their line items so a bill can be reconstructed from the
+    // export alone — an export you cannot rebuild from is not portability.
+    const [invoices, inventory, purchases, expenses, payments, staff, recurring, bank] = await Promise.all([
+      supabase.from("invoices").select("*, invoice_items(*)").eq("shop_id", shopId).order("created_at"),
+      supabase.from("inventory").select("*, designs(design_code, design_name, color, hsn_code, default_gst_rate, unit_type)").eq("shop_id", shopId),
+      supabase.from("purchases").select("*").eq("shop_id", shopId).order("purchase_date"),
+      supabase.from("expenses").select("*").eq("shop_id", shopId).order("expense_date"),
+      supabase.from("payment_events").select("*").eq("shop_id", shopId).order("created_at"),
+      supabase.from("shop_staff").select("id, staff_name, phone, can_edit_price, can_delete, can_manage_staff, active, created_at").eq("shop_id", shopId),
+      supabase.from("recurring_invoices").select("*").eq("shop_id", shopId),
+      supabase.from("bank_transactions").select("*").eq("shop_id", shopId).order("txn_date"),
+    ]);
+
+    // A table that does not exist yet (migration not run) must not fail the whole
+    // export — the rest of the shop's data is still theirs to take.
+    const rows = (r) => (r && !r.error ? r.data || [] : []);
+    const skipped = [
+      ["staff", staff], ["recurringInvoices", recurring], ["bankTransactions", bank],
+    ].filter(([, r]) => r && r.error).map(([name]) => name);
+
+    res.json({
+      exportedAt: new Date().toISOString(),
+      format: "fastbill-export-v1",
+      shop: gate.shop,
+      counts: {
+        invoices: rows(invoices).length,
+        inventory: rows(inventory).length,
+        purchases: rows(purchases).length,
+        expenses: rows(expenses).length,
+        paymentEvents: rows(payments).length,
+      },
+      invoices: rows(invoices),
+      inventory: rows(inventory),
+      purchases: rows(purchases),
+      expenses: rows(expenses),
+      paymentEvents: rows(payments),
+      staff: rows(staff),
+      recurringInvoices: rows(recurring),
+      bankTransactions: rows(bank),
+      // Honest about what could not be included, rather than silently omitting it.
+      unavailable: skipped,
+      note: "Your data, exported from FastBill. Keep this file safe — it contains customer names and phone numbers.",
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// One entity as a spreadsheet, for handing to an accountant.
+app.post("/api/export/:shopId/csv", exportLimiter, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const entity = String(req.query.entity || req.body?.entity || "invoices");
+    const gate = await verifyShopPin(shopId, req.body?.pin);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    let rows = [];
+    let columns = null;
+
+    if (entity === "invoices") {
+      const { data } = await supabase.from("invoices")
+        .select("invoice_number, created_at, customer_name, customer_phone, customer_gstin, invoice_type, is_gst_invoice, taxable_value, cgst_amount, sgst_amount, discount_amount, payment_status, amount_paid")
+        .eq("shop_id", shopId).order("created_at");
+      rows = (data || []).map(r => ({
+        ...r,
+        // The figure a shopkeeper actually recognises as the bill amount.
+        total: Math.round(((r.taxable_value || 0) + (r.cgst_amount || 0) + (r.sgst_amount || 0)) * 100) / 100,
+      }));
+    } else if (entity === "invoice_items") {
+      const { data } = await supabase.from("invoices")
+        .select("invoice_number, created_at, invoice_items(quantity_boxes, price_per_box, hsn_code, gst_rate, designs(design_code, design_name))")
+        .eq("shop_id", shopId).order("created_at");
+      rows = (data || []).flatMap(inv => (inv.invoice_items || []).map(it => ({
+        invoice_number: inv.invoice_number,
+        date: inv.created_at,
+        product_code: it.designs?.design_code || null,
+        product: it.designs?.design_name || null,
+        quantity: it.quantity_boxes,
+        rate: it.price_per_box,
+        hsn_code: it.hsn_code,
+        gst_rate: it.gst_rate,
+        line_total: Math.round((it.quantity_boxes || 0) * (it.price_per_box || 0) * 100) / 100,
+      })));
+    } else if (entity === "purchases") {
+      const { data } = await supabase.from("purchases").select("*").eq("shop_id", shopId).order("purchase_date");
+      rows = data || [];
+    } else if (entity === "inventory") {
+      const { data } = await supabase.from("inventory")
+        .select("quantity_boxes, low_stock_threshold, expiry_date, last_restocked_at, designs(design_code, design_name, color, hsn_code, default_gst_rate, unit_type)")
+        .eq("shop_id", shopId);
+      rows = (data || []).map(r => ({
+        product_code: r.designs?.design_code || null,
+        product: r.designs?.design_name || null,
+        colour: r.designs?.color || null,
+        unit: r.designs?.unit_type || null,
+        hsn_code: r.designs?.hsn_code || null,
+        gst_rate: r.designs?.default_gst_rate || null,
+        quantity: r.quantity_boxes,
+        low_stock_threshold: r.low_stock_threshold,
+        expiry_date: r.expiry_date,
+        last_restocked_at: r.last_restocked_at,
+      }));
+    } else if (entity === "expenses") {
+      const { data } = await supabase.from("expenses").select("category, amount, note, expense_date").eq("shop_id", shopId).order("expense_date");
+      rows = data || [];
+    } else {
+      return res.status(400).json({ error: "Unknown entity. Use invoices, invoice_items, purchases, inventory or expenses." });
+    }
+
+    const csv = toCsv(rows, columns);
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="fastbill-${entity}-${stamp}.csv"`);
+    // UTF-8 BOM so Excel renders Devanagari and other Indic scripts correctly
+    // instead of mojibake — without it a Hindi customer name is unreadable.
+    res.send("﻿" + csv);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

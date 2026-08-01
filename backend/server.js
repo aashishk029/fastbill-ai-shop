@@ -494,11 +494,12 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl } = require("./lib/money");
 const { toCsv } = require("./lib/csv");
 const { ageingSummary, groupByParty } = require("./lib/ageing");
+const { customerKey, currentExposure, paymentBehaviour, evaluateCreditSale, creditSummaryLine } = require("./lib/credit");
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
 // drifting apart, like the client/backend discount-order bug did earlier).
-async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount, tableNumber }) {
+async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount, tableNumber, creditLimitOverridden = false }) {
   let createdInvoiceId = null;
   try {
     if (!shopId) throw Object.assign(new Error("shopId required"), { status: 400 });
@@ -570,27 +571,34 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     const invoiceType = (gstinUpper && isValidGstin(gstinUpper)) ? 'B2B' : 'B2C';
 
     // Insert invoice
-    const { data: invoice, error: invoiceError } = await supabase
-      .from("invoices")
-      .insert([{
-        shop_id: shopId,
-        invoice_number: `INV-${Date.now()}`,
-        customer_name: customerName,
-        customer_phone: customerPhone || null,
-        customer_address: customerAddress || null,
-        customer_gstin: gstinUpper,
-        invoice_type: invoiceType,
-        taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
-        cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
-        sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
-        gst_rate: null, // mixed per-item rates — see invoice_items
-        is_gst_invoice: isGstInvoice,
-        payment_status: paymentStatus || 'paid',
-        amount_paid: (paymentStatus === 'credit') ? 0 : null,
-        table_number: tableNumber || null,
-        discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
-      }])
-      .select();
+    const invoiceRow = {
+      shop_id: shopId,
+      invoice_number: `INV-${Date.now()}`,
+      customer_name: customerName,
+      customer_phone: customerPhone || null,
+      customer_address: customerAddress || null,
+      customer_gstin: gstinUpper,
+      invoice_type: invoiceType,
+      taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
+      cgst_amount: isGstInvoice ? Math.round(cgst * 100) / 100 : null,
+      sgst_amount: isGstInvoice ? Math.round(sgst * 100) / 100 : null,
+      gst_rate: null, // mixed per-item rates — see invoice_items
+      is_gst_invoice: isGstInvoice,
+      payment_status: paymentStatus || 'paid',
+      amount_paid: (paymentStatus === 'credit') ? 0 : null,
+      table_number: tableNumber || null,
+      discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
+    };
+
+    // Recording that a shopkeeper was warned and sold on credit anyway: the
+    // difference between a mistake and a decision. The column only exists after
+    // migration 20260802000000, so a missing-column error retries without it —
+    // an audit field must never be the reason a bill cannot be raised.
+    let { data: invoice, error: invoiceError } = await supabase
+      .from("invoices").insert([{ ...invoiceRow, credit_limit_overridden: !!creditLimitOverridden }]).select();
+    if (invoiceError && /column|schema cache/i.test(invoiceError.message || "")) {
+      ({ data: invoice, error: invoiceError } = await supabase.from("invoices").insert([invoiceRow]).select());
+    }
 
     if (invoiceError) throw invoiceError;
     createdInvoiceId = invoice[0].id;
@@ -682,9 +690,184 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
   }
 }
 
+// ============================================
+// CUSTOMER CREDIT LIMITS
+//
+// The app makes giving udhari one toggle and, until now, said nothing when a
+// customer was already deep in debt — the most common way a small shop loses
+// money. Exposure, payment behaviour and the limit are assembled here; the
+// decision logic itself lives in lib/credit.js and is tested.
+// ============================================
+
+// Gather everything needed to judge a credit sale to one customer.
+// Returns null when the customer has no name (walk-in cash-style credit),
+// since there is nobody to track exposure against.
+async function assessCustomerCredit(shopId, customerName, newAmount) {
+  const key = customerKey(customerName);
+  if (!shopId || !key) return null;
+
+  const [openRes, settledRes, customerRes] = await Promise.allSettled([
+    supabase.from("invoices")
+      .select("id, customer_name, created_at, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, invoice_items(quantity_boxes, price_per_box)")
+      .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]).limit(500),
+    supabase.from("invoices")
+      .select("customer_name, created_at, updated_at")
+      .eq("shop_id", shopId).eq("payment_status", "paid").order("created_at", { ascending: false }).limit(200),
+    supabase.from("customers").select("*").eq("shop_id", shopId).eq("customer_key", key).maybeSingle(),
+  ]);
+
+  const rows = (r) => (r.status === "fulfilled" && !r.value.error ? r.value.data || [] : []);
+
+  // Match on the normalised name so bills typed with different capitalisation
+  // still count towards the same person's exposure.
+  const mine = rows(openRes).filter(i => customerKey(i.customer_name) === key).map(inv => {
+    const items = inv.invoice_items || [];
+    const net = inv.taxable_value != null
+      ? (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0)
+      : Math.max(0, items.reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0) - (inv.discount_amount || 0));
+    return { ...inv, outstanding: Math.round(net - (inv.amount_paid || 0)) };
+  });
+
+  const settled = rows(settledRes).filter(i => customerKey(i.customer_name) === key);
+  const customer = customerRes.status === "fulfilled" && !customerRes.value.error ? customerRes.value.data : null;
+
+  const exposure = currentExposure(mine);
+  const behaviour = paymentBehaviour(settled);
+  const evaluation = evaluateCreditSale({
+    exposure: exposure.exposure,
+    newAmount,
+    creditLimit: customer?.credit_limit,
+    blockOverLimit: customer?.block_over_limit,
+    behaviour,
+    oldestDays: exposure.oldestDays,
+  });
+
+  return {
+    customer: customer ? { name: customer.name, creditLimit: customer.credit_limit, creditDays: customer.credit_days, blockOverLimit: customer.block_over_limit } : null,
+    ...exposure,
+    behaviour,
+    ...evaluation,
+    summary: creditSummaryLine(evaluation, behaviour),
+  };
+}
+
+// Ask before billing: what does this customer owe, and should I be careful?
+app.get("/api/customers/:shopId/credit-check", async (req, res) => {
+  try {
+    const assessment = await assessCustomerCredit(req.params.shopId, req.query.name, parseFloat(req.query.amount) || 0);
+    if (!assessment) return res.json({ applicable: false });
+    res.json({ applicable: true, ...assessment });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Set or clear a customer's limit. Upsert on the normalised name, so the
+// shopkeeper never has to create a customer record before billing them.
+app.put("/api/customers/:shopId/limit", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { name, creditLimit, creditDays, blockOverLimit, phone, notes } = req.body;
+    const key = customerKey(name);
+    if (!key) return res.status(400).json({ error: "Customer ka naam chahiye" });
+
+    const limit = creditLimit === null || creditLimit === "" ? null : parseFloat(creditLimit);
+    if (limit !== null && (isNaN(limit) || limit < 0)) return res.status(400).json({ error: "Credit limit galat hai" });
+
+    const { data, error } = await supabase.from("customers").upsert({
+      shop_id: shopId,
+      name: String(name).trim(),
+      customer_key: key,
+      credit_limit: limit,
+      credit_days: creditDays === null || creditDays === "" ? null : parseInt(creditDays),
+      block_over_limit: !!blockOverLimit,
+      phone: phone || null,
+      notes: notes || null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "shop_id,customer_key" }).select().single();
+
+    if (error) throw error;
+    res.json({ success: true, customer: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Every customer who has a limit set, with what they currently owe against it.
+app.get("/api/customers/:shopId/limits", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const [custRes, openRes] = await Promise.allSettled([
+      supabase.from("customers").select("*").eq("shop_id", shopId).order("name"),
+      supabase.from("invoices")
+        .select("customer_name, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, created_at, invoice_items(quantity_boxes, price_per_box)")
+        .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]).limit(2000),
+    ]);
+
+    if (custRes.status === "fulfilled" && custRes.value.error) {
+      // Migration not run yet — say so rather than pretend there are no customers.
+      return res.json({ customers: [], unavailable: true });
+    }
+
+    const customers = custRes.status === "fulfilled" ? custRes.value.data || [] : [];
+    const open = openRes.status === "fulfilled" && !openRes.value.error ? openRes.value.data || [] : [];
+
+    const exposureByKey = {};
+    for (const inv of open) {
+      const key = customerKey(inv.customer_name);
+      const items = inv.invoice_items || [];
+      const net = inv.taxable_value != null
+        ? (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0)
+        : Math.max(0, items.reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0) - (inv.discount_amount || 0));
+      exposureByKey[key] = (exposureByKey[key] || 0) + Math.round(net - (inv.amount_paid || 0));
+    }
+
+    res.json({
+      customers: customers.map(c => {
+        const exposure = Math.max(0, exposureByKey[c.customer_key] || 0);
+        const limit = parseFloat(c.credit_limit) || 0;
+        return {
+          ...c,
+          exposure,
+          availableCredit: limit > 0 ? Math.round(Math.max(0, limit - exposure)) : null,
+          overLimit: limit > 0 && exposure > limit,
+        };
+      }),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/invoices/generate", async (req, res) => {
   try {
-    const result = await createInvoiceCore(req.body);
+    // Credit check runs here rather than inside createInvoiceCore on purpose:
+    // the recurring-invoice scheduler shares that core and has no human present
+    // to see a warning or authorise an override, so it must never be blocked.
+    let creditAssessment = null;
+    if (req.body?.paymentStatus === "credit" && req.body?.customerName) {
+      const grossGuess = (req.body.items || []).reduce(
+        (s, i) => s + (parseFloat(i.quantityBoxes) || 0) * (parseFloat(i.pricePerBox) || 0), 0,
+      ) - (parseFloat(req.body.discountAmount) || 0);
+      creditAssessment = await assessCustomerCredit(req.body.shopId, req.body.customerName, Math.max(0, grossGuess));
+
+      if (creditAssessment?.shouldBlock && !req.body.overrideCreditLimit) {
+        return res.status(409).json({
+          error: "Credit limit se zyada ho raha hai",
+          creditBlocked: true,
+          credit: creditAssessment,
+        });
+      }
+    }
+
+    const result = await createInvoiceCore({
+      ...req.body,
+      creditLimitOverridden: !!(creditAssessment?.wouldExceed),
+    });
+
+    // Warnings ride along with the successful response so the app can tell the
+    // shopkeeper what just happened without blocking the sale.
+    if (creditAssessment?.shouldWarn) result.creditWarning = creditAssessment;
     res.json(result);
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message });

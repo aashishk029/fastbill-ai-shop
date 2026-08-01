@@ -3432,6 +3432,11 @@ app.get("/api/credit-notes/:shopId/:id", async (req, res) => {
     const { shopId, id } = req.params;
     const { data: note, error } = await supabase.from("credit_notes")
       .select("*").eq("id", id).eq("shop_id", shopId).maybeSingle();
+    // Same treatment as the list endpoint: a missing table is a deployment
+    // state, not a database error to show a shopkeeper verbatim.
+    if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
+      return res.status(501).json({ error: "Credit note table nahi hai — migration 20260805000000 chalayein" });
+    }
     if (error) throw error;
     if (!note) return res.status(404).json({ error: "Credit note nahi mila" });
 

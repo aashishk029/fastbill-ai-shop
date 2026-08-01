@@ -2317,7 +2317,7 @@ app.get("/api/credit-score/:shopId", async (req, res) => {
     // ── Rule-based scoring (300–900, CIBIL style) ──────────────────────────
     const invoiceCount   = invoices.length;
     const totalRevenue   = invoices.reduce((s, i) => {
-      const amt = parseFloat(i.total_amount) || (parseFloat(i.taxable_value) + parseFloat(i.cgst_amount || 0) + parseFloat(i.sgst_amount || 0)) || 0;
+      const amt = parseFloat(i.total_amount) || invoiceGrossValue(i) || 0;
       return s + amt;
     }, 0);
     const uniqueCustomers = new Set(invoices.map(i => i.customer_name).filter(Boolean)).size;
@@ -3309,8 +3309,13 @@ app.post("/api/invoices/:id/eway-bill-data", async (req, res) => {
         recipientGstin: invoice.customer_gstin || null,
         invoiceType: invoice.invoice_type,
         totalTaxableValue: invoice.taxable_value,
-        cgstAmount: invoice.cgst_amount,
-        sgstAmount: invoice.sgst_amount,
+        // The EWB-01 form takes IGST for an inter-state consignment — which is
+        // precisely the case where an e-way bill matters most.
+        cgstAmount: invoice.is_inter_state ? 0 : invoice.cgst_amount,
+        sgstAmount: invoice.is_inter_state ? 0 : invoice.sgst_amount,
+        igstAmount: invoice.igst_amount || 0,
+        placeOfSupply: invoice.place_of_supply || null,
+        supplyType: invoice.is_inter_state ? "Inter-State" : "Intra-State",
         totalInvoiceValue: Math.round(grossValue),
         transporterName: transporterName || null,
         transporterId: transporterId || null,

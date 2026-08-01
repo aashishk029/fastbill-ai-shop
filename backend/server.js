@@ -1284,8 +1284,11 @@ async function computeDecisions(shopId, query = {}) {
       supabase.from("inventory")
         .select("design_id, quantity_boxes, expiry_date, last_cost_price, designs(design_code, design_name, unit_type)")
         .eq("shop_id", shopId),
+      // All purchases, not just the window: stock bought eight months ago still
+      // has a cost, and without it the money-stuck-on-the-shelf finding — the
+      // most valuable one this engine produces — never fires at all.
       supabase.from("purchases").select("design_id, quantity_boxes, cost_per_box, purchase_date")
-        .eq("shop_id", shopId).gte("purchase_date", since).limit(2000),
+        .eq("shop_id", shopId).order("purchase_date", { ascending: true }).limit(5000),
       supabase.from("invoices")
         .select(`created_at, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, payment_status, invoice_items(quantity_boxes, price_per_box)`)
         .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]).limit(2000),
@@ -1316,10 +1319,24 @@ async function computeDecisions(shopId, query = {}) {
     }
 
     // Last known cost per design, for valuing what is sitting on the shelf.
+    // Purchases are ordered oldest-first, so the last write wins = most recent.
     const lastCost = {};
     for (const p of purchases) {
-      if (p.design_id) lastCost[p.design_id] = parseFloat(p.cost_per_box) || 0;
+      const c = parseFloat(p.cost_per_box) || 0;
+      if (p.design_id && c > 0) lastCost[p.design_id] = c;
     }
+
+    // Where a shop has both a recorded purchase price and a cost typed into the
+    // pricing editor, the purchase wins. One is a transaction that happened; the
+    // other is a number someone typed into a form, and in real data the typed
+    // field frequently holds a selling price by mistake — which would value the
+    // shelf at several times what it is worth and turn every dead-stock figure
+    // into fiction.
+    const costFor = (row) => {
+      const purchased = lastCost[row.design_id] || 0;
+      const typed = parseFloat(row.last_cost_price) || 0;
+      return purchased > 0 ? purchased : typed;
+    };
 
     const recommendations = [];
     const abcInput = [];
@@ -1330,7 +1347,7 @@ async function computeDecisions(shopId, query = {}) {
       const unit = row.designs?.unit_type || "units";
       const onHand = parseFloat(row.quantity_boxes) || 0;
       const stats = perDesign[d];
-      const cost = parseFloat(row.last_cost_price) || lastCost[d] || 0;
+      const cost = costFor(row);
 
       // Demand series across the whole window, zeros included — a product that
       // sold 50 on one day and nothing for 89 others is not "50 a day".
@@ -1470,12 +1487,43 @@ async function computeDecisions(shopId, query = {}) {
 
     // ── Inventory turnover: is capital working or resting ──
     const inventoryValue = inventory.reduce((s, r) =>
-      s + (parseFloat(r.quantity_boxes) || 0) * (parseFloat(r.last_cost_price) || lastCost[r.design_id] || 0), 0);
+      s + (parseFloat(r.quantity_boxes) || 0) * costFor(r), 0);
     const cogsWindow = Object.entries(perDesign).reduce((s, [d, st]) => s + st.units * (lastCost[d] || 0), 0);
     const turnover = ops.inventoryTurnover({
       costOfGoodsSold: cogsWindow * (365 / windowDays),
       averageInventoryValue: inventoryValue,
     });
+
+    // A shop that barely sold anything in the window produces a technically
+    // correct "5441 days of inventory". That number is arithmetic, not
+    // information — it alarms without informing. Below a quarter of a turn a
+    // year there simply is not enough movement to describe, and saying so is
+    // more useful than printing a figure nobody can act on.
+    const turnoverMeaningful = !!turnover && turnover.turnover >= 0.25;
+
+    // Where the typed cost and the actual purchase price disagree badly, that is
+    // worth telling the shopkeeper: it is usually a selling price entered in a
+    // cost field, and it silently distorts every margin and valuation they see.
+    for (const row of inventory) {
+      const purchased = lastCost[row.design_id] || 0;
+      const typed = parseFloat(row.last_cost_price) || 0;
+      if (purchased > 0 && typed > 0 && typed > purchased * 2) {
+        recommendations.push({
+          type: "data_check",
+          priority: "low",
+          designId: row.design_id,
+          title: `Check the cost recorded for ${row.designs?.design_name || "a product"}`,
+          because: {
+            costTypedInApp: typed,
+            actualPurchasePrice: purchased,
+            note: "The cost saved in the pricing screen is far above what was actually paid — often a selling price entered by mistake.",
+          },
+          rupeeImpact: 0,
+          method: "Comparison of the recorded purchase price against the cost stored on the product",
+          confidence: "high",
+        });
+      }
+    }
 
     recommendations.sort((a, b) => {
       const rank = { high: 0, medium: 1, low: 2 };
@@ -1495,8 +1543,9 @@ async function computeDecisions(shopId, query = {}) {
       totalRupeeImpact: recommendations.reduce((s, r) => s + (r.rupeeImpact || 0), 0),
       health: {
         inventoryValue: Math.round(inventoryValue),
-        inventoryTurnover: turnover?.turnover ?? null,
-        daysOfInventory: turnover?.daysOfInventory ?? null,
+        inventoryTurnover: turnoverMeaningful ? turnover.turnover : null,
+        daysOfInventory: turnoverMeaningful ? turnover.daysOfInventory : null,
+        turnoverNote: turnoverMeaningful ? null : "Too little movement in this period to measure turnover.",
         daysSalesOutstanding: dso,
         outstanding: Math.round(outstanding),
         expensesInWindow: Math.round(expenses.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0)),

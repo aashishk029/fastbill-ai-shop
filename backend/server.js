@@ -167,6 +167,8 @@ const KANHAIYA_MARBLES = {
 // keeps BOTH Render (no cold sleep) AND the Supabase free project (no
 // week-idle pause) warm. See .github/workflows/keepwarm.yml.
 app.get("/api/health", async (req, res) => {
+  // Pick up a migration applied since boot (see recheckSchemaIfNeeded).
+  await recheckSchemaIfNeeded();
   let db = false;
   try {
     // Lightweight: count-only, no rows returned. Touches Postgres → resets idle timer.
@@ -182,6 +184,7 @@ app.get("/api/health", async (req, res) => {
     timestamp: new Date(),
     db,
     gemini: !!process.env.GEMINI_API_KEY,
+    igstReady: HAS_IGST_COLUMN,
     hf: !!process.env.HF_TOKEN,
   });
 });
@@ -518,13 +521,28 @@ const igstCol = () => (HAS_IGST_COLUMN ? ", igst_amount, is_inter_state" : "");
 async function probeIgstColumn() {
   try {
     const { error } = await supabase.from("invoices").select("igst_amount").limit(1);
+    const wasPresent = HAS_IGST_COLUMN;
     HAS_IGST_COLUMN = !error;
+    if (HAS_IGST_COLUMN && !wasPresent) console.log("igst_amount detected — inter-state billing active");
     if (!HAS_IGST_COLUMN) console.warn("igst_amount not present — run migration 20260804000000 for inter-state billing");
   } catch {
     HAS_IGST_COLUMN = false;
   }
 }
 probeIgstColumn();
+
+// The probe runs at boot, but a migration is applied by a human at some later
+// moment — and this server does not restart when that happens. Without
+// re-probing, every query would keep omitting igst_amount until the next
+// deploy, silently under-reporting inter-state bills long after the database
+// was ready for them.
+//
+// Re-checked from the health route rather than on a timer: the keep-warm cron
+// already calls it every ten minutes, so this costs nothing extra and stops as
+// soon as the column appears.
+async function recheckSchemaIfNeeded() {
+  if (!HAS_IGST_COLUMN) await probeIgstColumn();
+}
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two

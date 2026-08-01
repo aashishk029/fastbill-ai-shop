@@ -493,6 +493,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // discount ordering silently drifted apart once before.
 const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl } = require("./lib/money");
 const { toCsv } = require("./lib/csv");
+const { ageingSummary, groupByParty } = require("./lib/ageing");
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
@@ -2432,20 +2433,25 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
 app.get("/api/bakaya/:shopId", async (req, res) => {
   try {
     const { shopId } = req.params;
+    // These were capped at 50 rows, which silently understated the headline
+    // total for any shop with more than 50 open bills — the one number a
+    // shopkeeper checks daily. Totals must cover every open bill; the cap here
+    // is a safety valve, not a page size, and the response says when it bites.
+    const OPEN_BILL_CAP = 2000;
     const [invoicesRes, purchasesRes] = await Promise.allSettled([
       supabase.from("invoices")
         .select("id, invoice_number, customer_name, customer_phone, created_at, payment_status, amount_paid, taxable_value, cgst_amount, sgst_amount, discount_amount, invoice_items(quantity_boxes, price_per_box)")
         .eq("shop_id", shopId)
         .in("payment_status", ["credit", "partial"])
         .order("created_at", { ascending: false })
-        .limit(50),
+        .limit(OPEN_BILL_CAP),
 
       supabase.from("purchases")
         .select("id, supplier_name, created_at, purchase_date, payment_status, amount_paid, quantity_boxes, cost_per_box")
         .eq("shop_id", shopId)
         .in("payment_status", ["unpaid", "partial"])
         .order("purchase_date", { ascending: false })
-        .limit(50),
+        .limit(OPEN_BILL_CAP),
     ]);
 
     const creditInvoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
@@ -2490,7 +2496,26 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
     const customerBakaya = enrichedInvoices.reduce((s, i) => s + i.outstanding, 0);
     const supplierBakaya = enrichedPurchases.reduce((s, p) => s + p.outstanding, 0);
 
-    res.json({ customerBakaya, supplierBakaya, creditInvoices: enrichedInvoices, unpaidPurchases: enrichedPurchases });
+    // Ageing turns a total into a plan: which money is merely recent, which is
+    // stuck, and who to chase first. Suppliers are aged off purchase_date, which
+    // is when the obligation actually started.
+    const customerAgeing = ageingSummary(enrichedInvoices, { dateField: "created_at" });
+    const supplierAgeing = ageingSummary(enrichedPurchases, { dateField: "purchase_date" });
+    const topDebtors = groupByParty(enrichedInvoices, { partyField: "customer_name", dateField: "created_at" });
+    const topCreditors = groupByParty(enrichedPurchases, { partyField: "supplier_name", dateField: "purchase_date" });
+
+    res.json({
+      customerBakaya,
+      supplierBakaya,
+      // Lists stay capped for payload size; totals and ageing above cover everything.
+      creditInvoices: enrichedInvoices.slice(0, 50),
+      unpaidPurchases: enrichedPurchases.slice(0, 50),
+      customerAgeing,
+      supplierAgeing,
+      topDebtors: topDebtors.slice(0, 10),
+      topCreditors: topCreditors.slice(0, 10),
+      truncated: enrichedInvoices.length >= OPEN_BILL_CAP || enrichedPurchases.length >= OPEN_BILL_CAP,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

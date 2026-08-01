@@ -499,6 +499,7 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 // discount ordering silently drifted apart once before.
 const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl, invoiceTaxTotal, invoiceGrossValue } = require("./lib/money");
 const { toCsv } = require("./lib/csv");
+const { buildTallyXml } = require("./lib/tallyExport");
 const { ageingSummary, groupByParty } = require("./lib/ageing");
 const { customerKey, currentExposure, paymentBehaviour, evaluateCreditSale, creditSummaryLine } = require("./lib/credit");
 const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbook");
@@ -1902,6 +1903,74 @@ app.post("/api/export/:shopId/csv", exportLimiter, async (req, res) => {
     // UTF-8 BOM so Excel renders Devanagari and other Indic scripts correctly
     // instead of mojibake — without it a Hindi customer name is unreadable.
     res.send("﻿" + csv);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// The books, in the shape the shopkeeper's accountant actually works in.
+//
+// FastBill will not beat Tally at accounting and should not try. A clean
+// handoff turns the incumbent from a competitor into a channel — and removes
+// the most common reason a shop would abandon this app at year end.
+//
+// PIN-gated like every other bulk export: this is the whole book.
+app.post("/api/export/:shopId/tally", exportLimiter, async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const gate = await verifyShopPin(shopId, req.body?.pin);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    // Default to the current financial year, which is the unit a CA works in.
+    const now = new Date();
+    const ist = new Date(now.getTime() + 5.5 * 3600000);
+    const fyStartYear = ist.getUTCMonth() >= 3 ? ist.getUTCFullYear() : ist.getUTCFullYear() - 1;
+    const from = req.body?.from || `${fyStartYear}-04-01T00:00:00+05:30`;
+    const to = req.body?.to || `${fyStartYear + 1}-03-31T23:59:59+05:30`;
+
+    const [invRes, purchRes, cnRes] = await Promise.allSettled([
+      supabase.from("invoices")
+        .select(`id, invoice_number, created_at, customer_name, customer_gstin, is_gst_invoice, taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount, payment_status, invoice_items(quantity_boxes, price_per_box)`)
+        .eq("shop_id", shopId).gte("created_at", from).lte("created_at", to)
+        .not("payment_status", "in", '("cancelled")')
+        .order("created_at"),
+      supabase.from("purchases").select("*").eq("shop_id", shopId)
+        .gte("purchase_date", from).lte("purchase_date", to).order("purchase_date"),
+      supabase.from("credit_notes").select("*").eq("shop_id", shopId)
+        .gte("issued_at", from).lte("issued_at", to).order("issued_at"),
+    ]);
+
+    const rows = (r) => (r.status === "fulfilled" && !r.value.error ? r.value.data || [] : []);
+
+    // Attach the bill value the app itself computes, so the exporter can check
+    // its vouchers against it rather than trusting the stored tax fields alone.
+    const invoices = rows(invRes).map(inv => ({
+      ...inv,
+      grossAmount: inv.taxable_value != null
+        ? invoiceGrossValue(inv)
+        : Math.max(0, (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0) - (inv.discount_amount || 0)),
+    }));
+
+    const { xml, voucherCount, rejected } = buildTallyXml({
+      companyName: gate.shop?.name,
+      invoices,
+      purchases: rows(purchRes),
+      creditNotes: rows(cnRes),
+    });
+
+    if (req.body?.format === "json") {
+      // Lets the app show what will be sent, and what could not be, before the
+      // shopkeeper hands a file to their accountant.
+      return res.json({ voucherCount, rejected, from, to, xmlLength: xml.length });
+    }
+
+    res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="tally-${fyStartYear}-${String(fyStartYear + 1).slice(2)}.xml"`);
+    // Rejected vouchers travel in a header so a caller downloading the file
+    // still learns that something was left out.
+    res.setHeader("X-Vouchers-Exported", String(voucherCount));
+    res.setHeader("X-Vouchers-Rejected", String(rejected.length));
+    res.send(xml);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

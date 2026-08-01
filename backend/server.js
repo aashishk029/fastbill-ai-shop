@@ -233,13 +233,19 @@ app.post("/api/shops/init", async (req, res) => {
 // Get Shop Details
 app.get("/api/shops/:shopId", async (req, res) => {
   try {
+    // maybeSingle, not single: a shop that does not exist is a 404, not a 500.
+    // This route is called on every app launch, so a stale shopId used to
+    // surface as "Cannot coerce the result to a single JSON object" — a
+    // Postgres internal message shown to a shopkeeper, with a 500 that reads
+    // like the server is broken.
     const { data, error } = await supabase
       .from("shops")
       .select("*")
       .eq("id", req.params.shopId)
-      .single();
+      .maybeSingle();
 
     if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Shop nahi mila" });
 
     // Never expose the password hash to clients.
     const { pin_hash, ...safe } = data;
@@ -1792,7 +1798,7 @@ async function ensureExclusiveCategory(designId) {
   if (!siblings || siblings.length <= 1) return design.category_id; // already exclusive to this design
 
   const { data: origCat, error: fetchErr } = await supabase
-    .from("tile_categories").select("*").eq("id", design.category_id).single();
+    .from("tile_categories").select("*").eq("id", design.category_id).maybeSingle();
   if (fetchErr || !origCat) return design.category_id;
 
   const { data: newCat, error: insErr } = await supabase.from("tile_categories").insert({
@@ -3289,7 +3295,7 @@ app.post("/api/invoices/:id/eway-bill-data", async (req, res) => {
       .eq("id", req.params.id).eq("shop_id", shopId).single();
     if (error || !invoice) return res.status(404).json({ error: "Invoice not found in this shop" });
 
-    const { data: shop } = await supabase.from("shops").select("name, gstin, address").eq("id", shopId).single();
+    const { data: shop } = await supabase.from("shops").select("name, gstin, address").eq("id", shopId).maybeSingle();
 
     const grossValue = invoiceGrossValue(invoice);
     // E-way bill is mandatory above ₹50,000 goods value (CGST Rules 138) — flagging so the

@@ -503,6 +503,7 @@ const { ageingSummary, groupByParty } = require("./lib/ageing");
 const { customerKey, currentExposure, paymentBehaviour, evaluateCreditSale, creditSummaryLine } = require("./lib/credit");
 const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbook");
 const { resolveSupply, splitTaxComponents, stateCodeFromGstin, stateName } = require("./lib/gstPlace");
+const { financialYear, creditNoteNumber, computeCreditNote, gstAdjustmentAllowed } = require("./lib/creditNote");
 
 // Whether migration 20260804000000 has been applied. PostgREST errors on an
 // unknown column, so a query that asks for igst_amount before the migration
@@ -2715,6 +2716,26 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     ]);
 
     const invoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
+
+    // Credit notes issued this year. Since a return no longer edits the original
+    // invoice, a partially returned bill still carries its full value here — the
+    // credit has to be subtracted, or output tax is overstated by exactly the
+    // amount that was given back.
+    //
+    // Notes against invoices that are excluded entirely (cancelled, fully
+    // returned) are skipped too, otherwise the credit would be counted while the
+    // sale it reverses never was.
+    const { data: cnRows } = await supabase.from("credit_notes")
+      .select("id, invoice_id, credit_note_number, issued_at, customer_name, customer_gstin, taxable_value, cgst_amount, sgst_amount, igst_amount, total_credit, is_inter_state, original_invoice_number")
+      .eq("shop_id", shopId).gte("issued_at", fyStart).lte("issued_at", fyEnd);
+
+    const countedInvoiceIds = new Set(invoices.map(i => i.id));
+    const creditNotes = (cnRows || []).filter(n => countedInvoiceIds.has(n.invoice_id));
+    const cnTaxable = creditNotes.reduce((s, n) => s + (parseFloat(n.taxable_value) || 0), 0);
+    const cnCgst = creditNotes.reduce((s, n) => s + (parseFloat(n.cgst_amount) || 0), 0);
+    const cnSgst = creditNotes.reduce((s, n) => s + (parseFloat(n.sgst_amount) || 0), 0);
+    const cnIgst = creditNotes.reduce((s, n) => s + (parseFloat(n.igst_amount) || 0), 0);
+    const cnTotal = creditNotes.reduce((s, n) => s + (parseFloat(n.total_credit) || 0), 0);
     const nonGstInvoices = nonGstInvoicesRes.status === "fulfilled" ? nonGstInvoicesRes.value.data || [] : [];
     let purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
     // The GST columns above only exist after migration 20260801000000. Without this retry a
@@ -2743,7 +2764,8 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // they are reported as their own line rather than folded into CGST+SGST.
     const igstCollected = invoices.reduce((s, inv) => s + (inv.igst_amount || 0), 0);
     const interStateInvoices = invoices.filter(inv => inv.is_inter_state).length;
-    const gstCollected = cgst + sgst + igstCollected;
+    // Net of credit notes: what was actually supplied and is actually payable.
+    const gstCollected = (cgst - cnCgst) + (sgst - cnSgst) + (igstCollected - cnIgst);
 
     // ── INPUT TAX CREDIT ──
     // GST paid to suppliers, split by whether it is actually claimable. A purchase only
@@ -2823,12 +2845,25 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
       shop: { name: shop?.name, owner: shop?.owner_name, phone: shop?.phone, gstin: shop?.gstin || null },
       fy: `${fy}-${fy + 1}`,
       gst: {
-        grossSales: Math.round(grossSales),
-        taxableValue: Math.round(taxableValue),
-        cgst: Math.round(cgst),
-        sgst: Math.round(sgst),
+        // Reported net of credit notes; the gross figures and the credit are
+        // both shown so a CA can fill Table 4 and Table 9B separately.
+        grossSales: Math.round(grossSales - cnTotal),
+        grossSalesBeforeCredits: Math.round(grossSales),
+        taxableValue: Math.round(taxableValue - cnTaxable),
+        taxableValueBeforeCredits: Math.round(taxableValue),
+        cgst: Math.round(cgst - cnCgst),
+        sgst: Math.round(sgst - cnSgst),
+        creditNotes: {
+          count: creditNotes.length,
+          taxableValue: Math.round(cnTaxable),
+          cgst: Math.round(cnCgst),
+          sgst: Math.round(cnSgst),
+          igst: Math.round(cnIgst),
+          totalCredited: Math.round(cnTotal),
+          note: "GSTR-1 table 9B (credit/debit notes). These reduce output tax for the period.",
+        },
         totalGstCollected: Math.round(gstCollected),
-        igst: Math.round(igstCollected),
+        igst: Math.round(igstCollected - cnIgst),
         interStateInvoices,
         gstPaidOnPurchases: Math.round(gstPaidOnPurchases),
         itcAvailable: Math.round(itcAvailable),
@@ -3209,11 +3244,34 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
 
+    // Credits issued against these bills. A return no longer edits the invoice,
+    // so a partially returned bill still shows its full value here — without
+    // subtracting the credit, the day's sales would include goods that came back.
+    const rows = data || [];
+    const creditedByInvoice = {};
+    if (rows.length > 0) {
+      const { data: cns } = await supabase.from("credit_notes")
+        .select("invoice_id, total_credit")
+        .in("invoice_id", rows.map(r => r.id));
+      for (const n of (cns || [])) {
+        creditedByInvoice[n.invoice_id] = (creditedByInvoice[n.invoice_id] || 0) + (parseFloat(n.total_credit) || 0);
+      }
+    }
+
     // Compute totals from items
-    const invoices = (data || []).map(inv => {
+    const invoices = rows.map(inv => {
       const gross = (inv.invoice_items || []).reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
       const boxes = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes || 0), 0);
-      return { ...inv, grossAmount: Math.round(gross), totalBoxes: boxes };
+      const credited = Math.round(creditedByInvoice[inv.id] || 0);
+      return {
+        ...inv,
+        // grossAmount stays the net figure the app has always displayed, so
+        // nothing downstream changes shape; the parts are exposed alongside.
+        grossAmount: Math.max(0, Math.round(gross) - credited),
+        billedAmount: Math.round(gross),
+        creditedAmount: credited,
+        totalBoxes: boxes,
+      };
     });
 
     const monthlyTotal = invoices.reduce((s, i) => s + i.grossAmount, 0);
@@ -3341,6 +3399,51 @@ app.post("/api/invoices/:id/eway-bill-data", async (req, res) => {
   }
 });
 
+// Credit notes a shop has issued. Statutory documents, so they are listed in
+// their own right rather than only as a side effect of a return.
+app.get("/api/credit-notes/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    let query = supabase.from("credit_notes").select("*").eq("shop_id", shopId).order("issued_at", { ascending: false });
+    if (req.query.fy) query = query.eq("financial_year", req.query.fy);
+    if (req.query.invoiceId) query = query.eq("invoice_id", req.query.invoiceId);
+
+    const { data, error } = await query.limit(500);
+    if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
+      return res.json({ creditNotes: [], unavailable: true });
+    }
+    if (error) throw error;
+
+    const notes = data || [];
+    res.json({
+      creditNotes: notes,
+      totalCredited: Math.round(notes.reduce((s, n) => s + (parseFloat(n.total_credit) || 0), 0)),
+      taxCredited: Math.round(notes.reduce((s, n) =>
+        s + (parseFloat(n.cgst_amount) || 0) + (parseFloat(n.sgst_amount) || 0) + (parseFloat(n.igst_amount) || 0), 0)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// One credit note, with everything needed to print it as a document.
+app.get("/api/credit-notes/:shopId/:id", async (req, res) => {
+  try {
+    const { shopId, id } = req.params;
+    const { data: note, error } = await supabase.from("credit_notes")
+      .select("*").eq("id", id).eq("shop_id", shopId).maybeSingle();
+    if (error) throw error;
+    if (!note) return res.status(404).json({ error: "Credit note nahi mila" });
+
+    const { data: shop } = await supabase.from("shops")
+      .select("name, owner_name, address, phone, gstin").eq("id", shopId).maybeSingle();
+
+    res.json({ creditNote: note, shop });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/invoices/:id/return", async (req, res) => {
   try {
     const { id } = req.params;
@@ -3352,90 +3455,175 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       return res.status(400).json({ error: "returnItems required" });
     }
 
-    // Lookup invoice for shop_id + idempotency
+    // The invoice as issued. It is NOT modified by a return — see the credit
+    // note migration for why. Only its payment_status changes, so the app can
+    // still show that goods came back.
     const { data: invoiceRow, error: invErr } = await supabase
       .from("invoices")
-      .select("id, shop_id, payment_status")
+      .select(`id, shop_id, payment_status, invoice_number, created_at, customer_name, customer_phone, customer_gstin, discount_amount, is_gst_invoice, taxable_value, cgst_amount, sgst_amount${igstCol()}${HAS_IGST_COLUMN ? ", place_of_supply" : ""}`)
       .eq("id", id)
-      .single();
+      .maybeSingle();
     if (invErr || !invoiceRow) return res.status(404).json({ error: "Invoice not found" });
     if (invoiceRow.shop_id !== shopId) return res.status(403).json({ error: "Yeh invoice aapke shop ka nahi hai" });
     if (invoiceRow.payment_status === "returned") {
       return res.json({ success: true, message: "Invoice already fully returned", idempotent: true });
     }
 
-    // Current invoice items (with price) — used to reduce lines + recompute totals.
     const { data: itemsData } = await supabase
       .from("invoice_items")
-      .select("id, design_id, quantity_boxes, price_per_box")
+      .select("id, design_id, quantity_boxes, price_per_box, gst_rate")
       .eq("invoice_id", id);
     const itemList = itemsData || [];
-    const originalValue = itemList.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
+    if (itemList.length === 0) return res.status(400).json({ error: "Is invoice me koi item nahi hai" });
 
-    // Aggregate returned qty per design (handles duplicate rows in returnItems).
+    // Aggregate returned quantity per design (handles duplicate rows in returnItems).
     const returnByDesign = {};
     returnItems.forEach(r => {
       const q = parseFloat(r.quantityBoxes) || 0;
       if (q > 0) returnByDesign[r.designId] = (returnByDesign[r.designId] || 0) + q;
     });
+    if (Object.keys(returnByDesign).length === 0) {
+      return res.status(400).json({ error: "Koi quantity wapas nahi aayi" });
+    }
 
-    // For each returned design: restore inventory + reduce the invoice line qty.
-    await Promise.all(Object.entries(returnByDesign).map(async ([designId, q]) => {
+    // Already-credited quantities, so returning the same goods twice cannot
+    // credit them twice.
+    const { data: priorNotes } = await supabase
+      .from("credit_notes").select("lines").eq("invoice_id", id);
+    const alreadyCredited = {};
+    for (const note of (priorNotes || [])) {
+      for (const line of (note.lines || [])) {
+        alreadyCredited[line.designId] = (alreadyCredited[line.designId] || 0) + (parseFloat(line.quantity) || 0);
+      }
+    }
+    const remainingItems = itemList.map(i => ({
+      ...i,
+      quantity_boxes: Math.max(0, (parseFloat(i.quantity_boxes) || 0) - (alreadyCredited[i.design_id] || 0)),
+    }));
+    if (remainingItems.every(i => i.quantity_boxes <= 0)) {
+      return res.status(409).json({ error: "Is invoice ka sara maal pehle hi wapas ho chuka hai" });
+    }
+
+    // The GST mode is not stored on the invoice, so it is inferred from what was
+    // recorded: if the stored taxable value is less than the item gross, tax was
+    // inside the price. Inferring beats assuming, and both paths are tested.
+    const itemGross = itemList.reduce((s, i) => s + (parseFloat(i.quantity_boxes) || 0) * (parseFloat(i.price_per_box) || 0), 0);
+    const netOfDiscount = Math.max(0, itemGross - (parseFloat(invoiceRow.discount_amount) || 0));
+    const storedTaxable = parseFloat(invoiceRow.taxable_value) || 0;
+    const isGstInvoice = invoiceRow.is_gst_invoice !== false && storedTaxable > 0;
+    const gstMode = isGstInvoice && storedTaxable < netOfDiscount - 0.5 ? "included" : "exclusive";
+    const interState = !!invoiceRow.is_inter_state || (parseFloat(invoiceRow.igst_amount) || 0) > 0;
+
+    const credit = computeCreditNote({
+      originalItems: remainingItems,
+      returnedQty: returnByDesign,
+      gstMode,
+      isGstInvoice,
+      discountAmount: invoiceRow.discount_amount,
+      interState,
+    });
+    if (credit.lines.length === 0) {
+      return res.status(400).json({ error: "Yeh maal is invoice me nahi hai" });
+    }
+
+    // Restore stock for what came back.
+    await Promise.all(credit.lines.map(async (line) => {
       const { data: inv } = await supabase
         .from("inventory")
         .select("id, quantity_boxes")
-        .eq("shop_id", invoiceRow.shop_id)
-        .eq("design_id", designId)
+        .eq("shop_id", shopId)
+        .eq("design_id", line.designId)
         .maybeSingle();
       if (inv) {
         const { error: restoreErr } = await supabase.from("inventory")
-          .update({ quantity_boxes: (inv.quantity_boxes || 0) + q })
+          .update({ quantity_boxes: (inv.quantity_boxes || 0) + line.quantity })
           .eq("id", inv.id);
         if (restoreErr) throw restoreErr;
       }
-      const line = itemList.find(it => it.design_id === designId);
-      if (line) {
-        const newQty = Math.max(0, (line.quantity_boxes || 0) - q);
-        line.quantity_boxes = newQty; // keep local copy in sync for remainingValue
-        const { error: lineErr } = await supabase.from("invoice_items").update({ quantity_boxes: newQty }).eq("id", line.id);
-        if (lineErr) throw lineErr;
-      }
     }));
 
-    // Recompute invoice totals by scaling stored values to the remaining proportion.
-    // Linear scaling preserves GST mode (included/exclusive) + discount split correctly.
-    const remainingValue = itemList.reduce((s, i) => s + ((i.quantity_boxes || 0) * (i.price_per_box || 0)), 0);
-    const ratio = originalValue > 0 ? remainingValue / originalValue : 0;
-    const newStatus = remainingValue <= 0 ? "returned" : "partial_return";
+    // Issue the credit note. The serial number must be unique within the shop's
+    // financial year, so a conflict from a concurrent return is retried with the
+    // next sequence rather than silently reusing a number.
+    const fy = financialYear();
+    const adjustment = gstAdjustmentAllowed(invoiceRow.created_at);
+    let creditNote = null, cnError = null;
 
-    const { data: invFull } = await supabase
-      .from("invoices")
-      .select(`taxable_value, cgst_amount, sgst_amount${igstCol()}, discount_amount`)
-      .eq("id", id)
-      .single();
-    const scale = (v) => (v == null ? null : Math.round(v * ratio * 100) / 100);
+    const { count } = await supabase.from("credit_notes")
+      .select("id", { count: "exact", head: true })
+      .eq("shop_id", shopId).eq("financial_year", fy);
 
-    const { error: finalUpdErr } = await supabase.from("invoices").update({
+    for (let attempt = 0; attempt < 5 && !creditNote; attempt++) {
+      const sequence = (count || 0) + 1 + attempt;
+      const row = {
+        shop_id: shopId,
+        invoice_id: id,
+        credit_note_number: creditNoteNumber({ sequence }),
+        financial_year: fy,
+        sequence,
+        reason: reason || "Customer return",
+        customer_name: invoiceRow.customer_name,
+        customer_phone: invoiceRow.customer_phone,
+        customer_gstin: invoiceRow.customer_gstin,
+        original_invoice_number: invoiceRow.invoice_number,
+        original_invoice_date: invoiceRow.created_at,
+        taxable_value: credit.taxableValue,
+        cgst_amount: credit.cgst,
+        sgst_amount: credit.sgst,
+        igst_amount: credit.igst,
+        total_credit: credit.totalCredit,
+        is_inter_state: interState,
+        place_of_supply: invoiceRow.place_of_supply || null,
+        is_full_return: credit.isFullReturn,
+        lines: credit.lines,
+        gst_adjustable: adjustment.allowed,
+      };
+      const { data, error } = await supabase.from("credit_notes").insert([row]).select().single();
+      if (!error) { creditNote = data; break; }
+      cnError = error;
+      // A duplicate serial is a race worth retrying; anything else is not.
+      if (!/duplicate key|unique/i.test(error.message || "")) break;
+    }
+
+    // Stock is already back on the shelf. If the note could not be written, say
+    // so plainly instead of reporting a clean return that produced no document.
+    if (!creditNote) {
+      const migrationMissing = /relation|does not exist|schema cache/i.test(cnError?.message || "");
+      return res.status(migrationMissing ? 501 : 500).json({
+        error: migrationMissing
+          ? "Credit note table nahi hai — migration 20260805000000 chalayein"
+          : `Credit note ban nahi paya: ${cnError?.message}`,
+        stockRestored: true,
+      });
+    }
+
+    // Mark the invoice's return state without touching its amounts.
+    const totalRemaining = remainingItems.reduce((s, i) => s + i.quantity_boxes, 0);
+    const returnedNow = credit.lines.reduce((s, l) => s + l.quantity, 0);
+    const newStatus = returnedNow >= totalRemaining ? "returned" : "partial_return";
+
+    const { error: statusErr } = await supabase.from("invoices").update({
       payment_status: newStatus,
       return_note: reason || "Customer return",
-      taxable_value: scale(invFull?.taxable_value),
-      cgst_amount: scale(invFull?.cgst_amount),
-      sgst_amount: scale(invFull?.sgst_amount),
-      discount_amount: scale(invFull?.discount_amount),
-    }).eq("id", id);
-    if (finalUpdErr) throw finalUpdErr;
+    }).eq("id", id).eq("shop_id", shopId);
+    if (statusErr) throw statusErr;
 
-    res.json({ success: true, returnStatus: newStatus, itemsRestored: Object.keys(returnByDesign).length });
+    res.json({
+      success: true,
+      returnStatus: newStatus,
+      creditNote,
+      gstAdjustment: adjustment,
+      // Stated rather than buried: the goods can come back at any time, but the
+      // tax can only be recovered inside the statutory window.
+      note: adjustment.allowed
+        ? null
+        : `GST adjustment window closed on ${adjustment.deadline}. Goods returned, but the tax on this sale can no longer be reduced.`,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ============================================
-// WEEK 1 — CUSTOMER PAYMENT HISTORY
-// ============================================
-
-// Record a payment event (partial/full payment with date)
 app.post("/api/payment-events", async (req, res) => {
   try {
     const { invoiceId, amount, paymentMode, note, shopId } = req.body;

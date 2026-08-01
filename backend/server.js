@@ -495,11 +495,12 @@ const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCos
 const { toCsv } = require("./lib/csv");
 const { ageingSummary, groupByParty } = require("./lib/ageing");
 const { customerKey, currentExposure, paymentBehaviour, evaluateCreditSale, creditSummaryLine } = require("./lib/credit");
+const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbook");
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
 // drifting apart, like the client/backend discount-order bug did earlier).
-async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, discountAmount, tableNumber, creditLimitOverridden = false }) {
+async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, creditLimitOverridden = false }) {
   let createdInvoiceId = null;
   try {
     if (!shopId) throw Object.assign(new Error("shopId required"), { status: 400 });
@@ -590,6 +591,16 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
       discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
     };
 
+    // How the customer settled it. Only meaningful on a paid bill — an udhari
+    // bill has not been paid by anything yet. Left null when not supplied, and
+    // reported as "not recorded" rather than assumed to be cash, because
+    // assuming would make every day-close wrong.
+    const PAYMENT_MODES = ["cash", "upi", "card", "bank"];
+    const settledBy = String(paymentMode || "").toLowerCase();
+    if ((paymentStatus || "paid") === "paid" && PAYMENT_MODES.includes(settledBy)) {
+      invoiceRow.payment_mode = settledBy;
+    }
+
     // Recording that a shopkeeper was warned and sold on credit anyway: the
     // difference between a mistake and a decision. The column only exists after
     // migration 20260802000000, so a missing-column error retries without it —
@@ -597,7 +608,10 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     let { data: invoice, error: invoiceError } = await supabase
       .from("invoices").insert([{ ...invoiceRow, credit_limit_overridden: !!creditLimitOverridden }]).select();
     if (invoiceError && /column|schema cache/i.test(invoiceError.message || "")) {
-      ({ data: invoice, error: invoiceError } = await supabase.from("invoices").insert([invoiceRow]).select());
+      // Retry without the columns added by later migrations. Billing must work
+      // on a database that has not caught up yet; the audit detail can wait.
+      const { credit_limit_overridden, payment_mode, ...preMigration } = { ...invoiceRow };
+      ({ data: invoice, error: invoiceError } = await supabase.from("invoices").insert([preMigration]).select());
     }
 
     if (invoiceError) throw invoiceError;
@@ -1164,6 +1178,178 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
     }
 
     res.json({ message: "✓ Stock updated successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// COUNTER CASH — open the day, close the day, find the difference
+//
+// The daily ritual of a small shop: count the box at closing time. What matters
+// is not the day's sales but the gap between what the records imply and what is
+// actually in hand. A ₹200 shortfall found the same evening is a question
+// someone can still answer; found a month later it is unrecoverable.
+// ============================================
+
+// Everything that moved cash since the session opened.
+async function cashMovementsSince(shopId, since) {
+  const [invRes, eventRes, expRes, purchaseRes] = await Promise.allSettled([
+    supabase.from("invoices")
+      .select("payment_mode, payment_status, taxable_value, cgst_amount, sgst_amount, discount_amount, created_at, invoice_items(quantity_boxes, price_per_box)")
+      .eq("shop_id", shopId).gte("created_at", since)
+      .not("payment_status", "in", '("cancelled","returned","credit")'),
+    supabase.from("payment_events")
+      .select("amount, payment_mode, created_at").eq("shop_id", shopId).gte("created_at", since),
+    supabase.from("expenses")
+      .select("amount, payment_mode, expense_date").eq("shop_id", shopId).gte("expense_date", since),
+    supabase.from("purchases")
+      .select("amount_paid, payment_status, purchase_date").eq("shop_id", shopId).gte("purchase_date", since),
+  ]);
+
+  const rows = (r) => (r.status === "fulfilled" && !r.value.error ? r.value.data || [] : []);
+
+  // Bill value as the customer paid it: taxable + GST, or items minus discount
+  // for a non-GST bill.
+  const billValue = (inv) => {
+    if (inv.taxable_value != null) {
+      return (inv.taxable_value || 0) + (inv.cgst_amount || 0) + (inv.sgst_amount || 0);
+    }
+    const gross = (inv.invoice_items || []).reduce((s, i) => s + (i.quantity_boxes || 0) * (i.price_per_box || 0), 0);
+    return Math.max(0, gross - (inv.discount_amount || 0));
+  };
+
+  const invoices = rows(invRes);
+  const modes = summarisePaymentModes(invoices, { amountOf: billValue });
+
+  // Collections against older udhari. Payment events carry their own mode.
+  const cashCollections = rows(eventRes)
+    .filter(e => String(e.payment_mode || "").toLowerCase() === "cash")
+    .reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
+
+  // Expenses with no mode recorded are treated as cash: petty shop expenses are
+  // overwhelmingly paid from the drawer, and the alternative — ignoring them —
+  // would systematically overstate the cash that should be in hand.
+  const cashExpenses = rows(expRes)
+    .filter(e => ["cash", "", null, undefined].includes(e.payment_mode ? String(e.payment_mode).toLowerCase() : ""))
+    .reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
+
+  const cashPayouts = rows(purchaseRes).reduce((s, p) => s + (parseFloat(p.amount_paid) || 0), 0);
+
+  return {
+    cashSales: modes.cash,
+    modes,
+    cashCollections: Math.round(cashCollections * 100) / 100,
+    cashExpenses: Math.round(cashExpenses * 100) / 100,
+    cashPayouts: Math.round(cashPayouts * 100) / 100,
+    invoiceCount: invoices.length,
+  };
+}
+
+// Start the day with what is already in the drawer.
+app.post("/api/cash-sessions/open", async (req, res) => {
+  try {
+    const { shopId, openingCash, staffId } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+
+    const { data: existing } = await supabase.from("cash_sessions")
+      .select("id").eq("shop_id", shopId).is("closed_at", null).maybeSingle();
+    if (existing) return res.status(409).json({ error: "Ek din pehle se khula hai", sessionId: existing.id });
+
+    const { data, error } = await supabase.from("cash_sessions").insert([{
+      shop_id: shopId,
+      opening_cash: parseFloat(openingCash) || 0,
+      opened_by: staffId || null,
+    }]).select().single();
+    if (error) throw error;
+    res.json({ success: true, session: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// The open session with a live view of what the drawer should hold.
+app.get("/api/cash-sessions/current/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { data: session, error } = await supabase.from("cash_sessions")
+      .select("*").eq("shop_id", shopId).is("closed_at", null).maybeSingle();
+
+    if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
+      return res.json({ open: false, unavailable: true });
+    }
+    if (!session) return res.json({ open: false });
+
+    const movements = await cashMovementsSince(shopId, session.opened_at);
+    const expected = expectedCash({ openingCash: session.opening_cash, ...movements });
+
+    res.json({ open: true, session, movements, expectedCash: expected });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Close the day: count the box, record the difference while memory is fresh.
+app.post("/api/cash-sessions/:id/close", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { shopId, countedCash, note, staffId } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (countedCash === undefined || countedCash === null || countedCash === "") {
+      return res.status(400).json({ error: "Ginti hui nagdi daalein" });
+    }
+
+    // Scope by shop as well as id — an id alone must never close another shop's day.
+    const { data: session, error: findErr } = await supabase.from("cash_sessions")
+      .select("*").eq("id", id).eq("shop_id", shopId).maybeSingle();
+    if (findErr) throw findErr;
+    if (!session) return res.status(404).json({ error: "Session nahi mila" });
+    if (session.closed_at) return res.status(409).json({ error: "Yeh din pehle hi band ho chuka hai" });
+
+    const movements = await cashMovementsSince(shopId, session.opened_at);
+    const expected = expectedCash({ openingCash: session.opening_cash, ...movements });
+    const result = reconcile({ counted: parseFloat(countedCash), expected });
+
+    const { data, error } = await supabase.from("cash_sessions").update({
+      closed_at: new Date().toISOString(),
+      closed_by: staffId || null,
+      counted_cash: result.counted,
+      expected_cash: result.expected,
+      difference: result.difference,
+      cash_sales: movements.cashSales,
+      cash_collections: movements.cashCollections,
+      cash_expenses: movements.cashExpenses,
+      cash_payouts: movements.cashPayouts,
+      note: note || null,
+    }).eq("id", id).eq("shop_id", shopId).select().single();
+    if (error) throw error;
+
+    res.json({ success: true, session: data, reconciliation: result, movements });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Past days, for spotting a pattern rather than a one-off.
+app.get("/api/cash-sessions/:shopId", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("cash_sessions")
+      .select("*").eq("shop_id", req.params.shopId)
+      .not("closed_at", "is", null)
+      .order("opened_at", { ascending: false }).limit(30);
+    if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
+      return res.json({ sessions: [], unavailable: true });
+    }
+    if (error) throw error;
+
+    const sessions = data || [];
+    const shortDays = sessions.filter(s => (parseFloat(s.difference) || 0) < -5).length;
+    const totalShort = sessions.reduce((sum, s) => {
+      const d = parseFloat(s.difference) || 0;
+      return d < 0 ? sum + Math.abs(d) : sum;
+    }, 0);
+
+    res.json({ sessions, shortDays, totalShort: Math.round(totalShort) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

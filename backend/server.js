@@ -506,6 +506,7 @@ const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbo
 const { resolveSupply, splitTaxComponents, stateCodeFromGstin, stateName } = require("./lib/gstPlace");
 const { financialYear, creditNoteNumber, computeCreditNote, gstAdjustmentAllowed } = require("./lib/creditNote");
 const ops = require("./lib/opsResearch");
+const { supplierKey, debitNoteNumber, computeDebitNote } = require("./lib/debitNote");
 
 // Whether migration 20260804000000 has been applied. PostgREST errors on an
 // unknown column, so a query that asks for igst_amount before the migration
@@ -1242,6 +1243,209 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
     }
 
     res.json({ message: "✓ Stock updated successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// SUPPLIERS AND PURCHASE RETURNS
+//
+// The buy side has been much thinner than the sell side. A supplier was a name
+// typed onto each purchase, and goods could not be sent back at all — which
+// meant returned stock stayed on the shelf in the app and the input credit
+// claimed on it was never reversed. Keeping credit on goods that went back is
+// claiming a refund for tax the shop never ultimately bore.
+// ============================================
+
+app.put("/api/suppliers/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { name, phone, gstin, address, creditDays, notes } = req.body;
+    const key = supplierKey(name);
+    if (!key) return res.status(400).json({ error: "Supplier ka naam chahiye" });
+
+    const upper = gstin ? String(gstin).toUpperCase() : null;
+    if (upper && !isValidGstin(upper)) return res.status(400).json({ error: "GSTIN galat hai" });
+
+    const { data, error } = await supabase.from("suppliers").upsert({
+      shop_id: shopId,
+      name: String(name).trim(),
+      supplier_key: key,
+      phone: phone || null,
+      gstin: upper,
+      address: address || null,
+      credit_days: creditDays === null || creditDays === "" ? null : parseInt(creditDays),
+      notes: notes || null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "shop_id,supplier_key" }).select().single();
+
+    if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
+      return res.status(501).json({ error: "Supplier table nahi hai — migration 20260806000000 chalayein" });
+    }
+    if (error) throw error;
+    res.json({ success: true, supplier: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Suppliers with what is still owed to each, so payables have a named party
+// rather than a free-text string.
+app.get("/api/suppliers/:shopId", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const [supRes, purchRes] = await Promise.allSettled([
+      supabase.from("suppliers").select("*").eq("shop_id", shopId).order("name"),
+      supabase.from("purchases")
+        .select("supplier_name, quantity_boxes, cost_per_box, amount_paid, payment_status, purchase_date")
+        .eq("shop_id", shopId).in("payment_status", ["unpaid", "partial"]).limit(2000),
+    ]);
+
+    if (supRes.status === "fulfilled" && supRes.value.error) {
+      return res.json({ suppliers: [], unavailable: true });
+    }
+    const suppliers = supRes.status === "fulfilled" ? supRes.value.data || [] : [];
+    const open = purchRes.status === "fulfilled" && !purchRes.value.error ? purchRes.value.data || [] : [];
+
+    const owedByKey = {};
+    for (const p of open) {
+      const key = supplierKey(p.supplier_name);
+      const gross = (parseFloat(p.quantity_boxes) || 0) * (parseFloat(p.cost_per_box) || 0);
+      owedByKey[key] = (owedByKey[key] || 0) + Math.max(0, gross - (parseFloat(p.amount_paid) || 0));
+    }
+
+    res.json({
+      suppliers: suppliers.map(sup => ({ ...sup, outstanding: Math.round(owedByKey[sup.supplier_key] || 0) })),
+      // Names seen on purchases that have no supplier record yet — the shopkeeper
+      // can promote them rather than retyping.
+      unregistered: [...new Set(open.map(p => p.supplier_name).filter(Boolean))]
+        .filter(n => !suppliers.some(sup => sup.supplier_key === supplierKey(n))),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send goods back to a supplier: stock comes off the shelf and the credit
+// claimed on those goods is reversed by a debit note.
+app.post("/api/purchases/:id/return", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { shopId, returnQuantity, reason } = req.body;
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!returnQuantity || parseFloat(returnQuantity) <= 0) {
+      return res.status(400).json({ error: "Kitna maal wapas kar rahe hain?" });
+    }
+
+    const { data: purchase, error: pErr } = await supabase.from("purchases")
+      .select("*").eq("id", id).eq("shop_id", shopId).maybeSingle();
+    if (pErr) throw pErr;
+    if (!purchase) return res.status(404).json({ error: "Purchase nahi mila" });
+
+    // Quantities already returned on earlier notes, so the same goods cannot be
+    // sent back twice and reverse the credit twice.
+    const { data: priorNotes } = await supabase.from("debit_notes")
+      .select("return_quantity").eq("purchase_id", id);
+    const alreadyReturned = (priorNotes || []).reduce((s, n) => s + (parseFloat(n.return_quantity) || 0), 0);
+    const remaining = (parseFloat(purchase.quantity_boxes) || 0) - alreadyReturned;
+    if (remaining <= 0) {
+      return res.status(409).json({ error: "Is purchase ka sara maal pehle hi wapas ho chuka hai" });
+    }
+
+    const note = computeDebitNote({
+      purchase: { ...purchase, quantity_boxes: remaining },
+      returnQuantity,
+      reason,
+    });
+    if (!note) return res.status(400).json({ error: "Wapas karne layak maal nahi hai" });
+
+    // Stock must actually leave the shelf. Doing this before the note is written
+    // means a failure here stops the whole return rather than producing a
+    // document for goods still sitting in the shop.
+    const { data: inv } = await supabase.from("inventory")
+      .select("id, quantity_boxes").eq("shop_id", shopId).eq("design_id", purchase.design_id).maybeSingle();
+    if (inv) {
+      const newQty = Math.max(0, (parseFloat(inv.quantity_boxes) || 0) - note.returnQuantity);
+      const { error: invErr } = await supabase.from("inventory")
+        .update({ quantity_boxes: newQty }).eq("id", inv.id);
+      if (invErr) throw invErr;
+    }
+
+    const fy = financialYear();
+    const { count } = await supabase.from("debit_notes")
+      .select("id", { count: "exact", head: true })
+      .eq("shop_id", shopId).eq("financial_year", fy);
+
+    let saved = null, lastErr = null;
+    for (let attempt = 0; attempt < 5 && !saved; attempt++) {
+      const sequence = (count || 0) + 1 + attempt;
+      const { data, error } = await supabase.from("debit_notes").insert([{
+        shop_id: shopId,
+        purchase_id: id,
+        debit_note_number: debitNoteNumber({ sequence, financialYear: fy }),
+        financial_year: fy,
+        sequence,
+        reason: note.reason,
+        supplier_name: purchase.supplier_name,
+        supplier_gstin: purchase.supplier_gstin,
+        supplier_invoice_no: purchase.supplier_invoice_no,
+        original_purchase_date: purchase.purchase_date,
+        design_id: purchase.design_id,
+        return_quantity: note.returnQuantity,
+        cost_per_unit: note.costPerUnit,
+        taxable_value: note.taxableValue,
+        cgst_amount: note.cgst,
+        sgst_amount: note.sgst,
+        igst_amount: note.igst,
+        total_debit: note.totalDebit,
+        is_inter_state: !!purchase.is_inter_state,
+        is_full_return: note.isFullReturn,
+        itc_reversed: note.itcReversed,
+      }]).select().single();
+      if (!error) { saved = data; break; }
+      lastErr = error;
+      if (!/duplicate key|unique/i.test(error.message || "")) break;
+    }
+
+    if (!saved) {
+      const migrationMissing = /relation|does not exist|schema cache/i.test(lastErr?.message || "");
+      return res.status(migrationMissing ? 501 : 500).json({
+        error: migrationMissing
+          ? "Debit note table nahi hai — migration 20260806000000 chalayein"
+          : `Debit note ban nahi paya: ${lastErr?.message}`,
+        stockAdjusted: true,
+      });
+    }
+
+    res.json({
+      success: true,
+      debitNote: saved,
+      itcReversed: note.itcReversed,
+      note: note.itcReversed
+        ? `₹${note.taxReversed.toLocaleString("en-IN")} input credit reversed on this return.`
+        : "No input credit was claimed on this purchase, so nothing is reversed.",
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/debit-notes/:shopId", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("debit_notes")
+      .select("*").eq("shop_id", req.params.shopId).order("issued_at", { ascending: false }).limit(500);
+    if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
+      return res.json({ debitNotes: [], unavailable: true });
+    }
+    if (error) throw error;
+    const notes = data || [];
+    res.json({
+      debitNotes: notes,
+      totalDebited: Math.round(notes.reduce((s, n) => s + (parseFloat(n.total_debit) || 0), 0)),
+      itcReversedTotal: Math.round(notes.reduce((s, n) =>
+        s + (n.itc_reversed ? (parseFloat(n.cgst_amount) || 0) + (parseFloat(n.sgst_amount) || 0) + (parseFloat(n.igst_amount) || 0) : 0), 0)),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3206,7 +3410,19 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // registered dealer) — anything else is a cost, not a credit, and is reported
     // separately so the shopkeeper can see what they are losing by not collecting bills.
     const { gstPaidOnPurchases, itcAvailable, itcBlocked, purchasesWithoutGst } = summariseItc(purchases);
-    const netGstPayable = Math.max(0, gstCollected - itcAvailable);
+
+    // Credit reversed by purchase returns. Goods that went back to the supplier
+    // cannot keep their input credit — holding on to it is claiming a refund for
+    // tax the shop never ultimately bore. Reversals net off the claim.
+    const { data: dnRows } = await supabase.from("debit_notes")
+      .select("cgst_amount, sgst_amount, igst_amount, itc_reversed, issued_at")
+      .eq("shop_id", shopId).gte("issued_at", fyStart).lte("issued_at", fyEnd);
+    const itcReversed = (dnRows || []).reduce((s, n) => s + (n.itc_reversed
+      ? (parseFloat(n.cgst_amount) || 0) + (parseFloat(n.sgst_amount) || 0) + (parseFloat(n.igst_amount) || 0)
+      : 0), 0);
+
+    const itcNet = Math.max(0, itcAvailable - itcReversed);
+    const netGstPayable = Math.max(0, gstCollected - itcNet);
 
     // B2B split for GSTR-1
     const b2bInvoices = invoices.filter(inv => inv.invoice_type === 'B2B' || inv.customer_gstin);
@@ -3299,7 +3515,9 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         igst: Math.round(igstCollected - cnIgst),
         interStateInvoices,
         gstPaidOnPurchases: Math.round(gstPaidOnPurchases),
-        itcAvailable: Math.round(itcAvailable),
+        itcAvailable: Math.round(itcNet),
+        itcClaimedBeforeReversals: Math.round(itcAvailable),
+        itcReversedOnReturns: Math.round(itcReversed),
         itcBlocked: Math.round(itcBlocked),          // GST paid where no supplier GSTIN was recorded
         purchasesWithoutGst,                          // purchases with no GST captured at all
         itcNote: "ITC as per your own purchase records. Final entitlement depends on the supplier having filed their return — verify against GSTR-2B on the GST portal before claiming.",

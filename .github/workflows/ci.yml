@@ -1,0 +1,45 @@
+name: ci
+
+# Render deploys straight from main with no gate of its own, so this is the only
+# thing standing between a bad push and a shopkeeper's bill being wrong. It runs
+# on every push and PR, and must stay fast enough that nobody is tempted to skip it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --omit=dev || npm install --omit=dev
+
+      - name: Syntax check the server
+        run: node --check backend/server.js
+
+      - name: Money math tests
+        run: npm test
+
+      - name: Server boots without a database
+        # Catches missing requires and top-level crashes that a syntax check
+        # cannot. No Supabase credentials here on purpose — the server must
+        # start and report db:false rather than fall over.
+        run: |
+          node backend/server.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:3001/api/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          kill $SERVER_PID 2>/dev/null || true
+          echo "health: $(cat /tmp/health.json 2>/dev/null)"
+          grep -q '"status"' /tmp/health.json

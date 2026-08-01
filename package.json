@@ -1,13 +1,15 @@
 {
   "name": "fastbill-backend",
   "version": "0.1.0",
-  "description": "FastBill — AI-powered shop management backend (Bharat Ananta Energy)",
+  "description": "FastBill \u2014 AI-powered shop management backend (Bharat Ananta Energy)",
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",
     "dev": "nodemon backend/server.js",
     "client": "cd frontend && npm start",
-    "build": "cd frontend && npm run build"
+    "build": "cd frontend && npm run build",
+    "test": "node --test backend/**/*.test.js",
+    "check": "node --check backend/server.js && npm test"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.38.0",

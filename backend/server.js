@@ -471,8 +471,11 @@ app.get("/api/inventory/status/:shopId", async (req, res) => {
 
 // Generate Invoice
 // GSTIN format: 2 digits state + 5 letters PAN + 4 digits + 1 letter + 1 digit/Z + 1 alphanumeric
-const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9][Z][0-9A-Z]$/;
-const isValidGstin = (g) => typeof g === 'string' && GSTIN_REGEX.test(g.toUpperCase());
+// Money math lives in backend/lib/money.js so it can be tested without a database
+// or a running server (`npm test`). Route handlers must call these rather than
+// re-implementing arithmetic inline — a second copy is how the client and server
+// discount ordering silently drifted apart once before.
+const { GSTIN_REGEX, isValidGstin, computePurchaseGst, summariseItc, purchaseCostForPnl } = require("./lib/money");
 
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
@@ -1778,42 +1781,6 @@ module.exports = app;
 // ADD STOCK / PURCHASES ENDPOINT
 // ============================================
 
-// Split what a shopkeeper paid a supplier into its taxable and tax parts, and decide
-// whether the tax is claimable as Input Tax Credit.
-//
-// ITC is only real when three things are true together: this shop is GST-registered,
-// the supplier is GST-registered (their GSTIN is on the bill), and a GST rate was
-// actually entered. Anything less and the shopkeeper is not entitled to the credit —
-// so `itcEligible` is decided here on the server and never taken from the client.
-//
-// Note the deliberate limit: entitlement also depends on the supplier having filed,
-// which shows up in GSTR-2B. FastBill cannot see GSTR-2B, so what is reported is
-// "ITC as per your own purchase records" and is labelled that way to the user.
-function computePurchaseGst({ grossValue, gstRate, gstMode, supplierGstin, shopGstin }) {
-  const rate = parseFloat(gstRate);
-  const mode = gstMode || 'none';
-  const hasRate = !isNaN(rate) && rate > 0 && mode !== 'none';
-
-  if (!hasRate) {
-    return { taxableAmount: grossValue, gstAmount: 0, gstRate: null, gstMode: 'none', itcEligible: false };
-  }
-
-  // 'included' = the cost the shopkeeper typed already contains GST (the common case —
-  // they type what they actually paid). 'exclusive' = GST is added on top.
-  const taxableAmount = mode === 'included' ? grossValue / (1 + rate / 100) : grossValue;
-  const gstAmount = mode === 'included' ? grossValue - taxableAmount : grossValue * rate / 100;
-
-  const itcEligible = !!(shopGstin && supplierGstin && isValidGstin(String(supplierGstin).toUpperCase()));
-
-  return {
-    taxableAmount: Math.round(taxableAmount * 100) / 100,
-    gstAmount: Math.round(gstAmount * 100) / 100,
-    gstRate: rate,
-    gstMode: mode,
-    itcEligible,
-  };
-}
-
 app.post("/api/purchases/add", async (req, res) => {
   try {
     const { shopId, design_id, quantity_boxes, supplier_name, cost_per_box, extraCost, marginPercent, marginAmount,
@@ -2168,10 +2135,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // yields credit when the supplier's GSTIN was recorded (proof of a tax invoice from a
     // registered dealer) — anything else is a cost, not a credit, and is reported
     // separately so the shopkeeper can see what they are losing by not collecting bills.
-    const gstPaidOnPurchases = purchases.reduce((s, p) => s + (parseFloat(p.gst_amount) || 0), 0);
-    const itcAvailable = purchases.reduce((s, p) => s + (p.itc_eligible ? (parseFloat(p.gst_amount) || 0) : 0), 0);
-    const itcBlocked = gstPaidOnPurchases - itcAvailable;
-    const purchasesWithoutGst = purchases.filter(p => !p.gst_amount).length;
+    const { gstPaidOnPurchases, itcAvailable, itcBlocked, purchasesWithoutGst } = summariseItc(purchases);
     const netGstPayable = Math.max(0, gstCollected - itcAvailable);
 
     // B2B split for GSTR-1
@@ -2216,15 +2180,8 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // Total business turnover (ITR base)
     const totalTurnover = taxableValue + nonGstRevenue;
 
-    // Purchase cost for the P&L. Where GST was reclaimed as ITC, the tax is NOT a business
-    // expense — it comes back — so the expense is the GST-exclusive value. Counting the
-    // full amount while also claiming the credit would deduct the same tax twice.
-    // Where no ITC is claimable, the GST genuinely is part of the cost and stays in.
-    const totalPurchaseCost = purchases.reduce((s, p) => {
-      const gross = (p.quantity_boxes || 0) * (p.cost_per_box || 0);
-      if (p.itc_eligible && p.taxable_amount) return s + parseFloat(p.taxable_amount);
-      return s + gross;
-    }, 0);
+    // Where GST was reclaimed as ITC the tax is not an expense — see purchaseCostForPnl.
+    const totalPurchaseCost = purchaseCostForPnl(purchases);
 
     // Operating expenses (rent/utility/salary/etc.) — separate from COGS
     const expensesByCategory = {};

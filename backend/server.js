@@ -2601,7 +2601,8 @@ Today's sales: ₹${briefing.todaySales} (${briefing.todayCount} bills)
 This week vs last week: ₹${briefing.weekSales} vs ₹${briefing.prevWeekSales}${weekTrendPct !== null ? ` (${weekTrendPct}%)` : ""}
 Total udhaar baaki: ₹${totalOutstanding}
 Top overdue: ${overdue.map(o => `${o.name} ₹${o.outstanding} (${o.oldestDays}d)`).join("; ") || "none"}
-Low stock items (${briefing.lowStockCount}): ${lowStock.map(l => `${l.name} ${l.qty}${l.unit}`).join("; ") || "none"}`.trim();
+Low stock items (${briefing.lowStockCount}): ${lowStock.map(l => `${l.name} ${l.qty}${l.unit}`).join("; ") || "none"}
+${decisionFacts.length ? "Computed findings (highest priority first):\n" + decisionFacts.map(f => "- " + f).join("\n") : ""}`.trim();
 
         const body = {
           contents: [{ parts: [{ text: `You are BAE, an AI business co-pilot for an Indian shopkeeper using FastBill.
@@ -2625,10 +2626,22 @@ Output exactly 3 numbered lines (1., 2., 3.) and nothing else:` }] }],
           let txt = (gd?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
           // Strip any echoed heading like "Top 3 ...:" the model sometimes prepends.
           txt = txt.replace(/^top\s*3[^\n:]*:?\s*/i, "").trim();
-          // Only override the deterministic fallback if the model actually said
-          // something substantive (real length + contains a number).
-          const looksReal = txt.length > 15 && /\d/.test(txt);
+          // The model's job is to say OUR findings in the shopkeeper's language,
+          // never to decide what they are. "Contains a digit" let invented advice
+          // through — a generic "focus on sales today" passes that test while
+          // silently dropping the ₹99,560 sitting dead on a shelf.
+          //
+          // So require the narration to actually carry at least one of the
+          // distinctive figures we supplied. If it does not, the model has
+          // wandered off and the deterministic text is kept instead.
+          const supplied = (factBlock.match(/\d[\d,]{2,}/g) || []).map(n => n.replace(/,/g, ""));
+          const carriesOurNumbers = supplied.length === 0
+            || supplied.some(n => txt.replace(/,/g, "").includes(n));
+          const looksReal = txt.length > 15 && /\d/.test(txt) && carriesOurNumbers;
           if (looksReal) narration = txt;
+          else if (supplied.length) {
+            console.warn("briefing: model output dropped the computed figures — keeping deterministic text");
+          }
         }
       } catch (_) { /* keep deterministic fallback */ }
     }

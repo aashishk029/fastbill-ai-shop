@@ -591,10 +591,22 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     if (itemsErr) throw itemsErr;
 
     const inventoryUpdates = await Promise.all(items.map(async (item) => {
-      const { error } = await supabase.rpc("update_inventory_after_invoice", {
+      // Scope the decrement to this shop (see the 2026-08-01 migration). The 3-argument
+      // form only exists once that migration has run, and this backend deploys before a
+      // human runs SQL — so fall back to the original 2-argument call rather than break
+      // billing in the window between the two. Remove the fallback once migrated.
+      let { error } = await supabase.rpc("update_inventory_after_invoice", {
         design_id: item.designId,
         quantity: qty(item.quantityBoxes),
+        p_shop_id: shopId,
       });
+      if (error && /function|schema cache|argument/i.test(error.message || "")) {
+        console.warn("update_inventory_after_invoice: p_shop_id not available yet, falling back — run migration 20260801000000");
+        ({ error } = await supabase.rpc("update_inventory_after_invoice", {
+          design_id: item.designId,
+          quantity: qty(item.quantityBoxes),
+        }));
+      }
       return error;
     }));
     const invErr = inventoryUpdates.find(e => e);
@@ -1766,9 +1778,46 @@ module.exports = app;
 // ADD STOCK / PURCHASES ENDPOINT
 // ============================================
 
+// Split what a shopkeeper paid a supplier into its taxable and tax parts, and decide
+// whether the tax is claimable as Input Tax Credit.
+//
+// ITC is only real when three things are true together: this shop is GST-registered,
+// the supplier is GST-registered (their GSTIN is on the bill), and a GST rate was
+// actually entered. Anything less and the shopkeeper is not entitled to the credit —
+// so `itcEligible` is decided here on the server and never taken from the client.
+//
+// Note the deliberate limit: entitlement also depends on the supplier having filed,
+// which shows up in GSTR-2B. FastBill cannot see GSTR-2B, so what is reported is
+// "ITC as per your own purchase records" and is labelled that way to the user.
+function computePurchaseGst({ grossValue, gstRate, gstMode, supplierGstin, shopGstin }) {
+  const rate = parseFloat(gstRate);
+  const mode = gstMode || 'none';
+  const hasRate = !isNaN(rate) && rate > 0 && mode !== 'none';
+
+  if (!hasRate) {
+    return { taxableAmount: grossValue, gstAmount: 0, gstRate: null, gstMode: 'none', itcEligible: false };
+  }
+
+  // 'included' = the cost the shopkeeper typed already contains GST (the common case —
+  // they type what they actually paid). 'exclusive' = GST is added on top.
+  const taxableAmount = mode === 'included' ? grossValue / (1 + rate / 100) : grossValue;
+  const gstAmount = mode === 'included' ? grossValue - taxableAmount : grossValue * rate / 100;
+
+  const itcEligible = !!(shopGstin && supplierGstin && isValidGstin(String(supplierGstin).toUpperCase()));
+
+  return {
+    taxableAmount: Math.round(taxableAmount * 100) / 100,
+    gstAmount: Math.round(gstAmount * 100) / 100,
+    gstRate: rate,
+    gstMode: mode,
+    itcEligible,
+  };
+}
+
 app.post("/api/purchases/add", async (req, res) => {
   try {
-    const { shopId, design_id, quantity_boxes, supplier_name, cost_per_box, extraCost, marginPercent, marginAmount } = req.body;
+    const { shopId, design_id, quantity_boxes, supplier_name, cost_per_box, extraCost, marginPercent, marginAmount,
+            gstRate, gstMode, supplierGstin, supplierInvoiceNo, supplierInvoiceDate } = req.body;
 
     if (!shopId || !design_id || !quantity_boxes) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -1777,8 +1826,21 @@ app.post("/api/purchases/add", async (req, res) => {
     const qty = parseFloat(quantity_boxes) || 0;
     const baseCost = parseFloat(cost_per_box) || 0;
     const extra = Math.max(0, parseFloat(extraCost) || 0);
+
+    // Is this shop GST-registered? Decides whether any input credit exists at all.
+    const { data: shopRow } = await supabase.from("shops").select("gstin").eq("id", shopId).maybeSingle();
+    const gst = computePurchaseGst({
+      grossValue: qty * baseCost,
+      gstRate, gstMode, supplierGstin, shopGstin: shopRow?.gstin,
+    });
+
+    // Cost basis for pricing. When the GST is reclaimable as ITC it is not a cost —
+    // it comes back — so the selling price must be built on the GST-exclusive cost.
+    // Pricing on the gross amount in that case would silently overprice every item.
+    // For a shop with no GSTIN nothing is reclaimable, so gross is the true cost.
+    const costForPricing = gst.itcEligible && qty > 0 ? gst.taxableAmount / qty : baseCost;
     // Transportation/misc cost spread across the units bought, so it's blended into per-unit cost.
-    const effectiveCost = baseCost + (qty > 0 ? extra / qty : 0);
+    const effectiveCost = costForPricing + (qty > 0 ? extra / qty : 0);
     const marginPct = marginPercent !== undefined && marginPercent !== null && marginPercent !== '' ? parseFloat(marginPercent) : null;
     const marginAmt = marginAmount !== undefined && marginAmount !== null && marginAmount !== '' ? parseFloat(marginAmount) : null;
     const suggestedPrice = marginPct !== null ? effectiveCost * (1 + marginPct / 100)
@@ -1786,24 +1848,39 @@ app.post("/api/purchases/add", async (req, res) => {
       : null;
 
     // Insert purchase record
-    const { data: purchase, error: purchaseError } = await supabase
-      .from("purchases")
-      .insert([
-        {
-          shop_id: shopId,
-          design_id,
-          quantity_boxes: qty,
-          supplier_name: supplier_name || "Direct Purchase",
-          cost_per_box: baseCost,
-          extra_cost: extra,
-          margin_percent: marginPct,
-          margin_amount: marginAmt,
-          suggested_price: suggestedPrice,
-          purchase_date: new Date().toISOString(),
-        },
-      ])
-      .select()
-      .single();
+    const baseRow = {
+      shop_id: shopId,
+      design_id,
+      quantity_boxes: qty,
+      supplier_name: supplier_name || "Direct Purchase",
+      cost_per_box: baseCost,
+      extra_cost: extra,
+      margin_percent: marginPct,
+      margin_amount: marginAmt,
+      suggested_price: suggestedPrice,
+      purchase_date: new Date().toISOString(),
+    };
+    const gstRow = {
+      gst_rate: gst.gstRate,
+      gst_amount: gst.gstAmount || null,
+      taxable_amount: gst.gstAmount ? gst.taxableAmount : null,
+      gst_mode: gst.gstMode,
+      supplier_gstin: supplierGstin ? String(supplierGstin).toUpperCase() : null,
+      supplier_invoice_no: supplierInvoiceNo || null,
+      supplier_invoice_date: supplierInvoiceDate || null,
+      itc_eligible: gst.itcEligible,
+    };
+
+    // The GST columns only exist after migration 20260801000000. This backend deploys
+    // before a human runs that SQL, so a missing-column error must not stop a shopkeeper
+    // from adding stock — record the purchase without the GST detail instead.
+    let { data: purchase, error: purchaseError } = await supabase
+      .from("purchases").insert([{ ...baseRow, ...gstRow }]).select().single();
+    if (purchaseError && /column|schema cache/i.test(purchaseError.message || "")) {
+      console.warn("purchases/add: GST columns not present yet — run migration 20260801000000");
+      ({ data: purchase, error: purchaseError } = await supabase
+        .from("purchases").insert([baseRow]).select().single());
+    }
 
     if (purchaseError) throw purchaseError;
 
@@ -2044,7 +2121,7 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         .not("payment_status", "in", '("cancelled","returned")'),
 
       supabase.from("purchases")
-        .select("quantity_boxes, cost_per_box, purchase_date, supplier_name")
+        .select("quantity_boxes, cost_per_box, purchase_date, supplier_name, gst_amount, taxable_amount, itc_eligible, supplier_gstin")
         .eq("shop_id", shopId)
         .gte("purchase_date", fyStart)
         .lte("purchase_date", fyEnd),
@@ -2061,7 +2138,18 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
 
     const invoices = invoicesRes.status === "fulfilled" ? invoicesRes.value.data || [] : [];
     const nonGstInvoices = nonGstInvoicesRes.status === "fulfilled" ? nonGstInvoicesRes.value.data || [] : [];
-    const purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
+    let purchases = purchasesRes.status === "fulfilled" ? purchasesRes.value.data || [] : [];
+    // The GST columns above only exist after migration 20260801000000. Without this retry a
+    // missing column would silently produce an empty purchase list — i.e. a P&L showing zero
+    // cost of goods, which is worse than showing no ITC. Refetch the pre-migration shape.
+    const purchasesErr = purchasesRes.status === "fulfilled" ? purchasesRes.value.error : purchasesRes.reason;
+    if (purchasesErr && /column|schema cache/i.test(purchasesErr.message || "")) {
+      console.warn("tax/summary: purchase GST columns not present yet — run migration 20260801000000");
+      const { data: legacy } = await supabase.from("purchases")
+        .select("quantity_boxes, cost_per_box, purchase_date, supplier_name")
+        .eq("shop_id", shopId).gte("purchase_date", fyStart).lte("purchase_date", fyEnd);
+      purchases = legacy || [];
+    }
     const shop = shopRes.status === "fulfilled" ? shopRes.value.data : {};
     const expenses = expensesRes.status === "fulfilled" ? expensesRes.value.data || [] : [];
 
@@ -2075,7 +2163,15 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     const sgst = invoices.reduce((s, inv) => s + (inv.sgst_amount || 0), 0);
     const gstCollected = cgst + sgst;
 
-    const itcAvailable = 0; // ITC tracking needs purchase GST invoices — not tracked yet
+    // ── INPUT TAX CREDIT ──
+    // GST paid to suppliers, split by whether it is actually claimable. A purchase only
+    // yields credit when the supplier's GSTIN was recorded (proof of a tax invoice from a
+    // registered dealer) — anything else is a cost, not a credit, and is reported
+    // separately so the shopkeeper can see what they are losing by not collecting bills.
+    const gstPaidOnPurchases = purchases.reduce((s, p) => s + (parseFloat(p.gst_amount) || 0), 0);
+    const itcAvailable = purchases.reduce((s, p) => s + (p.itc_eligible ? (parseFloat(p.gst_amount) || 0) : 0), 0);
+    const itcBlocked = gstPaidOnPurchases - itcAvailable;
+    const purchasesWithoutGst = purchases.filter(p => !p.gst_amount).length;
     const netGstPayable = Math.max(0, gstCollected - itcAvailable);
 
     // B2B split for GSTR-1
@@ -2120,7 +2216,15 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
     // Total business turnover (ITR base)
     const totalTurnover = taxableValue + nonGstRevenue;
 
-    const totalPurchaseCost = purchases.reduce((s, p) => s + ((p.quantity_boxes || 0) * (p.cost_per_box || 0)), 0);
+    // Purchase cost for the P&L. Where GST was reclaimed as ITC, the tax is NOT a business
+    // expense — it comes back — so the expense is the GST-exclusive value. Counting the
+    // full amount while also claiming the credit would deduct the same tax twice.
+    // Where no ITC is claimable, the GST genuinely is part of the cost and stays in.
+    const totalPurchaseCost = purchases.reduce((s, p) => {
+      const gross = (p.quantity_boxes || 0) * (p.cost_per_box || 0);
+      if (p.itc_eligible && p.taxable_amount) return s + parseFloat(p.taxable_amount);
+      return s + gross;
+    }, 0);
 
     // Operating expenses (rent/utility/salary/etc.) — separate from COGS
     const expensesByCategory = {};
@@ -2152,8 +2256,11 @@ app.get("/api/tax/summary/:shopId", async (req, res) => {
         cgst: Math.round(cgst),
         sgst: Math.round(sgst),
         totalGstCollected: Math.round(gstCollected),
-        gstPaidOnPurchases: 0,
+        gstPaidOnPurchases: Math.round(gstPaidOnPurchases),
         itcAvailable: Math.round(itcAvailable),
+        itcBlocked: Math.round(itcBlocked),          // GST paid where no supplier GSTIN was recorded
+        purchasesWithoutGst,                          // purchases with no GST captured at all
+        itcNote: "ITC as per your own purchase records. Final entitlement depends on the supplier having filed their return — verify against GSTR-2B on the GST portal before claiming.",
         netGstPayable: Math.round(netGstPayable),
         totalInvoices: invoices.length,
         b2bInvoices: b2bInvoices.length,

@@ -185,6 +185,8 @@ app.get("/api/health", async (req, res) => {
     db,
     gemini: !!process.env.GEMINI_API_KEY,
     igstReady: HAS_IGST_COLUMN,
+    // Present only when something is actually wrong, so a clean shop stays quiet.
+    ...(RLS_BLOCKED.size ? { rlsBlocked: [...RLS_BLOCKED.keys()] } : {}),
     hf: !!process.env.HF_TOKEN,
   });
 });
@@ -544,6 +546,33 @@ async function recheckSchemaIfNeeded() {
   if (!HAS_IGST_COLUMN) await probeIgstColumn();
 }
 
+/**
+ * Remember tables whose writes were rejected by row-level security.
+ *
+ * This failure is dangerous precisely because it is quiet in the other
+ * direction: with RLS on and no policy a SELECT returns zero rows rather than
+ * an error, so the app shows "no credit notes" when the truth is "not allowed
+ * to read credit notes", and nothing looks wrong to anyone.
+ *
+ * It cannot be detected by reading — a locked table and an empty table are
+ * identical from the outside — and a probe INSERT would pollute real data. So
+ * the signal used is the one that arrives on its own: a write that fails. The
+ * first shopkeeper to hit it turns an isolated error string into a standing
+ * diagnostic that /api/health reports.
+ */
+const RLS_BLOCKED = new Map();
+
+function noteIfRlsError(table, error) {
+  if (error && /row-level security/i.test(error.message || "")) {
+    if (!RLS_BLOCKED.has(table)) {
+      console.error(`RLS is blocking writes to "${table}" — run FIX_RLS.sql. Reads on this table return zero rows silently.`);
+    }
+    RLS_BLOCKED.set(table, new Date().toISOString());
+  }
+  return error;
+}
+
+
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
 // drifting apart, like the client/backend discount-order bug did earlier).
@@ -883,7 +912,7 @@ app.put("/api/customers/:shopId/limit", async (req, res) => {
       updated_at: new Date().toISOString(),
     }, { onConflict: "shop_id,customer_key" }).select().single();
 
-    if (error) throw error;
+    if (noteIfRlsError("customers", error)) throw error;
     res.json({ success: true, customer: data });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1301,7 +1330,7 @@ app.put("/api/suppliers/:shopId", async (req, res) => {
     if (error && /relation|does not exist|schema cache/i.test(error.message || "")) {
       return res.status(501).json({ error: "Supplier table nahi hai — migration 20260806000000 chalayein" });
     }
-    if (error) throw error;
+    if (noteIfRlsError("suppliers", error)) throw error;
     res.json({ success: true, supplier: data });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1422,7 +1451,7 @@ app.post("/api/purchases/:id/return", async (req, res) => {
         itc_reversed: note.itcReversed,
       }]).select().single();
       if (!error) { saved = data; break; }
-      lastErr = error;
+      lastErr = noteIfRlsError("debit_notes", error);
       if (!/duplicate key|unique/i.test(error.message || "")) break;
     }
 
@@ -1873,7 +1902,7 @@ app.post("/api/cash-sessions/open", async (req, res) => {
       opening_cash: parseFloat(openingCash) || 0,
       opened_by: staffId || null,
     }]).select().single();
-    if (error) throw error;
+    if (noteIfRlsError("cash_sessions", error)) throw error;
     res.json({ success: true, session: data });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -2213,7 +2242,7 @@ app.post("/api/feedback", async (req, res) => {
       return res.status(400).json({ error: "rating must be 1-5" });
     }
 
-    const { error } = await supabase.from("feedback").insert([{
+    const { error: rawFeedbackErr } = await supabase.from("feedback").insert([{
       shop_id: shopId || null,
       shop_name: shopName || null,
       phone: phone || null,
@@ -2224,6 +2253,7 @@ app.post("/api/feedback", async (req, res) => {
       platform: platform || null,
       lang: lang || null,
     }]);
+    const error = noteIfRlsError("feedback", rawFeedbackErr);
     if (error) throw error;
 
     res.json({ message: "✓ Feedback received" });
@@ -4254,7 +4284,7 @@ app.post("/api/invoices/:id/return", async (req, res) => {
       };
       const { data, error } = await supabase.from("credit_notes").insert([row]).select().single();
       if (!error) { creditNote = data; break; }
-      cnError = error;
+      cnError = noteIfRlsError("credit_notes", error);
       // A duplicate serial is a race worth retrying; anything else is not.
       if (!/duplicate key|unique/i.test(error.message || "")) break;
     }

@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const bcrypt = require("bcrypt");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const { createClient } = require("@supabase/supabase-js");
@@ -576,11 +577,20 @@ function noteIfRlsError(table, error) {
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
 // drifting apart, like the client/backend discount-order bug did earlier).
-async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, placeOfSupply, creditLimitOverridden = false }) {
+async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, placeOfSupply, creditLimitOverridden = false, invoiceNumber = null }) {
   let createdInvoiceId = null;
   try {
     if (!shopId) throw Object.assign(new Error("shopId required"), { status: 400 });
     if (!Array.isArray(items) || items.length === 0) throw Object.assign(new Error("Items required"), { status: 400 });
+
+    // Idempotency: when a caller supplies its own invoiceNumber (e.g. an online-store
+    // webhook keying on the payment id), return the already-created invoice instead of
+    // billing — and decrementing stock — a second time on a retry or page refresh.
+    if (invoiceNumber) {
+      const { data: existing } = await supabase
+        .from("invoices").select("*").eq("shop_id", shopId).eq("invoice_number", invoiceNumber).maybeSingle();
+      if (existing) return { message: "✓ Invoice already recorded", invoice: existing, idempotent: true };
+    }
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
     const discount = Math.max(0, parseFloat(discountAmount) || 0);
 
@@ -663,7 +673,7 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     // Insert invoice
     const invoiceRow = {
       shop_id: shopId,
-      invoice_number: `INV-${Date.now()}`,
+      invoice_number: invoiceNumber || `INV-${Date.now()}`,
       customer_name: customerName,
       customer_phone: customerPhone || null,
       customer_address: customerAddress || null,
@@ -994,6 +1004,84 @@ app.post("/api/invoices/generate", async (req, res) => {
     // Warnings ride along with the successful response so the app can tell the
     // shopkeeper what just happened without blocking the sale.
     if (creditAssessment?.shouldWarn) result.creditWarning = creditAssessment;
+    res.json(result);
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// ONLINE-STORE WEBHOOK (website / Shopify / IG shop → FastBill)
+// ============================================
+// A shop that also sells online posts each PAID order here. FastBill decrements
+// that shop's inventory and records a bill — so online + counter sales draw down
+// one stock and the owner never oversells or bills twice.
+//
+//   POST /api/webhooks/online-order
+//   header: x-webhook-secret: <ONLINE_ORDER_SECRET>   (server-to-server auth)
+//   body: {
+//     shopId,                       // the FastBill shop this store belongs to
+//     externalRef,                  // payment id — used as the idempotency key
+//     source?,                      // "web" | "shopify" | ... (invoice number prefix)
+//     showGst?, gstMode?,           // default: non-GST sales record
+//     customer?: { name, phone, address, gstin, placeOfSupply },
+//     items: [ { sku, quantityBoxes, pricePerBox, gstRate? } ]   // sku = design_code
+//   }
+//
+// Auth note: these endpoints otherwise trust shopId alone (RLS disabled), so this
+// server-to-server route MUST carry the shared secret — without it, anyone could
+// draw down any shop's stock.
+app.post("/api/webhooks/online-order", async (req, res) => {
+  try {
+    const secret = process.env.ONLINE_ORDER_SECRET;
+    if (!secret) return res.status(503).json({ error: "Online-order webhook not configured (ONLINE_ORDER_SECRET missing)" });
+    const provided = req.get("x-webhook-secret") || "";
+    // Constant-time compare so the secret can't be guessed a byte at a time.
+    const a = Buffer.from(provided);
+    const b = Buffer.from(secret);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { shopId, externalRef, source, customer, items, showGst, gstMode } = req.body || {};
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!externalRef) return res.status(400).json({ error: "externalRef required (payment id)" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
+
+    // Map each SKU (design_code) to this shop's design_id. Only codes the shop
+    // actually stocks resolve — an unknown SKU is rejected, never silently dropped.
+    const skus = items.map(i => String(i.sku || "").trim()).filter(Boolean);
+    if (skus.length !== items.length) return res.status(400).json({ error: "every item needs a sku" });
+    const { data: designRows, error: dErr } = await supabase
+      .from("designs").select("id, design_code").in("design_code", skus);
+    if (dErr) throw dErr;
+    const codeToId = {};
+    (designRows || []).forEach(d => { codeToId[d.design_code] = d.id; });
+    const unknown = skus.filter(s => !(s in codeToId));
+    if (unknown.length) return res.status(400).json({ error: `Unknown SKU(s): ${unknown.join(", ")}` });
+
+    const coreItems = items.map(i => ({
+      designId: codeToId[String(i.sku).trim()],
+      quantityBoxes: i.quantityBoxes,
+      pricePerBox: i.pricePerBox,
+      gstRate: i.gstRate,
+    }));
+
+    const invoiceNumber = `${(source || "WEB").toUpperCase()}-${externalRef}`;
+    const result = await createInvoiceCore({
+      shopId,
+      customerName: customer?.name || "Online order",
+      customerPhone: customer?.phone || null,
+      customerAddress: customer?.address || null,
+      customerGstin: customer?.gstin || null,
+      placeOfSupply: customer?.placeOfSupply || null,
+      showGst: showGst === true,           // default: plain sales record, no GST split
+      gstMode: gstMode || "included",
+      items: coreItems,
+      paymentStatus: "paid",
+      paymentMode: "upi",                  // online payment gateway
+      invoiceNumber,                       // idempotency key = source + payment id
+    });
     res.json(result);
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message });

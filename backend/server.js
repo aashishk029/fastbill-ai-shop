@@ -35,9 +35,17 @@ app.use(bodyParser.json({ limit: '20mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
 
 // Initialize Supabase.
-// Accept either SUPABASE_ANON_KEY (code default) or SUPABASE_KEY (render.yaml legacy name).
+// Prefer the service_role key: the backend is the only database client (no browser or
+// mobile client talks to Supabase directly), so it must authenticate as service_role to
+// keep full access once Row-Level Security is enabled on every table. Falls back to the
+// anon/legacy key when the service key is not set, so this stays backward compatible and
+// causes no downtime on deploy — the switch happens the moment SUPABASE_SERVICE_ROLE_KEY
+// is added to the environment.
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.SUPABASE_KEY;
 // Misconfigured credentials must not crash the process. createClient() throws on an
 // empty URL, which turned a bad env var into a boot loop — the server would die before
 // it could serve /api/health and say what was wrong. Now it starts, every DB call

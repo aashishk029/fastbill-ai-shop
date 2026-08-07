@@ -22,6 +22,25 @@ const aiLimiter = makeLimiter(30, 15 * 60 * 1000);     // 30 / 15min per IP
 // Writes that change money-critical or identity fields.
 const writeLimiter = makeLimiter(60, 15 * 60 * 1000);  // 60 / 15min per IP
 
+// Per-account login limit, keyed on the phone being logged into rather than the caller's
+// address. An IP-keyed limit alone is only as trustworthy as the hop count we infer from
+// X-Forwarded-For: probing production showed that merely sending that header lands a
+// caller in a second bucket, doubling the attempts available. Keying on the phone removes
+// the proxy from the question entirely — rotating IPs no longer buys a fresh budget,
+// because the target of a PIN brute force is one specific account. 10 tries per 15
+// minutes leaves a shopkeeper who fumbles their own PIN plenty of room while capping an
+// attacker at a rate that cannot exhaust even a 4-digit space in any useful time.
+const loginPhoneLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Requests with no phone cannot authenticate anyway; bucket them together so a flood of
+  // malformed bodies still costs the attacker something.
+  keyGenerator: (req) => `phone:${String(req.body?.phone || "none")}`,
+  message: { error: "Bahut baar galat PIN. 15 minute baad try karein" },
+});
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -355,7 +374,7 @@ app.patch("/api/shops/:shopId", writeLimiter, async (req, res) => {
 // registered shopkeepers, which also narrows a PIN brute force to numbers known to exist.
 const LOGIN_FAILED = "Phone ya PIN galat hai";
 
-app.post("/api/shops/login", authLimiter, async (req, res) => {
+app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) => {
   try {
     const { phone, pin } = req.body;
     if (!phone || !pin) return res.status(400).json({ error: "Phone aur PIN dono chahiye" });

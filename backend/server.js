@@ -274,6 +274,16 @@ app.get("/api/health", async (req, res) => {
     db,
     gemini: !!process.env.GEMINI_API_KEY,
     igstReady: HAS_IGST_COLUMN,
+    // Whether the session gate is actually blocking, and whether sessions survive a
+    // restart. Both are invisible from outside otherwise: report-only mode answers exactly
+    // like no gate at all, so without this there is no way to confirm a deploy landed or
+    // that enforcement is really on. Neither field tells an attacker anything a single
+    // unauthenticated request would not already reveal.
+    auth: {
+      enforced: AUTH_ENFORCE,
+      // "ephemeral" means JWT_SECRET is unset and every restart invalidates all sessions.
+      sessionSecret: JWT_SECRET_IS_EPHEMERAL ? "ephemeral" : "configured",
+    },
     // Present only when something is actually wrong, so a clean shop stays quiet.
     ...(RLS_BLOCKED.size ? { rlsBlocked: [...RLS_BLOCKED.keys()] } : {}),
     hf: !!process.env.HF_TOKEN,

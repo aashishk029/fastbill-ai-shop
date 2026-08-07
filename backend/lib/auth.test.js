@@ -244,3 +244,54 @@ test("report-only mode lets the request through but says what it would have bloc
   assert.equal(out.passed, true, "an old app build must keep working during rollout");
   assert.match(lines.join("\n"), /would have blocked/);
 });
+
+// --- path spellings that reach the same route ------------------------------------------
+
+test("a trailing slash does not skip the shop check", () => {
+  // Express runs with strict routing off, so /api/shops/<id>/ hits the same handler.
+  // Matching the raw path missed it, which let one session read another shop.
+  assert.equal(shopIdFromPath("GET", `/api/shops/${OTHER}/`), OTHER);
+});
+
+test("an uppercased path does not skip the shop check", () => {
+  // Case-sensitive routing is off too, so /API/SHOPS/<id> reaches the handler as well.
+  assert.equal(shopIdFromPath("GET", `/API/SHOPS/${OTHER}`), OTHER);
+  assert.equal(shopIdFromPath("GET", `/API/Inventory/Status/${OTHER}`), OTHER);
+});
+
+test("doubled slashes do not skip the shop check", () => {
+  assert.equal(shopIdFromPath("GET", `/api//shops/${OTHER}`), OTHER);
+});
+
+test("record routes are matched under the same spellings", () => {
+  assert.deepEqual(resourceScopeFor("DELETE", "/API/Invoices/abc/"), { table: "invoices", column: "id", id: "abc" });
+});
+
+test("public routes stay public under those spellings, and no others sneak in", () => {
+  assert.equal(isPublicRoute("GET", "/API/Health/"), true);
+  assert.equal(isPublicRoute("GET", `/API/SHOPS/${SHOP}/`), false);
+});
+
+test("the id keeps its original case so it can be compared to the session", () => {
+  // Lowercasing the whole path would corrupt the id before the comparison.
+  assert.equal(shopIdFromPath("GET", "/API/SHOPS/AbCd-1234"), "AbCd-1234");
+});
+
+test("a session for one shop cannot reach another by respelling the path", async () => {
+  const mw = makeAuthMiddleware({ supabase: stubDb(null), secret: SECRET });
+  for (const p of [`/api/shops/${OTHER}/`, `/API/SHOPS/${OTHER}`, `/api//shops/${OTHER}`]) {
+    const out = await runMiddleware(mw, req({ path: p, headers: authed(SHOP) }));
+    assert.equal(out.status, 403, `${p} should be refused`);
+  }
+});
+
+test("a failed ownership lookup blocks when enforcing but not in report-only", async () => {
+  const exploding = { from: () => { throw new Error("db down"); } };
+  const enforcing = makeAuthMiddleware({ supabase: exploding, secret: SECRET });
+  const out = await runMiddleware(enforcing, req({ method: "DELETE", path: "/api/invoices/abc", headers: authed(SHOP) }));
+  assert.equal(out.status, 503, "an errored lookup proves nothing about ownership");
+
+  const reporting = makeAuthMiddleware({ supabase: exploding, secret: SECRET, enforce: false, log: () => {} });
+  const out2 = await runMiddleware(reporting, req({ method: "DELETE", path: "/api/invoices/abc", headers: authed(SHOP) }));
+  assert.equal(out2.passed, true, "a database hiccup must not start blocking during rollout");
+});

@@ -33,9 +33,27 @@ const PUBLIC_ROUTES = [
   { method: "GET", path: "/api/jewellery/rates" },
 ];
 
+// Express routes with strict routing and case-sensitive routing both off by default, so
+// /api/shops/<id>/ and /API/SHOPS/<id> reach the same handler as /api/shops/<id>. Matching
+// the raw path therefore missed those spellings and skipped the ownership check entirely —
+// a session for one shop could read another just by adding a trailing slash. Every matcher
+// below compares against this normalised form, and the patterns carry the /i flag; the
+// captured id still comes from the original string, so its case is preserved for the
+// comparison against the session.
+//
+// Percent-encoded spellings are deliberately left alone. Express matches literal segments
+// against the raw path, so an encoded route name simply 404s, and an encoded id fails the
+// comparison and is refused. Both directions fail closed.
+function normalisePath(path) {
+  return String(path || "")
+    .split("?")[0]
+    .replace(/\/{2,}/g, "/")
+    .replace(/\/+$/, "") || "/";
+}
+
 function isPublicRoute(method, path) {
-  const clean = String(path || "").split("?")[0].replace(/\/+$/, "") || "/";
-  return PUBLIC_ROUTES.some((r) => r.method === method && r.path === clean);
+  const clean = normalisePath(path);
+  return PUBLIC_ROUTES.some((r) => r.method === method && r.path.toLowerCase() === clean.toLowerCase());
 }
 
 // Routes that name a record by its own id instead of a shop id. The id alone says nothing
@@ -48,28 +66,28 @@ function isPublicRoute(method, path) {
 // GET /api/expenses/:shopId lists a shop's expenses, while DELETE /api/expenses/:id removes
 // one record.
 const RESOURCE_SCOPES = [
-  { method: "PATCH", pattern: /^\/api\/recurring-invoices\/([^/]+)$/, table: "recurring_invoices" },
-  { method: "DELETE", pattern: /^\/api\/recurring-invoices\/([^/]+)$/, table: "recurring_invoices" },
-  { method: "POST", pattern: /^\/api\/purchases\/([^/]+)\/return$/, table: "purchases" },
-  { method: "PATCH", pattern: /^\/api\/purchases\/([^/]+)\/payment$/, table: "purchases" },
-  { method: "POST", pattern: /^\/api\/cash-sessions\/([^/]+)\/close$/, table: "cash_sessions" },
-  { method: "PATCH", pattern: /^\/api\/bank-transactions\/([^/]+)\/match$/, table: "bank_transactions" },
-  { method: "PATCH", pattern: /^\/api\/invoices\/([^/]+)\/payment$/, table: "invoices" },
-  { method: "POST", pattern: /^\/api\/invoices\/([^/]+)\/return$/, table: "invoices" },
-  { method: "POST", pattern: /^\/api\/invoices\/([^/]+)\/eway-bill-data$/, table: "invoices" },
-  { method: "DELETE", pattern: /^\/api\/invoices\/([^/]+)$/, table: "invoices" },
-  { method: "DELETE", pattern: /^\/api\/inventory\/([^/]+)$/, table: "inventory" },
-  { method: "DELETE", pattern: /^\/api\/expenses\/([^/]+)$/, table: "expenses" },
+  { method: "PATCH", pattern: /^\/api\/recurring-invoices\/([^/]+)$/i, table: "recurring_invoices" },
+  { method: "DELETE", pattern: /^\/api\/recurring-invoices\/([^/]+)$/i, table: "recurring_invoices" },
+  { method: "POST", pattern: /^\/api\/purchases\/([^/]+)\/return$/i, table: "purchases" },
+  { method: "PATCH", pattern: /^\/api\/purchases\/([^/]+)\/payment$/i, table: "purchases" },
+  { method: "POST", pattern: /^\/api\/cash-sessions\/([^/]+)\/close$/i, table: "cash_sessions" },
+  { method: "PATCH", pattern: /^\/api\/bank-transactions\/([^/]+)\/match$/i, table: "bank_transactions" },
+  { method: "PATCH", pattern: /^\/api\/invoices\/([^/]+)\/payment$/i, table: "invoices" },
+  { method: "POST", pattern: /^\/api\/invoices\/([^/]+)\/return$/i, table: "invoices" },
+  { method: "POST", pattern: /^\/api\/invoices\/([^/]+)\/eway-bill-data$/i, table: "invoices" },
+  { method: "DELETE", pattern: /^\/api\/invoices\/([^/]+)$/i, table: "invoices" },
+  { method: "DELETE", pattern: /^\/api\/inventory\/([^/]+)$/i, table: "inventory" },
+  { method: "DELETE", pattern: /^\/api\/expenses\/([^/]+)$/i, table: "expenses" },
   // The path segment is an invoice id, and payment_events carries no shop column of its
   // own, so ownership is decided by the invoice the events hang off.
-  { method: "GET", pattern: /^\/api\/payment-events\/([^/]+)$/, table: "invoices" },
+  { method: "GET", pattern: /^\/api\/payment-events\/([^/]+)$/i, table: "invoices" },
   // designs has no shop_id at all — a design reaches a shop through the inventory row that
   // stocks it, so that join is what proves ownership here.
-  { method: "PATCH", pattern: /^\/api\/designs\/([^/]+)\/unit$/, table: "inventory", column: "design_id" },
+  { method: "PATCH", pattern: /^\/api\/designs\/([^/]+)\/unit$/i, table: "inventory", column: "design_id" },
 ];
 
 function resourceScopeFor(method, path) {
-  const clean = String(path || "").split("?")[0];
+  const clean = normalisePath(path);
   for (const scope of RESOURCE_SCOPES) {
     if (scope.method !== method) continue;
     const m = clean.match(scope.pattern);
@@ -94,29 +112,29 @@ function resourceScopeFor(method, path) {
 // auth.test.js asserts this table against every :shopId route declared in server.js, so a
 // new route added without an entry here fails the suite rather than shipping unguarded.
 const SHOP_SCOPED_PATHS = [
-  { methods: ["GET"], pattern: /^\/api\/customers\/credit-score\/([^/]+)(?:\/[^/]*)?$/ },
-  { methods: ["GET"], pattern: /^\/api\/purchases\/latest-rate\/([^/]+)(?:\/[^/]+)?$/ },
-  { methods: ["GET"], pattern: /^\/api\/inventory\/status\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/cash-sessions\/current\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/invoices\/(?:last-rate|history)\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/bae\/briefing\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/tax\/summary\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/reminders\/overdue\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/analytics\/projections\/([^/]+)$/ },
-  { methods: ["GET", "PATCH", "POST"], pattern: /^\/api\/shops\/([^/]+)(?:\/staff(?:\/[^/]+)?|\/repair-shared-pricing)?$/ },
-  { methods: ["DELETE"], pattern: /^\/api\/shops\/([^/]+)\/staff\/[^/]+$/ },
-  { methods: ["GET", "PUT"], pattern: /^\/api\/customers\/([^/]+)(?:\/(?:credit-check|limit|limits|history))?$/ },
-  { methods: ["GET"], pattern: /^\/api\/recurring-invoices\/([^/]+)$/ },
-  { methods: ["GET", "PUT"], pattern: /^\/api\/suppliers\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/(?:debit-notes|decisions|alerts|bakaya|credit-score|expenses)\/([^/]+)$/ },
-  { methods: ["GET"], pattern: /^\/api\/cash-sessions\/([^/]+)$/ },
-  { methods: ["POST"], pattern: /^\/api\/export\/([^/]+)(?:\/(?:csv|tally))?$/ },
-  { methods: ["GET"], pattern: /^\/api\/bank-transactions\/([^/]+)(?:\/suggestions)?$/ },
-  { methods: ["GET"], pattern: /^\/api\/credit-notes\/([^/]+)(?:\/[^/]+)?$/ },
+  { methods: ["GET"], pattern: /^\/api\/customers\/credit-score\/([^/]+)(?:\/[^/]*)?$/i },
+  { methods: ["GET"], pattern: /^\/api\/purchases\/latest-rate\/([^/]+)(?:\/[^/]+)?$/i },
+  { methods: ["GET"], pattern: /^\/api\/inventory\/status\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/cash-sessions\/current\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/invoices\/(?:last-rate|history)\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/bae\/briefing\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/tax\/summary\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/reminders\/overdue\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/analytics\/projections\/([^/]+)$/i },
+  { methods: ["GET", "PATCH", "POST"], pattern: /^\/api\/shops\/([^/]+)(?:\/staff(?:\/[^/]+)?|\/repair-shared-pricing)?$/i },
+  { methods: ["DELETE"], pattern: /^\/api\/shops\/([^/]+)\/staff\/[^/]+$/i },
+  { methods: ["GET", "PUT"], pattern: /^\/api\/customers\/([^/]+)(?:\/(?:credit-check|limit|limits|history))?$/i },
+  { methods: ["GET"], pattern: /^\/api\/recurring-invoices\/([^/]+)$/i },
+  { methods: ["GET", "PUT"], pattern: /^\/api\/suppliers\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/(?:debit-notes|decisions|alerts|bakaya|credit-score|expenses)\/([^/]+)$/i },
+  { methods: ["GET"], pattern: /^\/api\/cash-sessions\/([^/]+)$/i },
+  { methods: ["POST"], pattern: /^\/api\/export\/([^/]+)(?:\/(?:csv|tally))?$/i },
+  { methods: ["GET"], pattern: /^\/api\/bank-transactions\/([^/]+)(?:\/suggestions)?$/i },
+  { methods: ["GET"], pattern: /^\/api\/credit-notes\/([^/]+)(?:\/[^/]+)?$/i },
 ];
 
 function shopIdFromPath(method, path) {
-  const clean = String(path || "").split("?")[0];
+  const clean = normalisePath(path);
   for (const entry of SHOP_SCOPED_PATHS) {
     if (!entry.methods.includes(method)) continue;
     const m = clean.match(entry.pattern);
@@ -209,7 +227,11 @@ function makeAuthMiddleware({ supabase, secret, enforce = true, log = console.wa
           .maybeSingle();
         row = data;
       } catch (e) {
-        return res.status(500).json({ error: "Ownership check failed" });
+        // Fail closed when enforcing: a lookup that errored proves nothing about
+        // ownership. In report-only mode this still has to go through deny(), or a
+        // database hiccup would start blocking requests that the old build handled fine —
+        // the one thing report-only exists to prevent.
+        return deny(503, "Ownership check nahi ho paaya, dobara try karein");
       }
       // Absent and not-yours are answered identically on purpose: a distinct "exists but
       // belongs to someone else" reply would let a caller probe for valid record ids.
@@ -225,6 +247,7 @@ module.exports = {
   PUBLIC_ROUTES,
   RESOURCE_SCOPES,
   isPublicRoute,
+  normalisePath,
   resourceScopeFor,
   shopIdFromPath,
   SHOP_SCOPED_PATHS,

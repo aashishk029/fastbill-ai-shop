@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { attachSession, storeSession } from './session';
 import Dashboard from './components/Dashboard';
 import InvoiceForm from './components/InvoiceForm';
 import StockForm from './components/StockForm';
@@ -11,6 +12,9 @@ const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api
 
 // Extended timeout for Render free tier cold start (90 sec)
 const api = axios.create({ baseURL: API_BASE_URL, timeout: 90000 });
+// This instance was created from axios.defaults and will not pick up the interceptor that
+// session.js installs on the default export, so it is attached explicitly.
+attachSession(api);
 
 function App() {
   const [currentView, setCurrentView] = useState('dashboard');
@@ -88,6 +92,9 @@ function App() {
       setLoading(true);
       const response = await api.post(`/shops/init`, shopDetails);
       const newShopId = response.data.shop?.id || response.data.id;
+      // Signing up is the only place this app can obtain a session; there is no login
+      // screen here yet, so losing this token means losing access from this browser.
+      storeSession(response.data.token);
       localStorage.setItem('shopId', newShopId);
       setShopData(response.data);
       window.location.reload();

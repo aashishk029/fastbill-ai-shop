@@ -1,7 +1,7 @@
 {
   "name": "fastbill-backend",
   "version": "0.1.0",
-  "description": "FastBill \u2014 AI-powered shop management backend (Bharat Ananta Energy)",
+  "description": "FastBill — AI-powered shop management backend (Bharat Ananta Energy)",
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",
@@ -19,6 +19,7 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.5.1",
+    "jsonwebtoken": "^9.0.3",
     "tesseract.js": "^7.0.0",
     "uuid": "^9.0.1"
   },

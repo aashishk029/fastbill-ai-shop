@@ -7,6 +7,7 @@ require("dotenv").config();
 
 const { createClient } = require("@supabase/supabase-js");
 const { createWorker } = require("tesseract.js");
+const auth = require("./lib/auth");
 
 // Rate limiter. This is a required dependency, not an optional one: it is the only thing
 // standing between a 4-6 digit PIN and an offline-speed brute force. It used to be wrapped
@@ -218,6 +219,36 @@ const KANHAIYA_MARBLES = {
 };
 
 // ============================================
+// SESSION AUTH
+// ============================================
+// Until now every data route trusted the shop UUID in the URL, so anyone holding a UUID
+// could read and write that shop. This gate runs ahead of all routes: it requires a
+// session signed at login, and refuses any request whose named shop is not the session's
+// shop. Mounting it here rather than route by route means routes added later are covered
+// by default instead of by remembering.
+//
+// This defaults to report-only, which is deliberate and temporary.
+//
+// Every app build currently in a shopkeeper's hands predates sessions and sends no token,
+// so switching enforcement on the moment this deploys would lock all of them out. An
+// access control that takes the product offline for its only users is an outage, not a
+// fix. Report-only runs the identical checks and logs each request it would have refused,
+// which proves the rules against real traffic before they start rejecting.
+//
+// THE HOLE IS NOT CLOSED IN PRODUCTION UNTIL THIS IS FLIPPED. Set AUTH_ENFORCE=true on the
+// host once the app build that sends a token is on every device.
+const AUTH_ENFORCE = process.env.AUTH_ENFORCE === "true";
+const { secret: JWT_SECRET, ephemeral: JWT_SECRET_IS_EPHEMERAL } = auth.resolveSecret();
+if (!AUTH_ENFORCE) {
+  console.warn("SECURITY: AUTH_ENFORCE is not 'true' — session checks run in report-only mode and NOTHING is blocked. Any caller holding a shop UUID can still read and write that shop. Set AUTH_ENFORCE=true once every client sends a token.");
+}
+app.use(auth.makeAuthMiddleware({ supabase, secret: JWT_SECRET, enforce: AUTH_ENFORCE }));
+
+// Handed to clients at login/init so they can present it on later calls.
+const issueSession = (shopId, staffId = null, permissions = null) =>
+  auth.signSession({ shopId, staffId, permissions }, JWT_SECRET);
+
+// ============================================
 // ROUTES
 // ============================================
 
@@ -287,7 +318,9 @@ app.post("/api/shops/init", async (req, res) => {
     if (error) throw error;
 
     const { pin_hash: _hash, ...safeShop } = shop[0];
-    res.json({ message: "✓ Shop initialized", shop: safeShop });
+    // Signing up logs you in — without a token here the app would have to bounce the
+    // freshly chosen PIN through /login before it could load anything.
+    res.json({ message: "✓ Shop initialized", token: issueSession(shop[0].id), shop: safeShop });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -401,6 +434,11 @@ app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) =>
       const { pin_hash, ...safeShop } = parentShop;
       return res.json({
         found: true,
+        token: issueSession(parentShop.id, staffRow.id, {
+          canEditPrice: staffRow.can_edit_price,
+          canDelete: staffRow.can_delete,
+          canManageStaff: staffRow.can_manage_staff,
+        }),
         shop: safeShop,
         isStaff: true,
         staffId: staffRow.id,
@@ -437,10 +475,15 @@ app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) =>
       return res.status(401).json({ error: LOGIN_FAILED });
     }
     if (matched.length === 1) {
-      return res.json({ found: true, shop: matched[0] });
+      return res.json({ found: true, token: issueSession(matched[0].id), shop: matched[0] });
     }
-    // Multiple shops on this phone+PIN — client picks one
-    res.json({ found: true, multiple: true, shops: matched });
+    // Multiple shops on this phone+PIN — client picks one. A session is scoped to a single
+    // shop, so each candidate carries its own token and the client keeps the one it picks.
+    res.json({
+      found: true,
+      multiple: true,
+      shops: matched.map((shop) => ({ ...shop, token: issueSession(shop.id) })),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

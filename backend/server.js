@@ -8,31 +8,61 @@ require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { createWorker } = require("tesseract.js");
 
-// Rate limiter — optional dependency. If not installed, falls back to no-op so server still boots.
-let rateLimit = null;
-try { rateLimit = require("express-rate-limit"); } catch (e) { console.warn("express-rate-limit not installed — rate limiting disabled"); }
+// Rate limiter. This is a required dependency, not an optional one: it is the only thing
+// standing between a 4-6 digit PIN and an offline-speed brute force. It used to be wrapped
+// in try/catch with a no-op fallback, which meant a failed install silently shipped a
+// server with no rate limiting at all — a security control that disables itself on error
+// is worse than none, because nothing looks broken. Fail loudly at boot instead.
+const rateLimit = require("express-rate-limit");
 const makeLimiter = (max, windowMs) =>
-  rateLimit ? rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests, thodi der baad try karein" } })
-            : (req, res, next) => next();
+  rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests, thodi der baad try karein" } });
 // Tight limit on auth (brute-force) + expensive AI routes (cost abuse).
 const authLimiter = makeLimiter(20, 15 * 60 * 1000);   // 20 / 15min per IP
 const aiLimiter = makeLimiter(30, 15 * 60 * 1000);     // 30 / 15min per IP
+// Writes that change money-critical or identity fields.
+const writeLimiter = makeLimiter(60, 15 * 60 * 1000);  // 60 / 15min per IP
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Render (and any managed host) terminates TLS at a proxy, so req.ip is the proxy's
+// address unless we trust exactly one forwarding hop. Without this every request looks
+// like the same IP and the limiters above throttle all shops together. Trusting a fixed
+// hop count (not `true`) keeps X-Forwarded-For unspoofable — a client-supplied header
+// cannot shift the perceived IP and slip past the auth limiter.
+app.set('trust proxy', 1);
 
 // Middleware
 // CORS: restrict to ALLOWED_ORIGINS (comma-separated) when set, else allow all (dev/back-compat).
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
   : null;
+if (!ALLOWED_ORIGINS) {
+  console.warn(
+    "SECURITY: ALLOWED_ORIGINS is not set — CORS is open to every origin. " +
+    "Set it on the host (comma-separated, e.g. https://app.example.com,https://example.com) before serving real shops."
+  );
+}
 app.use(cors({
   origin: ALLOWED_ORIGINS || '*',
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(bodyParser.json({ limit: '20mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
+
+// Body size. 20mb on every route let an unauthenticated caller pin the process's memory
+// with a handful of junk requests. Only the routes that carry a base64 image or an
+// imported statement need room; everything else is small JSON, so the default is 1mb.
+// The large parser is mounted on those paths first — a global 1mb parser would reject
+// the upload before the route-level one ever ran.
+const LARGE_BODY_PATHS = [
+  "/api/inventory/scan-purchase",
+  "/api/inventory/photo-identify",
+  "/api/products/identify-photo",
+  "/api/bank-transactions/import",
+];
+app.use(LARGE_BODY_PATHS, bodyParser.json({ limit: '20mb' }));
+app.use(bodyParser.json({ limit: '1mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
 
 // Initialize Supabase.
 // Prefer the service_role key: the backend is the only database client (no browser or
@@ -270,12 +300,36 @@ app.get("/api/shops/:shopId", async (req, res) => {
 });
 
 // Update shop details (UPI, GSTIN, address, etc.)
-app.patch("/api/shops/:shopId", async (req, res) => {
+// Fields that decide where money lands or what a tax invoice claims. Rewriting upi_id
+// redirects every customer payment to an attacker's handle; gstin/pan_number/owner_name/
+// address are printed on GST invoices, so changing them forges a legal document. These
+// used to be editable by anyone who knew the shop UUID — a UUID travels in logs, URLs and
+// screenshots, so it is an identifier, never a credential. They now require the shop PIN.
+const SENSITIVE_SHOP_FIELDS = ['name', 'owner_name', 'address', 'gstin', 'pan_number', 'upi_id'];
+// Display preferences. No money or legal meaning, so they stay open until route-level
+// auth lands and covers every write uniformly.
+const PREFERENCE_SHOP_FIELDS = ['auto_reminder_enabled', 'reminder_threshold_days'];
+
+app.patch("/api/shops/:shopId", writeLimiter, async (req, res) => {
   try {
-    const allowed = ['name', 'owner_name', 'address', 'gstin', 'pan_number', 'upi_id', 'auto_reminder_enabled', 'reminder_threshold_days'];
+    const allowed = [...SENSITIVE_SHOP_FIELDS, ...PREFERENCE_SHOP_FIELDS];
     const updates = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
+    }
+
+    // Verify the PIN before touching anything sensitive. Checked against the shop being
+    // edited, so knowing some other shop's PIN grants nothing here.
+    const touchesSensitive = SENSITIVE_SHOP_FIELDS.some(k => updates[k] !== undefined);
+    if (touchesSensitive) {
+      const gate = await verifyShopPin(req.params.shopId, req.body?.pin);
+      if (!gate.ok) {
+        const status = gate.status === 400 ? 401 : gate.status;
+        return res.status(status).json({
+          error: gate.status === 400 ? "Shop details badalne ke liye PIN chahiye" : gate.error,
+          pinRequired: true,
+        });
+      }
     }
     if (updates.gstin) updates.gstin = updates.gstin.toUpperCase();
     if (updates.pan_number) updates.pan_number = updates.pan_number.toUpperCase();
@@ -296,6 +350,11 @@ app.patch("/api/shops/:shopId", async (req, res) => {
 });
 
 // Login by phone + PIN. One phone may own multiple shops.
+// One message for every login failure. Distinct "no shop on this number" vs "wrong PIN"
+// replies let anyone test phone numbers against the database and harvest the list of
+// registered shopkeepers, which also narrows a PIN brute force to numbers known to exist.
+const LOGIN_FAILED = "Phone ya PIN galat hai";
+
 app.post("/api/shops/login", authLimiter, async (req, res) => {
   try {
     const { phone, pin } = req.body;
@@ -313,9 +372,9 @@ app.post("/api/shops/login", authLimiter, async (req, res) => {
       // Not an owner phone — check if it's a staff account added under some shop.
       const { data: staffRow } = await supabase
         .from("shop_staff").select("*").eq("phone", phone).eq("active", true).maybeSingle();
-      if (!staffRow) return res.status(404).json({ error: "Koi shop nahi mila is number pe" });
+      if (!staffRow) return res.status(401).json({ error: LOGIN_FAILED });
       const staffOk = await bcrypt.compare(String(pin), staffRow.pin_hash);
-      if (!staffOk) return res.status(401).json({ error: "Galat PIN. Dobara try karo." });
+      if (!staffOk) return res.status(401).json({ error: LOGIN_FAILED });
 
       const { data: parentShop, error: shopErr } = await supabase
         .from("shops").select("*").eq("id", staffRow.shop_id).single();
@@ -356,7 +415,7 @@ app.post("/api/shops/login", authLimiter, async (req, res) => {
     }
 
     if (matched.length === 0) {
-      return res.status(401).json({ error: "Galat PIN. Dobara try karo." });
+      return res.status(401).json({ error: LOGIN_FAILED });
     }
     if (matched.length === 1) {
       return res.json({ found: true, shop: matched[0] });

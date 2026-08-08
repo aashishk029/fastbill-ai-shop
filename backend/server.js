@@ -291,12 +291,17 @@ app.get("/api/health", async (req, res) => {
 });
 
 // Initialize Shop
-app.post("/api/shops/init", async (req, res) => {
+app.post("/api/shops/init", writeLimiter, async (req, res) => {
   try {
     const { shopName, ownerName, phone, address, shopType, pin, gstin, pan, upiId } = req.body;
 
-    if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
-      return res.status(400).json({ error: "4 digit PIN zaroori hai" });
+    // New shops set a 6-digit PIN. A 4-digit PIN is 10,000 combinations, and the login
+    // limiter allows 10 tries per 15 minutes per phone, so a patient attacker exhausts it
+    // in days; six digits pushes that to years. Existing 4-digit PINs keep working at
+    // login on purpose — forcing a reset would lock out every current shopkeeper to fix a
+    // risk that the rate limit already holds down.
+    if (!pin || !/^\d{6}$/.test(pin)) {
+      return res.status(400).json({ error: "6 digit PIN zaroori hai" });
     }
 
     // Check phone not already registered.
@@ -503,7 +508,7 @@ app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) =>
 // STAFF / MULTI-USER LOGIN
 // ============================================
 
-app.post("/api/shops/:shopId/staff", async (req, res) => {
+app.post("/api/shops/:shopId/staff", writeLimiter, async (req, res) => {
   try {
     const { staffName, phone, pin, canEditPrice, canDelete, canManageStaff } = req.body;
     if (!staffName || !phone || !pin) return res.status(400).json({ error: "staffName, phone, pin required" });
@@ -544,7 +549,7 @@ app.get("/api/shops/:shopId/staff", async (req, res) => {
   }
 });
 
-app.patch("/api/shops/:shopId/staff/:staffId", async (req, res) => {
+app.patch("/api/shops/:shopId/staff/:staffId", writeLimiter, async (req, res) => {
   try {
     const allowed = ['can_edit_price', 'can_delete', 'can_manage_staff', 'active'];
     const updates = {};
@@ -562,7 +567,7 @@ app.patch("/api/shops/:shopId/staff/:staffId", async (req, res) => {
   }
 });
 
-app.delete("/api/shops/:shopId/staff/:staffId", async (req, res) => {
+app.delete("/api/shops/:shopId/staff/:staffId", writeLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from("shop_staff")
       .delete().eq("id", req.params.staffId).eq("shop_id", req.params.shopId).select();
@@ -1039,7 +1044,7 @@ app.get("/api/customers/:shopId/credit-check", async (req, res) => {
 
 // Set or clear a customer's limit. Upsert on the normalised name, so the
 // shopkeeper never has to create a customer record before billing them.
-app.put("/api/customers/:shopId/limit", async (req, res) => {
+app.put("/api/customers/:shopId/limit", writeLimiter, async (req, res) => {
   try {
     const { shopId } = req.params;
     const { name, creditLimit, creditDays, blockOverLimit, phone, notes } = req.body;
@@ -1114,7 +1119,7 @@ app.get("/api/customers/:shopId/limits", async (req, res) => {
   }
 });
 
-app.post("/api/invoices/generate", async (req, res) => {
+app.post("/api/invoices/generate", writeLimiter, async (req, res) => {
   try {
     // Credit check runs here rather than inside createInvoiceCore on purpose:
     // the recurring-invoice scheduler shares that core and has no human present
@@ -1239,7 +1244,7 @@ function advanceRecurringDate(dateStr, frequency) {
   return d.toISOString().slice(0, 10);
 }
 
-app.post("/api/recurring-invoices", async (req, res) => {
+app.post("/api/recurring-invoices", writeLimiter, async (req, res) => {
   try {
     const { shopId, customerName, customerPhone, customerAddress, customerGstin,
       items, showGst, gstMode, discountAmount, frequency, startDate } = req.body;
@@ -1278,7 +1283,7 @@ app.get("/api/recurring-invoices/:shopId", async (req, res) => {
   }
 });
 
-app.patch("/api/recurring-invoices/:id", async (req, res) => {
+app.patch("/api/recurring-invoices/:id", writeLimiter, async (req, res) => {
   try {
     const { shopId, active } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -1293,7 +1298,7 @@ app.patch("/api/recurring-invoices/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/recurring-invoices/:id", async (req, res) => {
+app.delete("/api/recurring-invoices/:id", writeLimiter, async (req, res) => {
   try {
     const { shopId } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -1309,7 +1314,7 @@ app.delete("/api/recurring-invoices/:id", async (req, res) => {
 
 // Cron entry point (called daily by a GitHub Action, same pattern as keep-warm) — generates
 // a real invoice for every active template whose next_run_date has arrived, for every shop.
-app.post("/api/recurring-invoices/run-due", async (req, res) => {
+app.post("/api/recurring-invoices/run-due", writeLimiter, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const { data: due, error } = await supabase.from("recurring_invoices")
@@ -1368,7 +1373,7 @@ function parseBillText(text) {
   return items.slice(0, 25);
 }
 
-app.post("/api/inventory/scan-purchase", async (req, res) => {
+app.post("/api/inventory/scan-purchase", writeLimiter, async (req, res) => {
   try {
     const { imageBase64, mimeType } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "No file data provided" });
@@ -1438,7 +1443,7 @@ Rules: quantity and rate must be numbers. hsnCode is usually a 4-8 digit code ne
   }
 });
 
-app.post("/api/inventory/confirm-scan", async (req, res) => {
+app.post("/api/inventory/confirm-scan", writeLimiter, async (req, res) => {
   try {
     const { shopId, items } = req.body;
     if (!shopId || !items?.length) return res.status(400).json({ error: "shopId and items required" });
@@ -1532,7 +1537,7 @@ app.post("/api/inventory/confirm-scan", async (req, res) => {
 // claiming a refund for tax the shop never ultimately bore.
 // ============================================
 
-app.put("/api/suppliers/:shopId", async (req, res) => {
+app.put("/api/suppliers/:shopId", writeLimiter, async (req, res) => {
   try {
     const { shopId } = req.params;
     const { name, phone, gstin, address, creditDays, notes } = req.body;
@@ -1603,7 +1608,7 @@ app.get("/api/suppliers/:shopId", async (req, res) => {
 
 // Send goods back to a supplier: stock comes off the shelf and the credit
 // claimed on those goods is reversed by a debit note.
-app.post("/api/purchases/:id/return", async (req, res) => {
+app.post("/api/purchases/:id/return", writeLimiter, async (req, res) => {
   try {
     const { id } = req.params;
     const { shopId, returnQuantity, reason } = req.body;
@@ -2115,7 +2120,7 @@ async function cashMovementsSince(shopId, since) {
 }
 
 // Start the day with what is already in the drawer.
-app.post("/api/cash-sessions/open", async (req, res) => {
+app.post("/api/cash-sessions/open", writeLimiter, async (req, res) => {
   try {
     const { shopId, openingCash, staffId } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -2158,7 +2163,7 @@ app.get("/api/cash-sessions/current/:shopId", async (req, res) => {
 });
 
 // Close the day: count the box, record the difference while memory is fresh.
-app.post("/api/cash-sessions/:id/close", async (req, res) => {
+app.post("/api/cash-sessions/:id/close", writeLimiter, async (req, res) => {
   try {
     const { id } = req.params;
     const { shopId, countedCash, note, staffId } = req.body;
@@ -2459,7 +2464,7 @@ app.post("/api/export/:shopId/tally", exportLimiter, async (req, res) => {
 // ============================================
 
 // Rate-limited with the shared auth limiter tier if available (spam guard), else open.
-app.post("/api/feedback", async (req, res) => {
+app.post("/api/feedback", writeLimiter, async (req, res) => {
   try {
     const { shopId, shopName, phone, rating, message, screen, appVersion, platform, lang } = req.body;
     const text = (message || "").trim();
@@ -2518,7 +2523,7 @@ app.get("/api/ads/active", async (req, res) => {
 // BANK RECONCILIATION (CSV import — no live bank API)
 // ============================================
 
-app.post("/api/bank-transactions/import", async (req, res) => {
+app.post("/api/bank-transactions/import", writeLimiter, async (req, res) => {
   try {
     const { shopId, transactions } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -2596,7 +2601,7 @@ app.get("/api/bank-transactions/:shopId/suggestions", async (req, res) => {
   }
 });
 
-app.patch("/api/bank-transactions/:id/match", async (req, res) => {
+app.patch("/api/bank-transactions/:id/match", writeLimiter, async (req, res) => {
   try {
     const { shopId, invoiceId, purchaseId, reconciled } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -2717,7 +2722,7 @@ async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg", maxOut
 // ============================================
 // AI — Photo → Product Identify (Gemini 1.5 Flash free)
 // ============================================
-app.post("/api/inventory/photo-identify", async (req, res) => {
+app.post("/api/inventory/photo-identify", writeLimiter, async (req, res) => {
   try {
     const { imageBase64, shopId } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "imageBase64 required" });
@@ -2846,7 +2851,7 @@ app.get("/api/invoices/last-rate/:shopId", async (req, res) => {
 // BAE INTELLIGENCE — /bae/query
 // ============================================
 
-app.post("/api/bae/query", async (req, res) => {
+app.post("/api/bae/query", writeLimiter, async (req, res) => {
   const { shopId, question } = req.body;
   if (!shopId || !question) return res.status(400).json({ error: "shopId and question required" });
 
@@ -3305,7 +3310,7 @@ module.exports = app;
 // ADD STOCK / PURCHASES ENDPOINT
 // ============================================
 
-app.post("/api/purchases/add", async (req, res) => {
+app.post("/api/purchases/add", writeLimiter, async (req, res) => {
   try {
     const { shopId, design_id, quantity_boxes, supplier_name, cost_per_box, extraCost, marginPercent, marginAmount,
             gstRate, gstMode, supplierGstin, supplierInvoiceNo, supplierInvoiceDate } = req.body;
@@ -3463,7 +3468,7 @@ app.get("/api/purchases/latest-rate/:shopId/:designId", async (req, res) => {
 });
 
 // Add New Product/Design
-app.post("/api/designs/add", async (req, res) => {
+app.post("/api/designs/add", writeLimiter, async (req, res) => {
   try {
     const { shopId, designCode, designName, color, categoryName, sizeMm, coverageSqft, pricePerBox, initialQuantity, hsnCode, defaultGstRate } = req.body;
 
@@ -3538,7 +3543,7 @@ app.post("/api/designs/add", async (req, res) => {
 });
 
 // Identify Product from Photo using Claude Vision
-app.post("/api/products/identify-photo", async (req, res) => {
+app.post("/api/products/identify-photo", writeLimiter, async (req, res) => {
   try {
     const { imageBase64, shopType } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "Image required" });
@@ -3919,7 +3924,7 @@ app.get("/api/bakaya/:shopId", async (req, res) => {
 });
 
 // Mark invoice payment (paid / partial)
-app.patch("/api/invoices/:id/payment", async (req, res) => {
+app.patch("/api/invoices/:id/payment", writeLimiter, async (req, res) => {
   try {
     const { status, amountPaid, shopId } = req.body; // status: 'paid'|'partial'|'credit'
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -3937,7 +3942,7 @@ app.patch("/api/invoices/:id/payment", async (req, res) => {
 });
 
 // Adjust inventory quantity (edit correction)
-app.patch("/api/inventory/adjust", async (req, res) => {
+app.patch("/api/inventory/adjust", writeLimiter, async (req, res) => {
   try {
     const { shopId, designId, inventoryId, newQuantity } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -3976,7 +3981,7 @@ async function checkStaffPermission(shopId, staffId, permissionColumn) {
   return !!data?.[permissionColumn];
 }
 
-app.delete("/api/inventory/:inventoryId", async (req, res) => {
+app.delete("/api/inventory/:inventoryId", writeLimiter, async (req, res) => {
   try {
     const { shopId, staffId } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -3998,7 +4003,7 @@ app.delete("/api/inventory/:inventoryId", async (req, res) => {
 
 // Fix a product's unit of measurement (e.g. was created as sqft, should be boxes for a ceramic
 // tile) — same shop-ownership check as other design edits, via its inventory row.
-app.patch("/api/designs/:designId/unit", async (req, res) => {
+app.patch("/api/designs/:designId/unit", writeLimiter, async (req, res) => {
   try {
     const { shopId, unitType } = req.body;
     if (!shopId || !unitType) return res.status(400).json({ error: "shopId and unitType required" });
@@ -4026,7 +4031,7 @@ app.patch("/api/designs/:designId/unit", async (req, res) => {
 // affected product is split out. This does NOT recover which distinct price each product should have
 // had (that information was already overwritten by the sharing bug) — it only stops further
 // cross-contamination. Shopkeeper must still re-enter the correct price per product afterwards.
-app.post("/api/shops/:shopId/repair-shared-pricing", async (req, res) => {
+app.post("/api/shops/:shopId/repair-shared-pricing", writeLimiter, async (req, res) => {
   try {
     const { data: invRows, error } = await supabase
       .from("inventory")
@@ -4070,7 +4075,7 @@ app.post("/api/shops/:shopId/repair-shared-pricing", async (req, res) => {
 // Set a product's selling price from cost + transport/misc + margin, without touching stock quantity.
 // Same blend-it-in formula as purchases/add and confirm-scan, so a shopkeeper can fix pricing
 // on an already-stocked product straight from the Current Inventory list.
-app.patch("/api/inventory/set-price", async (req, res) => {
+app.patch("/api/inventory/set-price", writeLimiter, async (req, res) => {
   try {
     const { shopId, designId, baseCost, extraCost, marginPercent, marginAmount, staffId } = req.body;
     if (!shopId || !designId) return res.status(400).json({ error: "shopId and designId required" });
@@ -4114,7 +4119,7 @@ app.patch("/api/inventory/set-price", async (req, res) => {
 });
 
 // Mark purchase payment
-app.patch("/api/purchases/:id/payment", async (req, res) => {
+app.patch("/api/purchases/:id/payment", writeLimiter, async (req, res) => {
   try {
     const { status, amountPaid, shopId } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -4209,7 +4214,7 @@ app.get("/api/invoices/history/:shopId", async (req, res) => {
 });
 
 // Cancel / Delete invoice — restores inventory
-app.delete("/api/invoices/:id", async (req, res) => {
+app.delete("/api/invoices/:id", writeLimiter, async (req, res) => {
   try {
     const { id } = req.params;
     const shopId = req.body?.shopId || req.query.shopId;
@@ -4269,7 +4274,7 @@ app.delete("/api/invoices/:id", async (req, res) => {
 // the exact fields the NIC EWB-01 form asks for from the invoice + transport details the
 // shopkeeper types in, so they can paste/type them into ewaybillgst.gov.in in under a minute
 // instead of hunting for each number across the invoice.
-app.post("/api/invoices/:id/eway-bill-data", async (req, res) => {
+app.post("/api/invoices/:id/eway-bill-data", writeLimiter, async (req, res) => {
   try {
     const { shopId, transporterName, transporterId, vehicleNumber, distanceKm } = req.body;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -4375,7 +4380,7 @@ app.get("/api/credit-notes/:shopId/:id", async (req, res) => {
   }
 });
 
-app.post("/api/invoices/:id/return", async (req, res) => {
+app.post("/api/invoices/:id/return", writeLimiter, async (req, res) => {
   try {
     const { id } = req.params;
     const { returnItems, reason, shopId } = req.body;
@@ -4555,7 +4560,7 @@ app.post("/api/invoices/:id/return", async (req, res) => {
   }
 });
 
-app.post("/api/payment-events", async (req, res) => {
+app.post("/api/payment-events", writeLimiter, async (req, res) => {
   try {
     const { invoiceId, amount, paymentMode, note, shopId } = req.body;
     if (!invoiceId || !amount) return res.status(400).json({ error: "invoiceId and amount required" });
@@ -4805,7 +4810,7 @@ app.get("/api/jewellery/rates", async (req, res) => {
 });
 
 // Jewellery invoice: weight-based billing
-app.post("/api/invoices/jewellery", async (req, res) => {
+app.post("/api/invoices/jewellery", writeLimiter, async (req, res) => {
   let createdInvoiceId = null;
   try {
     const { shopId, customerName, customerPhone, customerAddress, customerGstin,
@@ -4885,7 +4890,7 @@ app.post("/api/invoices/jewellery", async (req, res) => {
 
 const EXPENSE_CATEGORIES = ['rent', 'utility', 'salary', 'transport', 'marketing', 'other'];
 
-app.post("/api/expenses", async (req, res) => {
+app.post("/api/expenses", writeLimiter, async (req, res) => {
   try {
     const { shopId, category, amount, note, expenseDate } = req.body;
     if (!shopId || !category || !amount) return res.status(400).json({ error: "shopId, category, amount required" });
@@ -4939,7 +4944,7 @@ app.get("/api/expenses/:shopId", async (req, res) => {
   }
 });
 
-app.delete("/api/expenses/:id", async (req, res) => {
+app.delete("/api/expenses/:id", writeLimiter, async (req, res) => {
   try {
     const shopId = req.body?.shopId || req.query.shopId;
     if (!shopId) return res.status(400).json({ error: "shopId required" });
@@ -5014,7 +5019,7 @@ app.get("/api/reminders/overdue/:shopId", async (req, res) => {
 });
 
 // Mark reminders as sent (bulk update last_reminder_at)
-app.post("/api/reminders/mark-sent", async (req, res) => {
+app.post("/api/reminders/mark-sent", writeLimiter, async (req, res) => {
   try {
     const { invoiceIds, shopId } = req.body;
     if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {

@@ -27,6 +27,10 @@ function App() {
 
   // Hardcoded shop ID for Kanhaiya Marbles (will be set after first init)
   const SHOP_ID = localStorage.getItem('shopId');
+  // A stored shop id is no longer enough to reach the API — the session is what the server
+  // checks — so a browser holding an id but no session has to sign in again.
+  const HAS_SESSION = !!localStorage.getItem('sessionToken');
+  const [showRegister, setShowRegister] = useState(false);
 
   useEffect(() => {
     // Ping backend to wake Render free tier
@@ -87,6 +91,33 @@ function App() {
     }
   };
 
+  const handleLogin = async ({ phone, pin }) => {
+    try {
+      setLoading(true);
+      setError(null);
+      const response = await api.post('/shops/login', { phone, pin });
+      if (response.data.multiple) {
+        // Each candidate shop carries its own session; this client has no picker yet, so
+        // it takes the most recent, which is the order the server returns them in.
+        const first = response.data.shops[0];
+        storeSession(first.token);
+        localStorage.setItem('shopId', first.id);
+      } else {
+        storeSession(response.data.token);
+        localStorage.setItem('shopId', response.data.shop.id);
+      }
+      window.location.reload();
+    } catch (err) {
+      // The server answers the same way for an unknown phone and a wrong PIN, so that
+      // nobody can test phone numbers against the database. The message says both.
+      setError(err.response?.status === 429
+        ? 'Too many attempts. Try again in 15 minutes.'
+        : 'Phone number or PIN is wrong. Try again, or register a new shop.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleInitializeShop = async (shopDetails) => {
     try {
       setLoading(true);
@@ -106,7 +137,7 @@ function App() {
     }
   };
 
-  if (!SHOP_ID) {
+  if (!SHOP_ID || !HAS_SESSION) {
     return (
       <div className="container">
         <div className="init-screen">
@@ -117,7 +148,22 @@ function App() {
               ⏳ Server start ho raha hai... 30-50 sec wait karo
             </div>
           )}
-          <InitializeShop onSubmit={handleInitializeShop} />
+          {error && <div className="error-message">{error}</div>}
+          {showRegister ? (
+            <>
+              <InitializeShop onSubmit={handleInitializeShop} />
+              <button className="link-button" onClick={() => { setError(null); setShowRegister(false); }}>
+                Already have a shop? Log in
+              </button>
+            </>
+          ) : (
+            <>
+              <LoginForm onSubmit={handleLogin} loading={loading} />
+              <button className="link-button" onClick={() => { setError(null); setShowRegister(true); }}>
+                New here? Register a shop
+              </button>
+            </>
+          )}
         </div>
       </div>
     );
@@ -203,6 +249,33 @@ function App() {
         </button>
       </nav>
     </div>
+  );
+}
+
+// Signup used to be the only way this client could get in, which meant a browser that
+// cleared its storage could never return. The API needs a session now, so it needs a login.
+function LoginForm({ onSubmit, loading }) {
+  const [phone, setPhone] = useState('');
+  const [pin, setPin] = useState('');
+  const valid = /^\d{10}$/.test(phone) && /^\d{4,6}$/.test(pin);
+
+  return (
+    <form
+      className="login-form"
+      onSubmit={(e) => { e.preventDefault(); if (valid) onSubmit({ phone, pin }); }}
+    >
+      <input
+        type="tel" placeholder="Phone number" value={phone} maxLength={10}
+        onChange={(e) => setPhone(e.target.value.replace(/\D/g, ''))}
+      />
+      <input
+        type="password" placeholder="PIN" value={pin} maxLength={6}
+        onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+      />
+      <button type="submit" disabled={!valid || loading}>
+        {loading ? 'Logging in…' : 'Log in'}
+      </button>
+    </form>
   );
 }
 

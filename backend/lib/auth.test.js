@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
+  permissionFor,
   isPublicRoute,
   shopIdFromPath,
   resourceScopeFor,
@@ -294,4 +295,56 @@ test("a failed ownership lookup blocks when enforcing but not in report-only", a
   const reporting = makeAuthMiddleware({ supabase: exploding, secret: SECRET, enforce: false, log: () => {} });
   const out2 = await runMiddleware(reporting, req({ method: "DELETE", path: "/api/invoices/abc", headers: authed(SHOP) }));
   assert.equal(out2.passed, true, "a database hiccup must not start blocking during rollout");
+});
+
+// --- staff permissions ------------------------------------------------------------------
+
+const staffDb = (row) => ({ from: () => ({ select: () => ({ eq: () => ({ eq: () => ({ maybeSingle: async () => ({ data: row }) }) }) }) }) });
+const staffToken = (shopId, staffId) => ({ authorization: `Bearer ${signSession({ shopId, staffId }, SECRET)}` });
+
+test("destructive and pricing actions map to the permission they need", () => {
+  assert.equal(permissionFor("DELETE", "/api/invoices/abc"), "canDelete");
+  assert.equal(permissionFor("PATCH", "/api/inventory/set-price"), "canEditPrice");
+  assert.equal(permissionFor("POST", `/api/shops/${SHOP}/staff`), "canManageStaff");
+  assert.equal(permissionFor("GET", `/api/inventory/status/${SHOP}`), null);
+});
+
+test("the owner is never restricted by staff permissions", async () => {
+  // An owner session carries no staffId, so the permission gate does not apply.
+  const mw = makeAuthMiddleware({ supabase: stubDb({ shop_id: SHOP }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "DELETE", path: "/api/invoices/abc", headers: authed(SHOP) }));
+  assert.equal(out.passed, true);
+});
+
+test("a staff member without canDelete cannot delete, even calling the API directly", async () => {
+  // The app hides the button; that is not a control. This is the control.
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: true, can_delete: false }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "DELETE", path: "/api/invoices/abc", headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.status, 403);
+});
+
+test("a staff member with canDelete may delete", async () => {
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: true, can_delete: true, shop_id: SHOP }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "DELETE", path: "/api/invoices/abc", headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.passed, true);
+});
+
+test("a deactivated staff member loses permission immediately, not in 30 days", async () => {
+  // Permissions are read from the database, not the token, so revoking one takes effect at
+  // once instead of lasting as long as the session.
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: false, can_delete: true }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "DELETE", path: "/api/invoices/abc", headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.status, 403);
+});
+
+test("a staff row that no longer exists grants nothing", async () => {
+  const mw = makeAuthMiddleware({ supabase: staffDb(null), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "DELETE", path: "/api/invoices/abc", headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.status, 403);
+});
+
+test("staff cannot add or remove other staff without canManageStaff", async () => {
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: true, can_manage_staff: false }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "POST", path: `/api/shops/${SHOP}/staff`, headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.status, 403);
 });

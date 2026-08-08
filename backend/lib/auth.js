@@ -86,6 +86,25 @@ const RESOURCE_SCOPES = [
   { method: "PATCH", pattern: /^\/api\/designs\/([^/]+)\/unit$/i, table: "inventory", column: "design_id" },
 ];
 
+// Actions a staff member needs explicit permission for. The mobile app already hides these
+// controls from staff who lack the permission, but hiding a button is not a control: the
+// API sat open, so any staff login could delete invoices or rewrite prices by calling it
+// directly. The owner (a session with no staffId) is never restricted.
+const PERMISSION_SCOPES = [
+  { methods: ["DELETE"], pattern: /^\/api\/inventory\/[^/]+$/i, permission: "canDelete" },
+  { methods: ["DELETE"], pattern: /^\/api\/invoices\/[^/]+$/i, permission: "canDelete" },
+  { methods: ["DELETE"], pattern: /^\/api\/expenses\/[^/]+$/i, permission: "canDelete" },
+  { methods: ["DELETE"], pattern: /^\/api\/recurring-invoices\/[^/]+$/i, permission: "canDelete" },
+  { methods: ["PATCH"], pattern: /^\/api\/inventory\/set-price$/i, permission: "canEditPrice" },
+  { methods: ["POST", "PATCH", "DELETE"], pattern: /^\/api\/shops\/[^/]+\/staff(?:\/[^/]+)?$/i, permission: "canManageStaff" },
+];
+
+function permissionFor(method, path) {
+  const clean = normalisePath(path);
+  const hit = PERMISSION_SCOPES.find((s) => s.methods.includes(method) && s.pattern.test(clean));
+  return hit ? hit.permission : null;
+}
+
 function resourceScopeFor(method, path) {
   const clean = normalisePath(path);
   for (const scope of RESOURCE_SCOPES) {
@@ -215,6 +234,32 @@ function makeAuthMiddleware({ supabase, secret, enforce = true, log = console.wa
       return deny(403, "Ye shop aapki nahi hai");
     }
 
+    const needed = permissionFor(req.method, req.path);
+    if (needed && payload.staffId) {
+      // Read the permission from the database rather than the token. Permissions are
+      // stamped into the session at login and the session lasts 30 days, so trusting the
+      // token would keep a revoked permission working for a month, and a deactivated staff
+      // member would keep full access until their session expired.
+      let staff = null;
+      try {
+        const { data } = await supabase
+          .from("shop_staff")
+          .select("active, can_edit_price, can_delete, can_manage_staff")
+          .eq("id", payload.staffId)
+          .eq("shop_id", payload.shopId)
+          .maybeSingle();
+        staff = data;
+      } catch (e) {
+        return deny(503, "Permission check nahi ho paaya, dobara try karein");
+      }
+      const granted = staff && staff.active && {
+        canEditPrice: staff.can_edit_price,
+        canDelete: staff.can_delete,
+        canManageStaff: staff.can_manage_staff,
+      }[needed];
+      if (!granted) return deny(403, "Iske liye aapko permission nahi hai");
+    }
+
     const scope = resourceScopeFor(req.method, req.path);
     if (scope) {
       let row = null;
@@ -249,6 +294,8 @@ module.exports = {
   isPublicRoute,
   normalisePath,
   resourceScopeFor,
+  permissionFor,
+  PERMISSION_SCOPES,
   shopIdFromPath,
   SHOP_SCOPED_PATHS,
   shopIdsInRequest,

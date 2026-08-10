@@ -13,10 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run due recurring invoices
+        env:
+          # Must match RECURRING_CRON_SECRET on the backend host. Without it the job is
+          # refused: this route bills every shop, so it cannot be left open.
+          RECURRING_CRON_SECRET: ${{ secrets.RECURRING_CRON_SECRET }}
         run: |
           URL="https://fastbill-ai-shop.onrender.com/api/recurring-invoices/run-due"
           echo "Calling $URL"
-          code=$(curl -s -o /tmp/body.json -w "%{http_code}" -X POST --max-time 120 "$URL" || echo "000")
+          code=$(curl -s -o /tmp/body.json -w "%{http_code}" -X POST --max-time 120 \
+            -H "x-cron-secret: $RECURRING_CRON_SECRET" "$URL" || echo "000")
           echo "HTTP $code"
           cat /tmp/body.json || true
           echo ""

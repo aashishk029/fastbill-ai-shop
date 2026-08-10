@@ -1341,8 +1341,27 @@ app.delete("/api/recurring-invoices/:id", writeLimiter, async (req, res) => {
 
 // Cron entry point (called daily by a GitHub Action, same pattern as keep-warm) — generates
 // a real invoice for every active template whose next_run_date has arrived, for every shop.
+// Generates every shop's due recurring invoices. This is a scheduled job, not a user
+// action: it deliberately spans all shops, so it cannot be gated by a session the way the
+// rest of the API is. It used to have no authentication at all, which meant any caller
+// could bill every shop on the platform at a moment of their choosing — creating invoices
+// and decrementing stock — and read back the resulting template and invoice ids, which
+// belong to other shops. It is now authenticated by a shared secret, the same way the
+// online-order webhook is, and no session can reach it.
 app.post("/api/recurring-invoices/run-due", writeLimiter, async (req, res) => {
   try {
+    const cronSecret = process.env.RECURRING_CRON_SECRET;
+    if (!cronSecret) {
+      return res.status(503).json({ error: "Recurring cron not configured (RECURRING_CRON_SECRET missing)" });
+    }
+    const provided = req.get("x-cron-secret") || "";
+    const a = Buffer.from(provided);
+    const b = Buffer.from(cronSecret);
+    // Constant-time compare so the secret can't be guessed a byte at a time.
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const today = new Date().toISOString().slice(0, 10);
     const { data: due, error } = await supabase.from("recurring_invoices")
       .select("*").eq("active", true).lte("next_run_date", today);
@@ -1400,7 +1419,7 @@ function parseBillText(text) {
   return items.slice(0, 25);
 }
 
-app.post("/api/inventory/scan-purchase", writeLimiter, async (req, res) => {
+app.post("/api/inventory/scan-purchase", aiLimiter, async (req, res) => {
   try {
     const { imageBase64, mimeType } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "No file data provided" });
@@ -2749,7 +2768,7 @@ async function geminiVision(imageBase64, prompt, mimeType = "image/jpeg", maxOut
 // ============================================
 // AI — Photo → Product Identify (Gemini 1.5 Flash free)
 // ============================================
-app.post("/api/inventory/photo-identify", writeLimiter, async (req, res) => {
+app.post("/api/inventory/photo-identify", aiLimiter, async (req, res) => {
   try {
     const { imageBase64, shopId } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "imageBase64 required" });
@@ -2878,7 +2897,7 @@ app.get("/api/invoices/last-rate/:shopId", async (req, res) => {
 // BAE INTELLIGENCE — /bae/query
 // ============================================
 
-app.post("/api/bae/query", writeLimiter, async (req, res) => {
+app.post("/api/bae/query", aiLimiter, async (req, res) => {
   const { shopId, question } = req.body;
   if (!shopId || !question) return res.status(400).json({ error: "shopId and question required" });
 
@@ -3570,7 +3589,7 @@ app.post("/api/designs/add", writeLimiter, async (req, res) => {
 });
 
 // Identify Product from Photo using Claude Vision
-app.post("/api/products/identify-photo", writeLimiter, async (req, res) => {
+app.post("/api/products/identify-photo", aiLimiter, async (req, res) => {
   try {
     const { imageBase64, shopType } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "Image required" });

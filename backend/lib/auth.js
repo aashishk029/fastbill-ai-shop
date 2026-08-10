@@ -22,6 +22,8 @@ const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days — a shopkeeper should 
 //   shops/init    — creates the first shop; there is no session to present yet
 //   shops/login   — issues the session
 //   webhooks/*    — authenticated by its own shared secret via timingSafeEqual
+//   recurring-invoices/run-due — scheduled job spanning every shop, so no one session can
+//                   scope it; guarded by its own shared secret the same way
 //   ads/active    — public promo content, carries no shop data
 //   jewellery/rates — public market rates, carries no shop data
 const PUBLIC_ROUTES = [
@@ -29,6 +31,7 @@ const PUBLIC_ROUTES = [
   { method: "POST", path: "/api/shops/init" },
   { method: "POST", path: "/api/shops/login" },
   { method: "POST", path: "/api/webhooks/online-order" },
+  { method: "POST", path: "/api/recurring-invoices/run-due" },
   { method: "GET", path: "/api/ads/active" },
   { method: "GET", path: "/api/jewellery/rates" },
 ];

@@ -386,3 +386,19 @@ test("reversing a sale or purchase needs the same permission as deleting one", (
   assert.equal(permissionFor("POST", "/api/invoices/abc/return"), "canDelete");
   assert.equal(permissionFor("POST", "/api/purchases/p1/return"), "canDelete");
 });
+
+test("only the revoked-access refusal tells the client to sign out", async () => {
+  // A permission refusal must not log someone out for touching one forbidden button.
+  const revoked = makeAuthMiddleware({ supabase: staffDb({ active: false }), secret: SECRET });
+  const a = await runMiddleware(revoked, req({ path: `/api/inventory/status/${SHOP}`, headers: staffToken(SHOP, "s1") }));
+  assert.equal(a.body.accessRevoked, true);
+
+  const noPerm = makeAuthMiddleware({ supabase: staffDb({ active: true, can_delete: false }), secret: SECRET });
+  const b = await runMiddleware(noPerm, req({ method: "DELETE", path: "/api/invoices/x", headers: staffToken(SHOP, "s1") }));
+  assert.equal(b.status, 403);
+  assert.equal(b.body.accessRevoked, undefined);
+
+  const wrongShop = makeAuthMiddleware({ supabase: stubDb(null), secret: SECRET });
+  const c = await runMiddleware(wrongShop, req({ path: `/api/shops/${OTHER}`, headers: authed(SHOP) }));
+  assert.equal(c.body.accessRevoked, undefined);
+});

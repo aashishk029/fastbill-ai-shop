@@ -228,8 +228,12 @@ function makeAuthMiddleware({ supabase, secret, enforce = true, log = console.wa
   return async function authMiddleware(req, res, next) {
     if (isPublicRoute(req.method, req.path)) return next();
 
-    const deny = (status, error) => {
-      if (enforce) return res.status(status).json({ error });
+    // `extra` carries flags the client acts on. Only the revoked-access refusal sets one:
+    // it is the single 403 that means "this session is finished", as opposed to "you may
+    // not do that particular thing", and the app logs out on it. Marking the others would
+    // sign a user out for touching one forbidden button.
+    const deny = (status, error, extra = {}) => {
+      if (enforce) return res.status(status).json({ error, ...extra });
       log(`AUTH (report-only, would have blocked): ${req.method} ${req.path} — ${error}`);
       return next();
     };
@@ -262,7 +266,9 @@ function makeAuthMiddleware({ supabase, secret, enforce = true, log = console.wa
       } catch (e) {
         return deny(503, "Permission check nahi ho paaya, dobara try karein");
       }
-      if (!staff || !staff.active) return deny(403, "Aapka access band kar diya gaya hai");
+      if (!staff || !staff.active) {
+        return deny(403, "Aapka access band kar diya gaya hai", { accessRevoked: true });
+      }
 
       // Hand the route the permissions as they are right now. Routes that decide something
       // finer than allow/deny — billing, where the question is not "may you invoice" but

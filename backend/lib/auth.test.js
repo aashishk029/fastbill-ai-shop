@@ -348,3 +348,41 @@ test("staff cannot add or remove other staff without canManageStaff", async () =
   const out = await runMiddleware(mw, req({ method: "POST", path: `/api/shops/${SHOP}/staff`, headers: staffToken(SHOP, "s1") }));
   assert.equal(out.status, 403);
 });
+
+// --- staff access is checked on every request, not only gated ones ----------------------
+
+test("a deactivated staff member loses access to everything, not just gated routes", async () => {
+  // Checking only on permission-gated routes left a removed employee reading invoices,
+  // customers and the cashbook for the rest of their 30-day session.
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: false, can_delete: true }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ path: `/api/inventory/status/${SHOP}`, headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.status, 403);
+});
+
+test("an active staff member still reaches ordinary routes", async () => {
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: true }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ path: `/api/inventory/status/${SHOP}`, headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.passed, true);
+});
+
+test("routes are handed the permissions as they stand now, not as the token remembers", async () => {
+  // The token is up to a month old; billing decides price rights from this.
+  const mw = makeAuthMiddleware({ supabase: staffDb({ active: true, can_edit_price: true }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "POST", path: "/api/invoices/generate", body: { shopId: SHOP }, headers: staffToken(SHOP, "s1") }));
+  assert.equal(out.passed, true);
+  assert.equal(out.req.auth.permissions.canEditPrice, true);
+  assert.equal(out.req.auth.permissions.canDelete, false);
+});
+
+test("an owner session carries no permission object and is never narrowed", async () => {
+  const mw = makeAuthMiddleware({ supabase: stubDb(null), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "POST", path: "/api/invoices/generate", body: { shopId: SHOP }, headers: authed(SHOP) }));
+  assert.equal(out.passed, true);
+  assert.ok(!out.req.auth.permissions, "no permission object means nothing to narrow by");
+});
+
+test("reversing a sale or purchase needs the same permission as deleting one", () => {
+  // Otherwise "cannot delete" is worked around by refunding.
+  assert.equal(permissionFor("POST", "/api/invoices/abc/return"), "canDelete");
+  assert.equal(permissionFor("POST", "/api/purchases/p1/return"), "canDelete");
+});

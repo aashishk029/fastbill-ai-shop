@@ -245,8 +245,8 @@ if (!AUTH_ENFORCE) {
 app.use(auth.makeAuthMiddleware({ supabase, secret: JWT_SECRET, enforce: AUTH_ENFORCE }));
 
 // Handed to clients at login/init so they can present it on later calls.
-const issueSession = (shopId, staffId = null, permissions = null) =>
-  auth.signSession({ shopId, staffId, permissions }, JWT_SECRET);
+const issueSession = (shopId, staffId = null) =>
+  auth.signSession({ shopId, staffId }, JWT_SECRET);
 
 // ============================================
 // ROUTES
@@ -449,11 +449,7 @@ app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) =>
       const { pin_hash, ...safeShop } = parentShop;
       return res.json({
         found: true,
-        token: issueSession(parentShop.id, staffRow.id, {
-          canEditPrice: staffRow.can_edit_price,
-          canDelete: staffRow.can_delete,
-          canManageStaff: staffRow.can_manage_staff,
-        }),
+        token: issueSession(parentShop.id, staffRow.id),
         shop: safeShop,
         isStaff: true,
         staffId: staffRow.id,
@@ -721,7 +717,7 @@ function noteIfRlsError(table, error) {
 // Core invoice-generation logic, shared by the HTTP endpoint and the recurring-invoices
 // scheduler (both need identical math/rollback behavior — duplicating it would risk the two
 // drifting apart, like the client/backend discount-order bug did earlier).
-async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, placeOfSupply, creditLimitOverridden = false, invoiceNumber = null }) {
+async function createInvoiceCore({ shopId, customerName, customerPhone, customerAddress, customerGstin, showGst, gstMode, items, paymentStatus, paymentMode, discountAmount, tableNumber, placeOfSupply, creditLimitOverridden = false, invoiceNumber = null, lockToCatalogPrice = false }) {
   let createdInvoiceId = null;
   try {
     if (!shopId) throw Object.assign(new Error("shopId required"), { status: 400 });
@@ -745,7 +741,7 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     const designIds = items.map(i => i.designId).filter(Boolean);
     const { data: designsData } = await supabase
       .from("designs")
-      .select("id, hsn_code, default_gst_rate, design_code, design_name, unit_type")
+      .select("id, hsn_code, default_gst_rate, design_code, design_name, unit_type, tile_categories(base_price_per_box)")
       .in("id", designIds);
     const designMap = {};
     (designsData || []).forEach(d => { designMap[d.id] = d; });
@@ -766,6 +762,32 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
       }
       if (qty(it.quantityBoxes) > (stockMap[it.designId] || 0)) {
         throw Object.assign(new Error(`Stock kam hai. Available: ${stockMap[it.designId] || 0}, maanga: ${qty(it.quantityBoxes)}`), { status: 400 });
+      }
+    }
+
+    // Staff without canEditPrice may bill, but only at the shop's own price.
+    //
+    // Gating PATCH /api/inventory/set-price protected the catalogue and nothing else: the
+    // price that actually decides what a customer pays arrives here in the request body
+    // and was never compared to anything. A cashier could therefore keep "cannot edit
+    // price" and still sell a 900-rupee box for 100, or hand out an unlimited discount,
+    // which is the whole loss the permission exists to prevent. The app already hides
+    // these fields from such staff, so a legitimate request always matches; a mismatch is
+    // refused rather than silently rewritten, because quietly changing what someone
+    // believes they billed is its own kind of wrong.
+    if (lockToCatalogPrice) {
+      if (discount > 0) {
+        throw Object.assign(new Error("Discount dene ki permission nahi hai"), { status: 403 });
+      }
+      for (const it of items) {
+        const catalogPrice = designMap[it.designId]?.tile_categories?.base_price_per_box;
+        if (catalogPrice == null) {
+          throw Object.assign(new Error("Is product ka shop price set nahi hai — malik se kehkar set karwayein"), { status: 403 });
+        }
+        // Compare in paise so a floating-point tail does not read as tampering.
+        if (Math.round(price(it.pricePerBox) * 100) !== Math.round(parseFloat(catalogPrice) * 100)) {
+          throw Object.assign(new Error("Price badalne ki permission nahi hai"), { status: 403 });
+        }
       }
     }
 
@@ -1143,6 +1165,11 @@ app.post("/api/invoices/generate", writeLimiter, async (req, res) => {
     const result = await createInvoiceCore({
       ...req.body,
       creditLimitOverridden: !!(creditAssessment?.wouldExceed),
+      // Set after the spread, never before: the body is attacker-controlled, so a caller
+      // could otherwise send lockToCatalogPrice:false and unlock its own prices.
+      // Owners have no staffId and are unrestricted; staff are held to the shop's price
+      // unless they were granted canEditPrice.
+      lockToCatalogPrice: !!(req.auth?.staffId && !req.auth?.permissions?.canEditPrice),
     });
 
     // Warnings ride along with the successful response so the app can tell the

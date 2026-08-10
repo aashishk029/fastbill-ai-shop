@@ -96,6 +96,11 @@ const PERMISSION_SCOPES = [
   { methods: ["DELETE"], pattern: /^\/api\/expenses\/[^/]+$/i, permission: "canDelete" },
   { methods: ["DELETE"], pattern: /^\/api\/recurring-invoices\/[^/]+$/i, permission: "canDelete" },
   { methods: ["PATCH"], pattern: /^\/api\/inventory\/set-price$/i, permission: "canEditPrice" },
+  // Reversing a sale or a purchase unwinds money and stock. It is not filed under delete
+  // in the UI, but it undoes a completed transaction just as thoroughly, so it needs the
+  // same permission — otherwise "cannot delete" is trivially worked around by refunding.
+  { methods: ["POST"], pattern: /^\/api\/invoices\/[^/]+\/return$/i, permission: "canDelete" },
+  { methods: ["POST"], pattern: /^\/api\/purchases\/[^/]+\/return$/i, permission: "canDelete" },
   { methods: ["POST", "PATCH", "DELETE"], pattern: /^\/api\/shops\/[^/]+\/staff(?:\/[^/]+)?$/i, permission: "canManageStaff" },
 ];
 
@@ -196,9 +201,13 @@ function resolveSecret(env = process.env, warn = console.warn) {
   return { secret: crypto.randomBytes(48).toString("hex"), ephemeral: true };
 }
 
-function signSession({ shopId, staffId = null, permissions = null }, secret) {
+// The session says who is calling and nothing more. It deliberately does not carry the
+// staff member's permissions: the middleware reads those from the database on every staff
+// request, so a copy in the token would be a second, staler answer to the same question —
+// and the first thing someone reads by mistake.
+function signSession({ shopId, staffId = null }, secret) {
   if (!shopId) throw new Error("signSession requires a shopId");
-  return jwt.sign({ shopId, staffId, permissions }, secret, { expiresIn: TOKEN_TTL_SECONDS });
+  return jwt.sign({ shopId, staffId }, secret, { expiresIn: TOKEN_TTL_SECONDS });
 }
 
 function verifySession(token, secret) {
@@ -235,11 +244,12 @@ function makeAuthMiddleware({ supabase, secret, enforce = true, log = console.wa
     }
 
     const needed = permissionFor(req.method, req.path);
-    if (needed && payload.staffId) {
-      // Read the permission from the database rather than the token. Permissions are
-      // stamped into the session at login and the session lasts 30 days, so trusting the
-      // token would keep a revoked permission working for a month, and a deactivated staff
-      // member would keep full access until their session expired.
+    if (payload.staffId) {
+      // Every staff request re-reads the staff row, not just the permission-gated ones.
+      // Checking only on gated routes left a removed or deactivated employee with full
+      // read and write access to everything else — invoices, customers, the cashbook — for
+      // the entire 30-day life of their session. Both facts we need come from one row, so
+      // this costs a single lookup, and only for staff; owners never reach it.
       let staff = null;
       try {
         const { data } = await supabase
@@ -252,12 +262,20 @@ function makeAuthMiddleware({ supabase, secret, enforce = true, log = console.wa
       } catch (e) {
         return deny(503, "Permission check nahi ho paaya, dobara try karein");
       }
-      const granted = staff && staff.active && {
-        canEditPrice: staff.can_edit_price,
-        canDelete: staff.can_delete,
-        canManageStaff: staff.can_manage_staff,
-      }[needed];
-      if (!granted) return deny(403, "Iske liye aapko permission nahi hai");
+      if (!staff || !staff.active) return deny(403, "Aapka access band kar diya gaya hai");
+
+      // Hand the route the permissions as they are right now. Routes that decide something
+      // finer than allow/deny — billing, where the question is not "may you invoice" but
+      // "may you invoice at your own price" — read them from here rather than the token,
+      // which could be a month stale.
+      req.auth.permissions = {
+        canEditPrice: !!staff.can_edit_price,
+        canDelete: !!staff.can_delete,
+        canManageStaff: !!staff.can_manage_staff,
+      };
+      if (needed && !req.auth.permissions[needed]) {
+        return deny(403, "Iske liye aapko permission nahi hai");
+      }
     }
 
     const scope = resourceScopeFor(req.method, req.path);

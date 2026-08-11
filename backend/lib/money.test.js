@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Tests for FastBill's money math. Run with `npm test` (uses node:test — no
+ * Tests for FastBahi's money math. Run with `npm test` (uses node:test — no
  * dependency to install).
  *
  * These are not coverage theatre. Every case below is either a rule a

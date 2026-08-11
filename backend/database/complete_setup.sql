@@ -1,5 +1,5 @@
 -- ============================================
--- FASTBILL COMPLETE DATABASE SETUP
+-- FASTBAHI COMPLETE DATABASE SETUP
 -- Paste this in Supabase SQL Editor and Run
 -- ============================================
 

@@ -1,5 +1,5 @@
 -- ============================================================
--- FastBill — Pilot Production Migration (2026-06-16)
+-- FastBahi — Pilot Production Migration (2026-06-16)
 -- Run this ONCE in Supabase Dashboard → SQL Editor → New query → Run.
 -- Safe + reversible-friendly. Read each section's comment before running.
 -- ============================================================

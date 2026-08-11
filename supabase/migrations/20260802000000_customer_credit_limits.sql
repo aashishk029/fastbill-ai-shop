@@ -1,7 +1,7 @@
 -- ============================================================
 -- Customer credit limits
 --
--- FastBill actively encourages udhari (one toggle on the bill) but never warned
+-- FastBahi actively encourages udhari (one toggle on the bill) but never warned
 -- when a customer was already over-extended — which is the single most common
 -- way a small shop loses money. This adds a per-customer limit and the record
 -- of when a shopkeeper knowingly went past it.

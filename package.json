@@ -1,7 +1,7 @@
 {
-  "name": "fastbill-backend",
+  "name": "fastbahi-backend",
   "version": "0.1.0",
-  "description": "FastBill — AI-powered shop management backend (Bharat Ananta Energy)",
+  "description": "FastBahi — AI-powered shop management backend (Bharat Ananta Energy)",
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",

@@ -141,7 +141,7 @@ function App() {
     return (
       <div className="container">
         <div className="init-screen">
-          <h1>⚡ FastBill</h1>
+          <h1>⚡ FastBahi</h1>
           <p>AI-Powered Shop Management Platform</p>
           {serverWaking && (
             <div style={{background:'#fef3c7', padding:'10px', borderRadius:'8px', marginBottom:'12px', fontSize:'13px', color:'#92400e'}}>
@@ -172,7 +172,7 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>⚡ FastBill</h1>
+        <h1>⚡ FastBahi</h1>
         <p className="shop-owner">{shopData?.name} · {shopData?.owner_name}</p>
       </header>
 
@@ -358,7 +358,7 @@ function InitializeShop({ onSubmit }) {
         </select>
       </div>
       <button type="submit" className="btn-primary" disabled={loading}>
-        {loading ? 'Setting up...' : '🚀 Start FastBill'}
+        {loading ? 'Setting up...' : '🚀 Start FastBahi'}
       </button>
     </form>
   );

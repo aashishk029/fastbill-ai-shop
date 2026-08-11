@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Operations-research methods behind FastBill's advice.
+ * Operations-research methods behind FastBahi's advice.
  *
  * These are the standard, decades-old results from inventory theory and
  * managerial accounting — not heuristics invented here, and emphatically not

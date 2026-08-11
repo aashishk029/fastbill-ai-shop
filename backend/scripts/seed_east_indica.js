@@ -1,4 +1,4 @@
-// Seed the East Indica Tea online store into FastBill:
+// Seed the East Indica Tea online store into FastBahi:
 //   - one shop
 //   - 22 designs (one per website SKU, design_code = EIT_<sku>)
 //   - 22 inventory rows for that shop (initial stock)

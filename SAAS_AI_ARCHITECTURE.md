@@ -1,8 +1,8 @@
-# FastBill — Target Architecture: Multi-Tenant SaaS with AI Decision-Making at the Core
+# FastBahi — Target Architecture: Multi-Tenant SaaS with AI Decision-Making at the Core
 
 **Written 2026-08-01. Design document — nothing here is built yet.**
 
-Goal: FastBill becomes a proper multi-tenant SaaS where **AI and data analytics are the product**, not a feature bolted on. Every subscribing business owner gets decisions — what to restock, who not to give udhari to, what to price, where money is leaking — grounded in their own data, in their own language.
+Goal: FastBahi becomes a proper multi-tenant SaaS where **AI and data analytics are the product**, not a feature bolted on. Every subscribing business owner gets decisions — what to restock, who not to give udhari to, what to price, where money is leaking — grounded in their own data, in their own language.
 
 This document is written against the system as it actually exists (see `AI_HANDOFF.md`, verified 2026-07-29). It is deliberately **incremental**: every phase ships something, and there is no point at which the app must be rewritten.
 
@@ -215,7 +215,7 @@ None of this is glamorous and all of it is required before charging anyone.
 ## 9. Operations
 
 - **A staging environment.** Right now the mobile app points at production and there is nowhere to test a migration. This is the cheapest high-value fix available.
-- **Backups with a tested restore.** An untested backup is not a backup. Free-tier Postgres has no point-in-time recovery; when a shop's whole business is inside FastBill, this becomes a commercial requirement, not a preference.
+- **Backups with a tested restore.** An untested backup is not a backup. Free-tier Postgres has no point-in-time recovery; when a shop's whole business is inside FastBahi, this becomes a commercial requirement, not a preference.
 - **Migrations** — forward-only, reversible where possible, applied through CI rather than by pasting SQL into a dashboard. The current process (a human running SQL by hand) does not survive multiple tenants.
 - **Observability** — error tracking, latency and error-rate alerts, per-tenant health. Today a shop's failure is discovered when the shopkeeper phones.
 - **Cost controls** — the AI bill scales with usage, so per-tenant budgets and caching are architecture, not accounting.
@@ -256,11 +256,11 @@ The architecture that wins here is not the sophisticated one — it is the one a
 
 ## 12. The strategic bet, stated plainly
 
-Billing apps are a commodity in India. Vyapar, Marg, Tally and a dozen others do invoicing well, and FastBill will not out-feature them.
+Billing apps are a commodity in India. Vyapar, Marg, Tally and a dozen others do invoicing well, and FastBahi will not out-feature them.
 
 What none of them do is **tell a shopkeeper what to do next, in their own language, from their own data.** That requires exactly what this architecture is built for: a clean event log, one honest definition of every number, a decision engine that produces rupee-denominated recommendations, an LLM confined to language rather than arithmetic, and — eventually — aggregate intelligence across thousands of shops that no single-shop product can replicate.
 
-The competitive question is not "does FastBill have more features". It is: **when a shopkeeper opens the app in the morning, does it tell them something true and useful that they did not already know?** Everything above exists to make that answer yes, reliably, for a few thousand shops at once.
+The competitive question is not "does FastBahi have more features". It is: **when a shopkeeper opens the app in the morning, does it tell them something true and useful that they did not already know?** Everything above exists to make that answer yes, reliably, for a few thousand shops at once.
 
 ---
 

@@ -1,5 +1,5 @@
 -- ============================================================
--- FastBill — PHASE 2 structural (S2 + S3)
+-- FastBahi — PHASE 2 structural (S2 + S3)
 -- Apply BEFORE paid/multi-shop launch. NOT needed for 1 free pilot.
 -- These touch query code too — do with Claude in one focused session,
 -- then run the full e2e test before deploying.

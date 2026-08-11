@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Money math for FastBill — extracted so it can be tested without a database,
+ * Money math for FastBahi — extracted so it can be tested without a database,
  * a network, or booting the server.
  *
  * Everything a shopkeeper trusts lives here: what a line item costs, how a

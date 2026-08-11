@@ -1,6 +1,6 @@
-# FastBill — Complete AI Handoff Brief
+# FastBahi — Complete AI Handoff Brief
 
-> **Purpose of this file.** Hand this single document to any AI assistant (Claude, GPT, Gemini, a coding agent) with no other context, and it should understand what FastBill is, how every part works, why each design decision was made, what is deliberately unfinished, and what it must not break.
+> **Purpose of this file.** Hand this single document to any AI assistant (Claude, GPT, Gemini, a coding agent) with no other context, and it should understand what FastBahi is, how every part works, why each design decision was made, what is deliberately unfinished, and what it must not break.
 >
 > **Verified against source on 2026-07-29** by reading `backend/server.js` (3,225 lines), the mobile repo, migrations, workflows and live endpoint probes — not from memory. Where this file disagrees with `ARCHITECTURE.md` (last audited 2026-06-18), **this file is newer**.
 >
@@ -8,7 +8,7 @@
 
 ---
 
-## 1. What FastBill is, in one page
+## 1. What FastBahi is, in one page
 
 A billing + shop-management mobile app for small Indian shopkeepers (MSME). Android-first, works offline-ish, 10 Indian languages, GST-compliant invoicing.
 
@@ -16,7 +16,7 @@ A billing + shop-management mobile app for small Indian shopkeepers (MSME). Andr
 - **Jobs it does:** make a bill (GST or plain), track stock, track *udhari* (credit given to customers) and supplier dues, send payment reminders on WhatsApp, log expenses, show GST + income-tax summaries, and answer plain-language business questions.
 - **Owner:** Bharat Advanced Energy (BAE) — solo founder, `aashishk029@gmail.com`. (Older strings may say "Bharat Ananta Energy"; the company was renamed to **Advanced**. "BAE" is unchanged.)
 - **Business stage:** pre-revenue. Everything runs on free tiers on purpose. Currently preparing a **free pilot** with a handful of friendly shopkeepers, then a Play Store release.
-- **Codename in old notes:** "Project Naruto" — same thing as FastBill.
+- **Codename in old notes:** "Project Naruto" — same thing as FastBahi.
 
 ### Domain vocabulary an AI will hit in this codebase
 | Term | Meaning |
@@ -276,12 +276,12 @@ The founder's standing rule: **do not make structural changes without explicit a
 
 **Live and verified:** backend healthy (`{"db":true,"gemini":true}`); every migration through `20260724030000` is applied in Supabase (recurring invoices, staff, ads, bank transactions, expiry and margin columns all respond); both repos clean and pushed.
 
-**Latest build:** `~/Downloads/FastBill-v16-pilot.apk` — 96 MB, `versionCode 16`, EAS preview build `5118a743`, EAS-managed keystore. Contains everything described here, including the new feedback button.
+**Latest build:** `~/Downloads/FastBahi-v16-pilot.apk` — 96 MB, `versionCode 16`, EAS preview build `5118a743`, EAS-managed keystore. Contains everything described here, including the new feedback button.
 
 **Pilot artifacts:**
 - `~/fastbill-sales-kit/PILOT_SETUP.sql` — Part A: idempotent schema catch-up (the `feedback` table + all July columns). Part B: destructive `TRUNCATE` of every shop, commented out by default. Supersedes the older `WIPE_AND_MIGRATE.sql`.
 - `~/fastbill-sales-kit/PILOT_GUIDE_HINDI.md` — shopkeeper handout in Hindi: install (Android APK / iPhone web link), setup, five first-day tasks, how to send feedback, FAQ.
-- Also in that folder: `PLAY_STORE_SUBMISSION.md` (listing copy, Data Safety answers, content rating, screenshot guide), `FINAL_REVIEW_CHECKLIST.md`, `PILOT_RUNBOOK.md`, `FASTBILL_REVIEW.md` (severity-ranked audit), `00_BAE_STRATEGY.md`, offer sheet / outreach / target list, landing page.
+- Also in that folder: `PLAY_STORE_SUBMISSION.md` (listing copy, Data Safety answers, content rating, screenshot guide), `FINAL_REVIEW_CHECKLIST.md`, `PILOT_RUNBOOK.md`, `FASTBAHI_REVIEW.md` (severity-ranked audit), `00_BAE_STRATEGY.md`, offer sheet / outreach / target list, landing page.
 
 **The one open blocker:** Part A of `PILOT_SETUP.sql` has **not** been run in Supabase, so `POST /api/feedback` currently returns `Could not find the table 'public.feedback'`. Everything else in the app works. Only the founder can run it — no Supabase admin credential exists locally; the real key lives only in Render's environment.
 

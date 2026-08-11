@@ -3,7 +3,7 @@
 --
 -- How a kirana shop actually ends its day — count the drawer, compare it with
 -- what the day should have produced, and record the difference while the memory
--- is fresh. Its absence was conspicuous: FastBill could tell a shopkeeper their
+-- is fresh. Its absence was conspicuous: FastBahi could tell a shopkeeper their
 -- sales but not whether the cash in the box matched them.
 --
 -- payment_mode on invoices is a prerequisite, not a bonus. Without knowing which

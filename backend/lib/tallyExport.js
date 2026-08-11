@@ -4,7 +4,7 @@
  * Tally-compatible voucher XML.
  *
  * Every month a shopkeeper's books end up with a CA, and that CA works in
- * Tally. FastBill will not beat Tally at accounting and should not try; giving
+ * Tally. FastBahi will not beat Tally at accounting and should not try; giving
  * it a clean handoff turns the incumbent from a competitor into a channel, and
  * removes the single most common reason a shop would stop using this app.
  *

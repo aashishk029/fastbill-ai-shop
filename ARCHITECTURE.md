@@ -1,4 +1,4 @@
-# FastBill — System Architecture (Mainframe Reference)
+# FastBahi — System Architecture (Mainframe Reference)
 
 > **See `AI_HANDOFF.md` first — it is newer (verified 2026-07-29) and covers the
 > July 2026 features (staff/multi-user, recurring invoices, ad slot, bank
@@ -7,7 +7,7 @@
 >
 > Last full audit: 2026-06-18. Keep this file updated whenever you build/modify.
 
-FastBill = bilingual, GST-compliant billing + shop-management app for Indian
+FastBahi = bilingual, GST-compliant billing + shop-management app for Indian
 MSME shopkeepers (tiles / kirana / electronics / jewellery / restaurant).
 Owner: Bharat Ananta Energy (BAE). Stack is intentionally cheap (all free tiers)
 until revenue.

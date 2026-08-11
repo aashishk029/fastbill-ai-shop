@@ -1182,16 +1182,16 @@ app.post("/api/invoices/generate", writeLimiter, async (req, res) => {
 });
 
 // ============================================
-// ONLINE-STORE WEBHOOK (website / Shopify / IG shop → FastBill)
+// ONLINE-STORE WEBHOOK (website / Shopify / IG shop → FastBahi)
 // ============================================
-// A shop that also sells online posts each PAID order here. FastBill decrements
+// A shop that also sells online posts each PAID order here. FastBahi decrements
 // that shop's inventory and records a bill — so online + counter sales draw down
 // one stock and the owner never oversells or bills twice.
 //
 //   POST /api/webhooks/online-order
 //   header: x-webhook-secret: <ONLINE_ORDER_SECRET>   (server-to-server auth)
 //   body: {
-//     shopId,                       // the FastBill shop this store belongs to
+//     shopId,                       // the FastBahi shop this store belongs to
 //     externalRef,                  // payment id — used as the idempotency key
 //     source?,                      // "web" | "shopify" | ... (invoice number prefix)
 //     showGst?, gstMode?,           // default: non-GST sales record
@@ -2277,7 +2277,7 @@ app.get("/api/cash-sessions/:shopId", async (req, res) => {
 // ============================================
 // DATA EXPORT — the shopkeeper's own data, on demand
 //
-// A business asked to run itself inside FastBill must be able to take everything
+// A business asked to run itself inside FastBahi must be able to take everything
 // back out: for their accountant, for their own records, and as the honest answer
 // to "what happens if you shut down". Nothing here is a favour to the user; a
 // system of record that cannot be exported is a hostage.
@@ -2338,7 +2338,7 @@ app.post("/api/export/:shopId", exportLimiter, async (req, res) => {
 
     res.json({
       exportedAt: new Date().toISOString(),
-      format: "fastbill-export-v1",
+      format: "fastbahi-export-v1",
       shop: gate.shop,
       counts: {
         invoices: rows(invoices).length,
@@ -2357,7 +2357,7 @@ app.post("/api/export/:shopId", exportLimiter, async (req, res) => {
       bankTransactions: rows(bank),
       // Honest about what could not be included, rather than silently omitting it.
       unavailable: skipped,
-      note: "Your data, exported from FastBill. Keep this file safe — it contains customer names and phone numbers.",
+      note: "Your data, exported from FastBahi. Keep this file safe — it contains customer names and phone numbers.",
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -2439,7 +2439,7 @@ app.post("/api/export/:shopId/csv", exportLimiter, async (req, res) => {
 
 // The books, in the shape the shopkeeper's accountant actually works in.
 //
-// FastBill will not beat Tally at accounting and should not try. A clean
+// FastBahi will not beat Tally at accounting and should not try. A clean
 // handoff turns the incumbent from a competitor into a channel — and removes
 // the most common reason a shop would abandon this app at year end.
 //
@@ -3019,7 +3019,7 @@ ${purLines}
     let answer = "AI unavailable";
     if (geminiKey) {
       const geminiBody = {
-        contents: [{ parts: [{ text: `You are BAE — an AI business assistant for an Indian MSME shop using FastBill.
+        contents: [{ parts: [{ text: `You are BAE — an AI business assistant for an Indian MSME shop using FastBahi.
 Answer using ONLY the data below. Be specific with ₹ amounts and names. 2-4 lines max. Hindi/English mix OK.
 
 ${context}
@@ -3204,7 +3204,7 @@ Low stock items (${briefing.lowStockCount}): ${lowStock.map(l => `${l.name} ${l.
 ${decisionFacts.length ? "Computed findings (highest priority first):\n" + decisionFacts.map(f => "- " + f).join("\n") : ""}`.trim();
 
         const body = {
-          contents: [{ parts: [{ text: `You are BAE, an AI business co-pilot for an Indian shopkeeper using FastBill.
+          contents: [{ parts: [{ text: `You are BAE, an AI business co-pilot for an Indian shopkeeper using FastBahi.
 From the FACTS below, write the TOP 3 most important things the owner should do today.
 Rules: use ONLY these numbers (do not invent any). Write the ENTIRE response ONLY in ${langName} language (its native script) — no other language mixed in (keep ₹ amounts and proper names as-is). Each point ONE short line, action-oriented. Number them 1-3. No preamble.
 
@@ -5095,7 +5095,7 @@ app.listen(PORT, () => {
   const dbState = SUPABASE_URL && SUPABASE_KEY ? "configured" : "NOT CONFIGURED";
   const aiState = process.env.GEMINI_API_KEY ? "configured" : "not configured";
   console.log([
-    "FastBill backend",
+    "FastBahi backend",
     `  port:     ${PORT}`,
     `  database: ${dbState}`,
     `  ai:       ${aiState}`,

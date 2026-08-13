@@ -1271,7 +1271,11 @@ app.post("/api/webhooks/online-order", async (req, res) => {
       shopId,
       customerName: customer?.name || "Online order",
       customerPhone: customer?.phone || null,
-      customerAddress: customer?.address || null,
+      // The caller now sends the address in parts, because a courier needs pincode on its
+      // own. An invoice still wants one printable line, so it is composed here rather than
+      // asking the website to send the same address twice in two shapes.
+      customerAddress: [customer?.address, customer?.city, customer?.pincode]
+        .filter(Boolean).join(", ") || null,
       customerGstin: customer?.gstin || null,
       placeOfSupply: customer?.placeOfSupply || null,
       showGst: showGst === true,           // default: plain sales record, no GST split

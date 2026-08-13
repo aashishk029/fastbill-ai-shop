@@ -244,6 +244,33 @@ if (!AUTH_ENFORCE) {
 }
 app.use(auth.makeAuthMiddleware({ supabase, secret: JWT_SECRET, enforce: AUTH_ENFORCE }));
 
+// Keep internal failures internal.
+//
+// Seventy-odd handlers answer their catch block with `error.message`, and when the thrower
+// is Supabase that string is a Postgres error — table names, column names, constraint
+// names, sometimes a fragment of the offending row. It is handed to whoever made the
+// request. Rewriting every handler would be seventy chances to miss one, so the response
+// is filtered at the single point they all pass through.
+//
+// The status code is what separates the two kinds of message. Anything this code raises on
+// purpose carries its own code and a sentence someone meant to write — a 4xx for the
+// shopkeeper ("Stock kam hai", "Ye shop aapki nahi hai"), or a 503 for whoever runs the
+// server ("Recurring cron not configured"). Those go out untouched. Exactly 500 is the
+// catch-all no one chose, so by definition its text was written for a developer: it goes
+// to the log, and the caller gets a plain sentence instead.
+app.use((req, res, next) => {
+  const sendJson = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode === 500 && body && typeof body.error === "string") {
+      console.error(`[500] ${req.method} ${req.originalUrl} — ${body.error}`);
+      return sendJson({ ...body, error: "Kuch galat ho gaya. Thodi der baad try karein." });
+    }
+    return sendJson(body);
+  };
+  next();
+});
+
+
 // Handed to clients at login/init so they can present it on later calls.
 const issueSession = (shopId, staffId = null) =>
   auth.signSession({ shopId, staffId }, JWT_SECRET);

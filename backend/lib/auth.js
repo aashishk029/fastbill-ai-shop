@@ -111,6 +111,9 @@ const PERMISSION_SCOPES = [
   { methods: ["POST"], pattern: /^\/api\/invoices\/[^/]+\/return$/i, permission: "canDelete" },
   { methods: ["POST"], pattern: /^\/api\/purchases\/[^/]+\/return$/i, permission: "canDelete" },
   { methods: ["POST", "PATCH", "DELETE"], pattern: /^\/api\/shops\/[^/]+\/staff(?:\/[^/]+)?$/i, permission: "canManageStaff" },
+  // Minting the webhook credential is owner-level work. A cashier with a staff login must
+  // not be able to hand out something that can draw down the shop's stock.
+  { methods: ["POST"], pattern: /^\/api\/shops\/[^/]+\/webhook-secret$/i, permission: "canManageStaff" },
 ];
 
 function permissionFor(method, path) {
@@ -154,7 +157,7 @@ const SHOP_SCOPED_PATHS = [
   { methods: ["GET"], pattern: /^\/api\/tax\/summary\/([^/]+)$/i },
   { methods: ["GET"], pattern: /^\/api\/reminders\/overdue\/([^/]+)$/i },
   { methods: ["GET"], pattern: /^\/api\/analytics\/projections\/([^/]+)$/i },
-  { methods: ["GET", "PATCH", "POST"], pattern: /^\/api\/shops\/([^/]+)(?:\/staff(?:\/[^/]+)?|\/repair-shared-pricing)?$/i },
+  { methods: ["GET", "PATCH", "POST"], pattern: /^\/api\/shops\/([^/]+)(?:\/staff(?:\/[^/]+)?|\/repair-shared-pricing|\/webhook-secret)?$/i },
   { methods: ["DELETE"], pattern: /^\/api\/shops\/([^/]+)\/staff\/[^/]+$/i },
   { methods: ["GET", "PUT"], pattern: /^\/api\/customers\/([^/]+)(?:\/(?:credit-check|limit|limits|history))?$/i },
   { methods: ["GET"], pattern: /^\/api\/recurring-invoices\/([^/]+)$/i },

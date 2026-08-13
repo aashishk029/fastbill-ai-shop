@@ -1232,18 +1232,49 @@ app.post("/api/invoices/generate", writeLimiter, async (req, res) => {
 // draw down any shop's stock.
 app.post("/api/webhooks/online-order", async (req, res) => {
   try {
-    const secret = process.env.ONLINE_ORDER_SECRET;
-    if (!secret) return res.status(503).json({ error: "Online-order webhook not configured (ONLINE_ORDER_SECRET missing)" });
+    const { shopId, externalRef, source, customer, items, showGst, gstMode } = req.body || {};
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+
+    // Authenticate against THIS shop's secret.
+    //
+    // The check used to be one shared ONLINE_ORDER_SECRET, and shopId was read from the
+    // body afterwards. With a single shop that is adequate; with two it is a cross-tenant
+    // hole, because every shop's website necessarily holds the same secret and could post
+    // an order into any other shop by naming a different shopId. Reading the shop first
+    // and comparing against its own secret makes the secret prove *which* shop is calling.
+    //
+    // Looking the shop up before authenticating lets an unauthenticated caller cause one
+    // indexed primary-key read. That is accepted deliberately: the alternative is no
+    // per-shop secret at all, and this route is left unthrottled on purpose so a genuine
+    // order is never dropped.
+    if (!/^[0-9a-f-]{36}$/i.test(String(shopId))) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const { data: shopRow } = await supabase
+      .from("shops").select("webhook_secret").eq("id", shopId).maybeSingle();
+
+    // Until every shop has its own secret, a shop without one still accepts the shared
+    // value, so a live connector does not break the moment this deploys. Each fallback is
+    // logged by shop, so it is visible which sites still need moving over; once the log is
+    // quiet, ONLINE_ORDER_SECRET can be deleted from the host.
+    const shopSecret = shopRow && shopRow.webhook_secret;
+    const secret = shopSecret || process.env.ONLINE_ORDER_SECRET;
+    if (!secret) {
+      return res.status(503).json({ error: "Online-order webhook not configured for this shop" });
+    }
+    if (!shopSecret) {
+      console.warn(`SECURITY: shop ${shopId} has no webhook_secret and fell back to the shared ONLINE_ORDER_SECRET. Give it its own before onboarding another shop.`);
+    }
+
     const provided = req.get("x-webhook-secret") || "";
-    // Constant-time compare so the secret can't be guessed a byte at a time.
+    // Constant-time compare so the secret can't be guessed a byte at a time. Lengths are
+    // compared first because timingSafeEqual throws on a mismatch.
     const a = Buffer.from(provided);
     const b = Buffer.from(secret);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { shopId, externalRef, source, customer, items, showGst, gstMode } = req.body || {};
-    if (!shopId) return res.status(400).json({ error: "shopId required" });
     if (!externalRef) return res.status(400).json({ error: "externalRef required (payment id)" });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
 
@@ -5151,6 +5182,40 @@ app.post("/api/reminders/mark-sent", writeLimiter, async (req, res) => {
   }
 });
 
+
+// Mint or replace this shop's online-order webhook secret.
+//
+// PIN-gated for the same reason upi_id is: it is a credential, and whoever holds it can
+// draw down the shop's stock and raise invoices in its name. The value is returned exactly
+// once, on creation — it is stored to be compared against, not to be read back, so a
+// leaked session cannot walk up and ask for it later.
+app.post("/api/shops/:shopId/webhook-secret", writeLimiter, async (req, res) => {
+  try {
+    const gate = await verifyShopPin(req.params.shopId, req.body?.pin);
+    if (!gate.ok) {
+      const status = gate.status === 400 ? 401 : gate.status;
+      return res.status(status).json({
+        error: gate.status === 400 ? "Webhook secret badalne ke liye PIN chahiye" : gate.error,
+        pinRequired: true,
+      });
+    }
+
+    const secret = crypto.randomBytes(32).toString("hex");
+    const { error } = await supabase
+      .from("shops").update({ webhook_secret: secret }).eq("id", req.params.shopId);
+    if (error) throw error;
+
+    // Rotating invalidates the old value immediately, so say so plainly — an online store
+    // still holding the previous secret stops syncing the moment this returns.
+    res.json({
+      success: true,
+      secret,
+      note: "Ise apni website ke FASTBILL_WEBHOOK_SECRET me daalein. Purana secret abhi band ho gaya — website update karne tak online order sync nahi honge.",
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ============================================
 // ONLINE ORDERS — fulfilment

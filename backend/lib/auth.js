@@ -87,6 +87,12 @@ const RESOURCE_SCOPES = [
   // designs has no shop_id at all — a design reaches a shop through the inventory row that
   // stocks it, so that join is what proves ownership here.
   { method: "PATCH", pattern: /^\/api\/designs\/([^/]+)\/unit$/i, table: "inventory", column: "design_id" },
+  // Online orders addressed by their own id. GET /api/orders/:shopId is the list and is
+  // shop-scoped instead — the single-segment shapes are kept apart deliberately.
+  { method: "GET", pattern: /^\/api\/orders\/detail\/([^/]+)$/i, table: "online_orders" },
+  { method: "GET", pattern: /^\/api\/orders\/([^/]+)\/track$/i, table: "online_orders" },
+  { method: "POST", pattern: /^\/api\/orders\/([^/]+)\/ship$/i, table: "online_orders" },
+  { method: "PATCH", pattern: /^\/api\/orders\/([^/]+)\/status$/i, table: "online_orders" },
 ];
 
 // Actions a staff member needs explicit permission for. The mobile app already hides these
@@ -158,6 +164,7 @@ const SHOP_SCOPED_PATHS = [
   { methods: ["POST"], pattern: /^\/api\/export\/([^/]+)(?:\/(?:csv|tally))?$/i },
   { methods: ["GET"], pattern: /^\/api\/bank-transactions\/([^/]+)(?:\/suggestions)?$/i },
   { methods: ["GET"], pattern: /^\/api\/credit-notes\/([^/]+)(?:\/[^/]+)?$/i },
+  { methods: ["GET"], pattern: /^\/api\/orders\/([^/]+)$/i },
 ];
 
 function shopIdFromPath(method, path) {

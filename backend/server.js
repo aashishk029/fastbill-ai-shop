@@ -8,6 +8,7 @@ require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { createWorker } = require("tesseract.js");
 const auth = require("./lib/auth");
+const shipping = require("./lib/shipping");
 
 // Rate limiter. This is a required dependency, not an optional one: it is the only thing
 // standing between a 4-6 digit PIN and an offline-speed brute force. It used to be wrapped
@@ -1280,6 +1281,40 @@ app.post("/api/webhooks/online-order", async (req, res) => {
       paymentMode: "upi",                  // online payment gateway
       invoiceNumber,                       // idempotency key = source + payment id
     });
+    // Record the order alongside the invoice.
+    //
+    // The invoice says what was sold; it has no field for where the parcel goes and no
+    // state that changes after it is raised. Until this existed, a paid website order was
+    // billed and then invisible — nothing could answer which orders still needed packing,
+    // and the delivery address was discarded on arrival. Upserting on (shop_id,
+    // external_ref) keeps the webhook safe to retry: the same payment can arrive twice and
+    // still be one order.
+    //
+    // A failure here must not fail the webhook. The money is taken and the stock is already
+    // decremented, so refusing now would make the caller retry a billing operation to fix a
+    // bookkeeping row. It is logged instead, and the daily reconcile sweep replays it.
+    try {
+      const addr = customer || {};
+      await supabase.from("online_orders").upsert({
+        shop_id: shopId,
+        external_ref: externalRef,
+        source: source || "web",
+        invoice_id: result?.invoice?.id || null,
+        customer_name: addr.name || "Online order",
+        customer_phone: addr.phone || null,
+        customer_email: addr.email || null,
+        address_line: addr.address || null,
+        city: addr.city || null,
+        state: addr.state || null,
+        pincode: addr.pincode || null,
+        amount: result?.invoice?.gross_amount ?? null,
+        items,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "shop_id,external_ref", ignoreDuplicates: false });
+    } catch (e) {
+      console.error(`[online-order] billed ${externalRef} but could not record the order — ${e.message}`);
+    }
+
     res.json(result);
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message });
@@ -5109,6 +5144,164 @@ app.post("/api/reminders/mark-sent", writeLimiter, async (req, res) => {
     res.json({ success: true, count: invoiceIds.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+
+// ============================================
+// ONLINE ORDERS — fulfilment
+// ============================================
+// The invoice answers "what was sold". These answer "has it gone out yet", which is the
+// question a shop actually opens the app to ask each morning.
+
+// The shop's order list, newest first. Defaults to what still needs work, because a list
+// that opens on three hundred delivered parcels hides the four that do not.
+app.get("/api/orders/:shopId", async (req, res) => {
+  try {
+    const { status, limit } = req.query;
+    let q = supabase
+      .from("online_orders")
+      .select("*")
+      .eq("shop_id", req.params.shopId)
+      .order("created_at", { ascending: false })
+      .limit(Math.min(parseInt(limit, 10) || 100, 500));
+
+    if (status === "pending") q = q.in("status", ["paid", "packed"]);
+    else if (status) q = q.eq("status", status);
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    const orders = data || [];
+    res.json({
+      orders,
+      counts: orders.reduce((acc, o) => ({ ...acc, [o.status]: (acc[o.status] || 0) + 1 }), {}),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/orders/detail/:id", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("online_orders").select("*").eq("id", req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Order nahi mila" });
+    res.json({ order: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Book the courier.
+//
+// The address is checked before the carrier is called so a shopkeeper who is missing a
+// pincode is told that, rather than an opaque rejection arriving after they have committed.
+// Booking twice is refused rather than made idempotent: a second call would strand the
+// first AWB, and a parcel already handed over cannot be un-handed.
+app.post("/api/orders/:id/ship", writeLimiter, async (req, res) => {
+  try {
+    const { data: order, error } = await supabase
+      .from("online_orders").select("*").eq("id", req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!order) return res.status(404).json({ error: "Order nahi mila" });
+    if (order.awb) {
+      return res.status(409).json({
+        error: `Is order ka courier pehle se book hai (AWB ${order.awb})`,
+        awb: order.awb,
+      });
+    }
+    if (!shipping.canTransition(order.status, "packed") && order.status !== "packed") {
+      return res.status(409).json({ error: `"${order.status}" order ka courier book nahi ho sakta` });
+    }
+
+    const problems = shipping.validateAddress(order);
+    if (problems.length) return res.status(400).json({ error: problems.join(", ") });
+
+    const adapter = shipping.getAdapter();
+    const shipment = await adapter.createShipment(order);
+
+    const now = new Date().toISOString();
+    const { data: updated, error: upErr } = await supabase
+      .from("online_orders")
+      .update({
+        status: "packed",
+        courier_provider: adapter.name,
+        shipment_ref: shipment.shipmentRef || null,
+        awb: shipment.awb || null,
+        label_url: shipment.labelUrl || null,
+        tracking_url: shipment.trackingUrl || null,
+        packed_at: now,
+        updated_at: now,
+      })
+      .eq("id", order.id)
+      .select()
+      .single();
+    if (upErr) throw upErr;
+
+    // Say plainly when nothing was really booked, so a mock AWB is never mistaken for a
+    // parcel that a courier has actually accepted.
+    res.json({ success: true, order: updated, mock: !!shipment.mock });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Move an order along by hand — packed once the box is taped, shipped when the courier
+// takes it, delivered when the customer confirms. Only legal moves are accepted.
+app.patch("/api/orders/:id/status", writeLimiter, async (req, res) => {
+  try {
+    const { status } = req.body || {};
+    const { data: order, error } = await supabase
+      .from("online_orders").select("*").eq("id", req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!order) return res.status(404).json({ error: "Order nahi mila" });
+
+    if (!shipping.canTransition(order.status, status)) {
+      return res.status(409).json({
+        error: `"${order.status}" se "${status}" nahi ho sakta`,
+        allowed: shipping.ALLOWED_TRANSITIONS[order.status] || [],
+      });
+    }
+
+    const now = new Date().toISOString();
+    const stamp = { packed: "packed_at", shipped: "shipped_at", delivered: "delivered_at", cancelled: "cancelled_at" }[status];
+    const { data: updated, error: upErr } = await supabase
+      .from("online_orders")
+      .update({ status, ...(stamp ? { [stamp]: now } : {}), updated_at: now })
+      .eq("id", order.id)
+      .select()
+      .single();
+    if (upErr) throw upErr;
+    res.json({ success: true, order: updated });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// Ask the carrier where the parcel is. Only writes back when the carrier reports a state we
+// are allowed to move to, so a confused carrier response cannot rewind an order.
+app.get("/api/orders/:id/track", async (req, res) => {
+  try {
+    const { data: order, error } = await supabase
+      .from("online_orders").select("*").eq("id", req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!order) return res.status(404).json({ error: "Order nahi mila" });
+    if (!order.awb) return res.status(400).json({ error: "Abhi courier book nahi hua" });
+
+    const adapter = shipping.getAdapter();
+    const result = await adapter.track(order);
+
+    if (result.status && shipping.canTransition(order.status, result.status)) {
+      const stamp = { shipped: "shipped_at", delivered: "delivered_at" }[result.status];
+      await supabase.from("online_orders")
+        .update({ status: result.status, ...(stamp ? { [stamp]: new Date().toISOString() } : {}), updated_at: new Date().toISOString() })
+        .eq("id", order.id);
+    }
+    res.json({ awb: order.awb, provider: order.courier_provider, ...result });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 

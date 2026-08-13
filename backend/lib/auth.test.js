@@ -402,3 +402,33 @@ test("only the revoked-access refusal tells the client to sign out", async () =>
   const c = await runMiddleware(wrongShop, req({ path: `/api/shops/${OTHER}`, headers: authed(SHOP) }));
   assert.equal(c.body.accessRevoked, undefined);
 });
+
+// --- online orders ------------------------------------------------------------------------
+
+test("the order list is shop-scoped, the single-order routes are record-scoped", () => {
+  // Both shapes are one segment after /orders, so they are kept apart deliberately:
+  // GET /api/orders/<shopId> lists, GET /api/orders/<id>/track addresses one record.
+  assert.equal(shopIdFromPath("GET", `/api/orders/${SHOP}`), SHOP);
+  assert.equal(resourceScopeFor("GET", `/api/orders/${SHOP}`), null);
+  assert.equal(shopIdFromPath("GET", "/api/orders/detail/o1"), null);
+  assert.deepEqual(resourceScopeFor("GET", "/api/orders/detail/o1"), { table: "online_orders", column: "id", id: "o1" });
+});
+
+test("booking a courier on another shop's order is refused", async () => {
+  // The lookup finds nothing for this session's shop, so the order is treated as absent.
+  const mw = makeAuthMiddleware({ supabase: stubDb(null), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "POST", path: "/api/orders/o1/ship", headers: authed(SHOP) }));
+  assert.equal(out.status, 404);
+});
+
+test("a shop reaches its own order", async () => {
+  const mw = makeAuthMiddleware({ supabase: stubDb({ shop_id: SHOP }), secret: SECRET });
+  const out = await runMiddleware(mw, req({ method: "POST", path: "/api/orders/o1/ship", headers: authed(SHOP) }));
+  assert.equal(out.passed, true);
+});
+
+test("one shop cannot list another shop's orders", async () => {
+  const mw = makeAuthMiddleware({ supabase: stubDb(null), secret: SECRET });
+  const out = await runMiddleware(mw, req({ path: `/api/orders/${OTHER}`, headers: authed(SHOP) }));
+  assert.equal(out.status, 403);
+});

@@ -220,6 +220,29 @@ const KANHAIYA_MARBLES = {
   lowStockThreshold: 30,
 };
 
+// Strip every credential from a shop row before it leaves the server.
+//
+// The row is fetched with select("*") in several places and each one used to remove
+// pin_hash by destructuring — which worked until columns were added that are also secrets.
+// webhook_secret lets the holder post orders into the shop and draw down its stock;
+// shipping_config holds the courier account's credentials. Both were being returned to any
+// authenticated caller, which defeats the reason the webhook secret is write-only in the
+// first place: a stolen session could read it and keep using it after the session was
+// revoked.
+//
+// One function, so a future secret column is removed everywhere by adding it here rather
+// than by finding six destructurings.
+const SHOP_SECRET_COLUMNS = ["pin_hash", "webhook_secret", "shipping_config"];
+function publicShop(shop) {
+  if (!shop || typeof shop !== "object") return shop;
+  const safe = { ...shop };
+  for (const col of SHOP_SECRET_COLUMNS) delete safe[col];
+  // Whether a webhook secret exists is useful to the app (it can offer "generate one");
+  // the value is not.
+  safe.hasWebhookSecret = !!shop.webhook_secret;
+  return safe;
+}
+
 // ============================================
 // SESSION AUTH
 // ============================================
@@ -367,7 +390,7 @@ app.post("/api/shops/init", writeLimiter, async (req, res) => {
 
     if (error) throw error;
 
-    const { pin_hash: _hash, ...safeShop } = shop[0];
+    const safeShop = publicShop(shop[0]);
     // Signing up logs you in — without a token here the app would have to bounce the
     // freshly chosen PIN through /login before it could load anything.
     res.json({ message: "✓ Shop initialized", token: issueSession(shop[0].id), shop: safeShop });
@@ -394,7 +417,7 @@ app.get("/api/shops/:shopId", async (req, res) => {
     if (!data) return res.status(404).json({ error: "Shop nahi mila" });
 
     // Never expose the password hash to clients.
-    const { pin_hash, ...safe } = data;
+    const safe = publicShop(data);
     res.json(safe);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -444,7 +467,7 @@ app.patch("/api/shops/:shopId", writeLimiter, async (req, res) => {
       .select()
       .single();
     if (error) throw error;
-    const { pin_hash, ...safe } = data;
+    const safe = publicShop(data);
     res.json({ success: true, shop: safe });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -481,7 +504,7 @@ app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) =>
       const { data: parentShop, error: shopErr } = await supabase
         .from("shops").select("*").eq("id", staffRow.shop_id).single();
       if (shopErr || !parentShop) return res.status(404).json({ error: "Shop nahi mila" });
-      const { pin_hash, ...safeShop } = parentShop;
+      const safeShop = publicShop(parentShop);
       return res.json({
         found: true,
         token: issueSession(parentShop.id, staffRow.id),
@@ -512,7 +535,7 @@ app.post("/api/shops/login", authLimiter, loginPhoneLimiter, async (req, res) =>
         ok = await bcrypt.compare(String(pin), shop.pin_hash);
       }
       if (ok) {
-        const { pin_hash, ...safe } = shop;
+        const safe = publicShop(shop);
         matched.push(safe);
       }
     }
@@ -2497,7 +2520,7 @@ async function verifyShopPin(shopId, pin) {
   const match = await bcrypt.compare(String(pin), shop.pin_hash);
   if (!match) return { ok: false, status: 401, error: "Galat PIN" };
 
-  const { pin_hash, ...safeShop } = shop;
+  const safeShop = publicShop(shop);
   return { ok: true, shop: safeShop };
 }
 

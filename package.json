@@ -1,7 +1,7 @@
 {
   "name": "fastbahi-backend",
   "version": "0.1.0",
-  "description": "FastBahi — AI-powered shop management backend (Bharat Ananta Energy)",
+  "description": "FastBahi \u2014 AI-powered shop management backend (Bharat Ananta Energy)",
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",
@@ -9,7 +9,8 @@
     "client": "cd frontend && npm start",
     "build": "cd frontend && npm run build",
     "test": "node --test backend/**/*.test.js",
-    "check": "node --check backend/server.js && npm test"
+    "check": "node --check backend/server.js && npm test && npm run redteam",
+    "redteam": "node redteam.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.38.0",

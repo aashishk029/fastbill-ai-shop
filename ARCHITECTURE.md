@@ -399,3 +399,31 @@ so East Indica's prepaid-only checkout is protection, not a gap. And if money ev
 through the platform's own account and is disbursed to shops, that is **payment aggregation
 and needs an RBI PA licence (₹15 crore net worth)**. Each shop connecting its own Razorpay
 avoids this entirely.
+
+---
+
+## 15. Adversarial testing (`redteam.js`)
+
+`npm run redteam` boots the real server against an in-memory database and attacks it.
+41 cases across eight categories: authentication, IDOR, server-to-server secrets, mass
+assignment, prototype pollution, business logic, denial of service, information disclosure.
+**It exits non-zero if anything gets through**, so a protection quietly removed later fails
+here rather than passing a review. `npm run check` = syntax + unit tests + red team.
+
+It is not a checklist. Every case is a request that either gets in or does not — a forged
+`alg:none` token, an expired one, a shop id smuggled through the body, a `__proto__` key,
+a staff member without `canEditPrice` billing at their own price, a 3 MB body, twenty-five
+PIN guesses.
+
+**It found a live issue on its first run.** `GET /api/shops/:shopId` returned
+`webhook_secret` and `shipping_config`. Each call site fetched the row with `select("*")`
+and removed `pin_hash` by destructuring, which was correct when `pin_hash` was the only
+secret and silently wrong the moment secret columns were added. That defeated the reason
+the webhook secret is write-only: a stolen session could read it and keep posting orders
+after the session was revoked, and `shipping_config` carries the courier account's
+credentials.
+
+Fixed with one `publicShop()` helper listing the secret columns, so a future secret column
+is removed everywhere by adding it to that list rather than by finding six destructurings.
+The response keeps a `hasWebhookSecret` boolean, because whether one exists is useful to
+the app and the value is not.

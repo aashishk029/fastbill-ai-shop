@@ -85,23 +85,34 @@ function registerAdapter(adapter) {
   return adapter;
 }
 
-// Which carrier to use. SHIPPING_PROVIDER names it; unset means the mock, so a fresh
-// deployment books nothing real by accident. An adapter that is named but missing its
-// credentials is an error rather than a silent fall back to the mock — falling back would
-// hand the shop a fake AWB while it believed it had a real one.
-function getAdapter(env = process.env) {
-  const wanted = (env.SHIPPING_PROVIDER || "mock").trim();
+// Which carrier to use, for THIS shop.
+//
+// A courier account is a shop's own commercial relationship — its rates, its pickup
+// address, its liability — so it cannot be shared between shops any more than a bank
+// account can. The shop's own row decides, and its shipping_config supplies whatever that
+// adapter needs. The process environment is only a fallback for a single-shop deployment
+// that has not filled the columns in yet.
+//
+// A shop with nothing set gets the mock, which announces itself, rather than silently
+// booking against whatever account happened to be configured platform-wide. An adapter
+// that is named but missing its credentials is an error rather than a fall back to the
+// mock — falling back would hand the shop a fake AWB while it believed it had a real one.
+function getAdapter(shop = null, env = process.env) {
+  const wanted = String((shop && shop.shipping_provider) || env.SHIPPING_PROVIDER || "mock").trim();
   const adapter = adapters.get(wanted);
   if (!adapter) {
-    throw Object.assign(new Error(`Unknown SHIPPING_PROVIDER "${wanted}"`), { status: 503 });
+    throw Object.assign(new Error(`Unknown shipping provider "${wanted}"`), { status: 503 });
   }
-  if (!adapter.isConfigured(env)) {
+  // The adapter is handed the shop's own config first, with the environment behind it, so
+  // a per-shop token wins over a platform-wide one.
+  const config = { ...env, ...((shop && shop.shipping_config) || {}) };
+  if (!adapter.isConfigured(config)) {
     throw Object.assign(
-      new Error(`${adapter.name} ke credentials set nahi hain`),
+      new Error(`${adapter.name} ke credentials is shop ke liye set nahi hain`),
       { status: 503 }
     );
   }
-  return adapter;
+  return { adapter, config };
 }
 
 module.exports = {

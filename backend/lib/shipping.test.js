@@ -98,25 +98,59 @@ test("the mock refuses an address a real carrier would refuse", async () => {
 
 // --- choosing the carrier ----------------------------------------------------------------
 
-test("with nothing configured, the mock is what you get", () => {
-  assert.equal(getAdapter({}).name, "mock");
+test("a shop with nothing configured gets the mock", () => {
+  // Not whatever account happened to be set platform-wide — the mock announces itself.
+  assert.equal(getAdapter(null, {}).adapter.name, "mock");
+  assert.equal(getAdapter({ shipping_provider: null }, {}).adapter.name, "mock");
 });
 
 test("a named carrier that is not installed is an error, not a fallback", () => {
-  assert.throws(() => getAdapter({ SHIPPING_PROVIDER: "shiprocket" }), (e) => e.status === 503);
+  assert.throws(() => getAdapter({ shipping_provider: "shiprocket" }, {}), (e) => e.status === 503);
 });
 
 test("a carrier missing its credentials is an error, not a silent downgrade to mock", () => {
   // Falling back would hand the shop a fake AWB while it believed the parcel was booked.
   registerAdapter({
     name: "halfwired",
-    isConfigured: (env) => !!(env && env.HALFWIRED_TOKEN),
+    isConfigured: (cfg) => !!(cfg && cfg.HALFWIRED_TOKEN),
     createShipment: async () => ({}),
     track: async () => ({}),
   });
   assert.throws(
-    () => getAdapter({ SHIPPING_PROVIDER: "halfwired" }),
+    () => getAdapter({ shipping_provider: "halfwired" }, {}),
     (e) => e.status === 503 && /credentials/.test(e.message)
   );
-  assert.equal(getAdapter({ SHIPPING_PROVIDER: "halfwired", HALFWIRED_TOKEN: "x" }).name, "halfwired");
+  assert.equal(
+    getAdapter({ shipping_provider: "halfwired", shipping_config: { HALFWIRED_TOKEN: "x" } }, {}).adapter.name,
+    "halfwired"
+  );
+});
+
+// --- one shop's courier account is not another's ------------------------------------------
+
+test("each shop books through its own carrier", () => {
+  registerAdapter({ name: "carrierA", isConfigured: () => true, createShipment: async () => ({}), track: async () => ({}) });
+  registerAdapter({ name: "carrierB", isConfigured: () => true, createShipment: async () => ({}), track: async () => ({}) });
+  assert.equal(getAdapter({ shipping_provider: "carrierA" }, {}).adapter.name, "carrierA");
+  assert.equal(getAdapter({ shipping_provider: "carrierB" }, {}).adapter.name, "carrierB");
+});
+
+test("a shop's own credentials beat a platform-wide one", () => {
+  // Otherwise a leftover platform token would quietly book on the wrong account.
+  const { config } = getAdapter(
+    { shipping_provider: "halfwired", shipping_config: { HALFWIRED_TOKEN: "shop-token" } },
+    { HALFWIRED_TOKEN: "platform-token" }
+  );
+  assert.equal(config.HALFWIRED_TOKEN, "shop-token");
+});
+
+test("one shop's credentials never leak into another's booking", () => {
+  const a = getAdapter({ shipping_provider: "halfwired", shipping_config: { HALFWIRED_TOKEN: "A" } }, {});
+  const b = getAdapter({ shipping_provider: "halfwired", shipping_config: { HALFWIRED_TOKEN: "B" } }, {});
+  assert.equal(a.config.HALFWIRED_TOKEN, "A");
+  assert.equal(b.config.HALFWIRED_TOKEN, "B");
+});
+
+test("the environment still works for a single-shop deployment that has not filled the columns", () => {
+  assert.equal(getAdapter(null, { SHIPPING_PROVIDER: "carrierA" }).adapter.name, "carrierA");
 });

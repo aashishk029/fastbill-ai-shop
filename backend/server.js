@@ -5288,8 +5288,11 @@ app.post("/api/orders/:id/ship", writeLimiter, async (req, res) => {
     const problems = shipping.validateAddress(order);
     if (problems.length) return res.status(400).json({ error: problems.join(", ") });
 
-    const adapter = shipping.getAdapter();
-    const shipment = await adapter.createShipment(order);
+    // The shop's own courier account, not a platform-wide one.
+    const { data: shopRow } = await supabase
+      .from("shops").select("shipping_provider, shipping_config").eq("id", order.shop_id).maybeSingle();
+    const { adapter, config } = shipping.getAdapter(shopRow);
+    const shipment = await adapter.createShipment(order, config);
 
     const now = new Date().toISOString();
     const { data: updated, error: upErr } = await supabase
@@ -5359,8 +5362,10 @@ app.get("/api/orders/:id/track", async (req, res) => {
     if (!order) return res.status(404).json({ error: "Order nahi mila" });
     if (!order.awb) return res.status(400).json({ error: "Abhi courier book nahi hua" });
 
-    const adapter = shipping.getAdapter();
-    const result = await adapter.track(order);
+    const { data: shopRow } = await supabase
+      .from("shops").select("shipping_provider, shipping_config").eq("id", order.shop_id).maybeSingle();
+    const { adapter, config } = shipping.getAdapter(shopRow);
+    const result = await adapter.track(order, config);
 
     if (result.status && shipping.canTransition(order.status, result.status)) {
       const stamp = { shipped: "shipped_at", delivered: "delivered_at" }[result.status];

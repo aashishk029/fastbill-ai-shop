@@ -355,6 +355,12 @@ app.post("/api/shops/init", writeLimiter, async (req, res) => {
         pan_number: pan?.toUpperCase() || null,
         upi_id: upiId || null,
         shop_id_display: shopIdDisplay,
+        // Every shop gets its own webhook secret at birth. The migration backfilled the
+        // shops that already existed; without this a shop registered afterwards would have
+        // none and would fall back to the shared ONLINE_ORDER_SECRET — which is exactly
+        // the cross-tenant hole that per-shop secrets exist to close, quietly reopened for
+        // each new arrival. It also means the shared value can now be deleted outright.
+        webhook_secret: crypto.randomBytes(32).toString("hex"),
       }])
       .select();
 

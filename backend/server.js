@@ -687,6 +687,7 @@ const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbo
 const { resolveSupply, splitTaxComponents, stateCodeFromGstin, stateName } = require("./lib/gstPlace");
 const { financialYear, creditNoteNumber, computeCreditNote, gstAdjustmentAllowed } = require("./lib/creditNote");
 const ops = require("./lib/opsResearch");
+const advice = require("./lib/advice");
 const { supplierKey, debitNoteNumber, computeDebitNote } = require("./lib/debitNote");
 
 // Whether migration 20260804000000 has been applied. PostgREST errors on an
@@ -1919,13 +1920,13 @@ async function computeDecisions(shopId, query = {}) {
     const leadTime = Math.max(1, parseFloat(req.query.leadTimeDays) || ASSUMED_LEAD_TIME_DAYS);
     const serviceLevel = Math.min(0.995, Math.max(0.5, parseFloat(req.query.serviceLevel) || 0.95));
 
-    const [salesRes, invRes, purchRes, bakayaInvRes, expRes] = await Promise.allSettled([
+    const [salesRes, invRes, purchRes, bakayaInvRes, expRes, onlineRes, cashRes] = await Promise.allSettled([
       supabase.from("invoices")
         .select("id, created_at, payment_status, invoice_items(design_id, quantity_boxes, price_per_box)")
         .eq("shop_id", shopId).gte("created_at", since)
         .not("payment_status", "in", '("cancelled","returned")').limit(3000),
       supabase.from("inventory")
-        .select("design_id, quantity_boxes, expiry_date, last_cost_price, designs(design_code, design_name, unit_type)")
+        .select("design_id, quantity_boxes, expiry_date, last_cost_price, designs(design_code, design_name, unit_type, tile_categories(base_price_per_box))")
         .eq("shop_id", shopId),
       // All purchases, not just the window: stock bought eight months ago still
       // has a cost, and without it the money-stuck-on-the-shelf finding — the
@@ -1936,9 +1937,29 @@ async function computeDecisions(shopId, query = {}) {
         .select(`created_at, amount_paid, taxable_value, cgst_amount, sgst_amount${igstCol()}, payment_status, invoice_items(quantity_boxes, price_per_box)`)
         .eq("shop_id", shopId).in("payment_status", ["credit", "partial"]).limit(2000),
       supabase.from("expenses").select("amount, expense_date").eq("shop_id", shopId).gte("expense_date", since),
+      // Online orders draw down the same shelf as a counter sale. Leaving them out
+      // understated demand on exactly the products that are growing.
+      supabase.from("online_orders").select("status, created_at, items")
+        .eq("shop_id", shopId).gte("created_at", since).limit(2000),
+      // What is actually in the drawer, so restock advice can be limited to what the shop
+      // can pay for.
+      supabase.from("cash_sessions").select("opening_cash, cash_sales, cash_collections, cash_expenses, cash_payouts")
+        .eq("shop_id", shopId).is("closed_at", null).order("opened_at", { ascending: false }).limit(1),
     ]);
 
     const rows = (r) => (r.status === "fulfilled" && !r.value.error ? r.value.data || [] : []);
+    const onlineOrders = rows(onlineRes);
+    const cashRow = rows(cashRes)[0] || null;
+    // Cash on hand from the open session. Null when no session is open — and null must mean
+    // "unknown", never "zero", or every restock would be reported as unaffordable.
+    const cashOnHand = cashRow
+      ? expectedCash({
+          openingCash: cashRow.opening_cash, cashSales: cashRow.cash_sales,
+          cashCollections: cashRow.cash_collections, cashExpenses: cashRow.cash_expenses,
+          cashPayouts: cashRow.cash_payouts,
+        })
+      : null;
+    const onlineDaily = advice.onlineDemandBySku(onlineOrders, { days: windowDays });
     const sales = rows(salesRes);
     const inventory = rows(invRes);
     const purchases = rows(purchRes);
@@ -2015,12 +2036,25 @@ async function computeDecisions(shopId, query = {}) {
         const runway = ops.stockRunway({ onHand, avgDailyDemand: avgDaily, avgLeadTimeDays: leadTime });
 
         if (onHand <= rop.reorderPoint) {
-          // Order enough to cover the lead time plus a cycle, less what is left.
-          const suggested = Math.max(0, Math.ceil(rop.reorderPoint + avgDaily * leadTime - onHand));
+          // How much, from EOQ, rather than "cover the lead time plus a cycle". The old rule
+          // ignored what an order costs to place and what the stock costs to hold, which is
+          // exactly the trade-off EOQ exists to settle. It falls back to the old rule when
+          // there is no cost on file, since EOQ needs one.
+          const order = advice.orderQuantity({
+            dailyDemand: avgDaily,
+            unitCost: cost,
+            reorderPoint: rop.reorderPoint,
+            onHand,
+          });
+          const suggested = order
+            ? order.quantity
+            : Math.max(0, Math.ceil(rop.reorderPoint + avgDaily * leadTime - onHand));
           recommendations.push({
             type: "restock",
             priority: runway.urgent ? "high" : "medium",
             designId: d,
+            daysLeft: runway.daysLeft,
+            estimatedCost: order ? order.estimatedCost : Math.round(suggested * (cost || 0)),
             title: `Order ${suggested} ${unit} of ${name}`,
             because: {
               onHand: Math.round(onHand * 100) / 100,
@@ -2202,7 +2236,52 @@ async function computeDecisions(shopId, query = {}) {
         },
         note: "Class A items carry most of the value and deserve the tightest stock control.",
       },
-      methodology: "Reorder point with safety stock, ABC/Pareto, inventory turnover and DSO — computed from this shop's own sales history. No figure on this page is generated by a language model.",
+      // What the restock list costs, and how much of it the drawer can actually cover.
+      // Advice that cannot be paid for is not advice: telling a shop to buy forty thousand
+      // rupees of stock when eight thousand are in the drawer is confidently useless, and
+      // it teaches the shopkeeper to stop reading. Absent when no cash session is open —
+      // unknown must not be reported as zero, or everything would look unaffordable.
+      affordability: cashOnHand === null ? null : (() => {
+        const r = advice.affordableRestocks(
+          recommendations.filter((x) => x.type === "restock"), cashOnHand);
+        return {
+          cashOnHand: r.cashAvailable,
+          canBuyNow: r.affordable.length,
+          costOfThose: r.totalCost,
+          cannotAffordYet: r.deferred.length,
+          shortBy: r.shortBy,
+          buyFirst: r.affordable.slice(0, 5).map((x) => x.title),
+          note: r.shortBy > 0
+            ? "Ye stock khatam ho raha hai par abhi paisa nahi hai — supplier se udhaar ki baat karne ka waqt."
+            : "Poori restock list abhi ke cash se ho jayegi.",
+        };
+      })(),
+
+      // Products that are losing money or nearly so. This hides inside a healthy revenue
+      // line: the shop is busy and still going backwards.
+      margins: (() => {
+        const leaks = advice.marginLeaks(
+          inventory.map((i) => ({
+            sku: i.designs?.design_code || i.design_id,
+            name: i.designs?.design_name || "",
+            price: parseFloat(i.designs?.tile_categories?.base_price_per_box) || 0,
+            cost: parseFloat(i.last_cost_price) || 0,
+            unitsSold: perDesign[i.design_id]?.units || 0,
+          }))
+        );
+        return {
+          losing: leaks.filter((l) => l.severity === "loss").slice(0, 10),
+          thin: leaks.filter((l) => l.severity === "thin").slice(0, 10),
+          note: "Margin price par gina gaya hai (p−c)/p, cost par markup nahi — markup har sauda accha dikhata hai.",
+        };
+      })(),
+
+      // Demand that arrived through the website, folded into the same shelf.
+      onlineDemand: Object.keys(onlineDaily).length
+        ? { windowDays, perSku: onlineDaily }
+        : null,
+
+      methodology: "Reorder point with safety stock, EOQ order sizing, ABC/Pareto, inventory turnover, DSO and gross margin — computed from this shop's own sales history, its own costs and the cash actually in its drawer. Sources are classical operations research (Harris/Wilson EOQ; reorder point with variable demand and lead time) and standard managerial accounting, cited in backend/lib/opsResearch.js and backend/lib/advice.js. No figure on this page is generated by a language model.",
     };
   }
 }

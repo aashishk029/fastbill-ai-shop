@@ -9,6 +9,7 @@ const { createClient } = require("@supabase/supabase-js");
 const { createWorker } = require("tesseract.js");
 const auth = require("./lib/auth");
 const shipping = require("./lib/shipping");
+const { stateFromPincode } = require("./lib/pincodeState");
 
 // Rate limiter. This is a required dependency, not an optional one: it is the only thing
 // standing between a 4-6 digit PIN and an offline-speed brute force. It used to be wrapped
@@ -1314,7 +1315,16 @@ app.post("/api/webhooks/online-order", async (req, res) => {
       customerAddress: [customer?.address, customer?.city, customer?.pincode]
         .filter(Boolean).join(", ") || null,
       customerGstin: customer?.gstin || null,
-      placeOfSupply: customer?.placeOfSupply || null,
+      // Place of supply for a shipped order is where the goods come to rest, not where the
+      // shop stands (CGST Act s.10(1)(a)). Without this every inter-state parcel was billed
+      // CGST+SGST at the seller's own state: the total collected was right, but the heads
+      // were wrong, so the buyer could not take credit and GSTR-1 would not reconcile.
+      // An unresolvable pincode yields null and the existing counter-sale default stands —
+      // a wrong state on a tax invoice is worse than a conservative one.
+      placeOfSupply:
+        customer?.placeOfSupply
+        || stateFromPincode(customer?.pincode)?.stateCode
+        || null,
       showGst: showGst === true,           // default: plain sales record, no GST split
       gstMode: gstMode || "included",
       items: coreItems,

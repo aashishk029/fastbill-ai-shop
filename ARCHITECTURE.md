@@ -1,11 +1,15 @@
 # FastBahi — System Architecture (Mainframe Reference)
 
-> **See `AI_HANDOFF.md` first — it is newer (verified 2026-07-29) and covers the
-> July 2026 features (staff/multi-user, recurring invoices, ad slot, bank
-> reconciliation, e-way prep, in-app feedback) that this file predates.**
-> This file remains the deeper narrative reference for the pre-July system.
+> **Last full audit: 2026-08-14.** Sections 3, 4, 8, 9 and 10–13 were rewritten then;
+> everything else predates it and is older. `AI_HANDOFF.md` (2026-07-29) covers the July
+> features (staff/multi-user, recurring invoices, ad slot, bank reconciliation, e-way prep,
+> in-app feedback).
 >
-> Last full audit: 2026-06-18. Keep this file updated whenever you build/modify.
+> Keep this file updated whenever you build or modify. Where a decision looks odd, the
+> reason is written down — read it before undoing it.
+
+**Current shape:** `backend/server.js` ~5,500 lines, 84 routes, 14 library modules under
+`backend/lib/`, 248 tests (`npm test`), 20 SQL migrations.
 
 FastBahi = bilingual, GST-compliant billing + shop-management app for Indian
 MSME shopkeepers (tiles / kirana / electronics / jewellery / restaurant).
@@ -77,21 +81,78 @@ expenses CRUD, `GET /analytics/projections/:shopId`, payment-events.
 **Infra:** `GET /health` — runs a cheap `count` query so periodic pings keep
 Render + Supabase warm (see §7).
 
-### Security model (server-side)
-Client sends `shopId` as identity (no JWT yet). Ownership is enforced per-route:
-mutations require `shopId` and filter/verify `shop_id` ownership (403 on mismatch).
-Rate limiting via `express-rate-limit` (`authLimiter` on login). PIN bcrypt-hashed;
-null-hash legacy shops self-enroll PIN on first login. **Gap (backlog S4):** RLS
-disabled in Supabase + anon key in client bundle — fine for pilot, fix before scale.
+### Security model (server-side) — rewritten 2026-08-07..14
+
+**Sessions.** Login and signup issue a signed JWT (`backend/lib/auth.js`). One app-level
+gate mounted *ahead of routing* answers, per request: is there a valid session, and does the
+shop this request names match it. Gating centrally rather than per route means a route added
+later is covered by default rather than by remembering.
+
+Three details that are easy to get wrong, and were:
+
+- **`req.params` is empty in `app.use()` middleware.** Express fills params only after a
+  route matches. The first version read `req.params.shopId`, always got `undefined`, and so
+  passed everything while looking correct. Shop position is matched from the *path*
+  explicitly, per HTTP method, because several paths mean different things per verb
+  (`GET /api/orders/:shopId` lists; `DELETE /api/recurring-invoices/:id` removes one row).
+- **Express defaults `strict routing` OFF and `case sensitive routing` OFF**, so
+  `/api/shops/<id>/` and `/API/SHOPS/<id>` reach the same handler. Matching only the
+  canonical spelling was a live bypass — a session for one shop read another by appending a
+  slash. `normalisePath()` + `/i` on every pattern fixes it; the captured id keeps its
+  original case so the comparison still works.
+- **A session is not authorisation.** Routes naming a record by its own id (`/invoices/:id`)
+  resolve that record's owning shop first, or a valid session could delete another shop's
+  invoice by guessing an id. Absent and not-yours return the same reply, so ids cannot be
+  probed.
+
+A guard test parses `server.js` and asserts every `:shopId` route appears in the scope
+table — adding a shop-scoped route without registering it fails the suite rather than
+shipping unguarded. It has already caught one.
+
+**`AUTH_ENFORCE`** must be `"true"` to block; anything else runs every check in report-only
+and logs what it *would* have refused. That existed so a build already on a shopkeeper's
+phone kept working during rollout. **It is `true` in production since 2026-08-13.** Check
+`GET /api/health` → `auth.enforced`.
+
+**Staff permissions** are enforced server-side, not by hiding buttons. Deleting, price
+edits, returns and staff management check the permission; the check reads the staff row
+from the database rather than the token, because permissions are stamped in at login and a
+session lasts 30 days — trusting the token would keep a revoked permission alive for a
+month and leave a removed employee with full access. Every staff request re-reads that row,
+so deactivation takes effect at once.
+
+**Price is enforced, not just displayed.** `canEditPrice` originally guarded only the
+catalogue, while the price a customer actually pays arrived in the invoice body unchecked —
+a cashier could hold "cannot edit price" and still sell a ₹900 box for ₹100. Staff without
+the permission are now held to the catalogue price and refused a discount. The flag is set
+*after* `...req.body` is spread; before it, a caller could send `lockToCatalogPrice:false`.
+
+**Other controls.** `express-rate-limit` is a hard dependency (it was optional with a no-op
+fallback, so a failed install shipped no rate limiting and no symptom); `trust proxy` is a
+fixed single hop; login is limited per-phone as well as per-IP, because probing production
+showed merely *sending* an `X-Forwarded-For` header opened a second bucket; body limit is
+1 MB except four image/import routes; login returns one message for unknown phone and wrong
+PIN alike, so numbers cannot be harvested. **Exactly HTTP 500** is masked to a generic
+sentence and the real error logged — 4xx and 503 are chosen deliberately and pass through.
+Secrets: none in either repo, and none in 140 commits of history.
 
 ---
 
-## 4. Database (Supabase Postgres, RLS disabled)
+## 4. Database (Supabase Postgres, RLS **enabled**)
 
 Key tables: `shops`, `designs` (no shop_id — linked via `tile_categories`),
 `tile_categories`, `inventory` (`quantity_boxes NUMERIC(12,3)`, `is_low_stock`
 GENERATED), `invoices` (payment_status: paid/credit/partial/cancelled/returned),
-`invoice_items`, `purchases`, `expenses`. Full column list: `backend/database/schema.sql`.
+`invoice_items`, `purchases`, `expenses`, **`online_orders`** (see §11).
+
+`shops` also carries, added 2026-08: **`webhook_secret`** (per-shop, §12),
+**`shipping_provider` + `shipping_config`** (per-shop courier, §12).
+Full column list: `backend/database/schema.sql`.
+
+**RLS is on, and it protects less than it looks like it does.** The backend connects as
+`service_role`, which *bypasses RLS entirely*. So RLS defends against someone hitting the
+Supabase REST API directly with a leaked anon key; it does nothing about a hole in this API.
+Do not read "RLS enabled" as "tenants are isolated" — that is what §3 and §12 are for.
 
 **Migrations:** `supabase/migrations/` in Supabase-CLI format. Apply manually in
 SQL Editor (oldest timestamp first). `20260616120000_pilot_production.sql` = S1
@@ -151,7 +212,16 @@ keeps both warm). Free (GitHub Actions). Avoids needing paid Supabase ($25/mo) a
 
 - **S2** per-shop unique design codes (currently global unique → blocks multi-shop scale).
 - **S3** atomic invoice generate (currently manual rollback in catch).
-- **S4** enable Supabase RLS / move writes behind service key.
+- ~~**S4** enable Supabase RLS / move writes behind service key.~~ **Done** — RLS on,
+  backend authenticates as `service_role`. Read the caveat in §4.
+- `ALLOWED_ORIGINS` is unset, so CORS is open to every origin and the server warns at boot.
+  Deliberately not set: the web client deploys to a Vercel domain that is not fixed here, and
+  a wrong value breaks it. Low risk because the session travels in a header, not a cookie, so
+  a third-party page still cannot read anything. **If you ever set it, it must include
+  `https://eastindicatea.com`** or the orders admin page stops working.
+- `POST /api/inventory/scan-purchase` and `POST /api/products/identify-photo` are the only
+  two routes with no shop scope at all. That is correct — they are pure OCR/AI and touch no
+  shop data — but do not add anything to them that reads the database.
 - **A2** paid Supabase/Render (or rely on keep-warm) before many paid shops.
 - Payment **collection** (in-app money movement) needs Razorpay + registered entity + KYC
   — deferred. Current "payment request" = free WhatsApp + `upi://` deeplink (no gateway, no KYC).
@@ -162,4 +232,170 @@ keeps both warm). Free (GitHub Actions). Avoids needing paid Supabase ($25/mo) a
 
 GSTR-1 includes only GST invoices. **ITR/P&L turnover includes non-GST (cash) sales**
 — excluding them = under-reporting income = illegal. 44AD updated AY 2026-27 (6% digital /
-8% cash, ₹3 Cr limit). GST split CGST+SGST only (no IGST inter-state yet).
+8% cash, ₹3 Cr limit). **GST place of supply is now correct for shipped orders (2026-08-14).** It was not, and
+this mattered: every inter-state online order was billed CGST+SGST at the seller's own
+state. The total collected was right — which is why nothing looked wrong — but the heads
+were not, so the buyer could not take credit and GSTR-1 would not reconcile. A defect on
+the face of a legal document.
+
+`backend/lib/gstPlace.js` is right that for a *counter* sale to an unregistered buyer the
+place of supply is the shop's own state; the goods are handed over there. An online order is
+not a counter sale: where a supply involves movement of goods, place of supply is where that
+movement terminates (CGST Act s.10(1)(a)). `backend/lib/pincodeState.js` derives the buyer's
+state from the delivery pincode and the webhook passes it as `placeOfSupply`.
+
+This only became possible once orders stored the address in discrete columns — the pincode
+used to be flattened into one printable line before it reached the backend.
+
+**Where it will not guess.** Postal circles match states at two digits for most of India, but
+Uttarakhand sits inside Uttar Pradesh's range, Chhattisgarh inside Madhya Pradesh's, Goa
+inside Maharashtra's, and the north-east shares one block — resolved at three digits. Andhra
+Pradesh and Telangana were one state until 2014 and their pincodes interleave, so those
+return `null` and the counter-sale default stands. A wrong state on a tax invoice is worse
+than a conservative one: being unsure is recoverable, being wrong and certain is not.
+
+---
+
+## 10. Library modules (`backend/lib/`)
+
+Pure, testable, no Express and no Supabase. `server.js` is a single large file; anything
+worth reasoning about independently lives here so it can be tested without booting the app.
+
+| Module | What it decides |
+|---|---|
+| `auth.js` | sessions, shop scope, record ownership, staff permissions (§3) |
+| `opsResearch.js` | the operations-research formulas — EOQ, reorder point, ABC, newsvendor, turnover, DSO, confidence |
+| `advice.js` | which of those numbers is worth saying, in what order, and when to stay quiet (§13) |
+| `pincodeState.js` | delivery pincode → state, for GST place of supply (§9) |
+| `shipping.js` | courier adapter interface + order lifecycle rules (§11) |
+| `gstPlace.js` | CGST+SGST vs IGST |
+| `money.js`, `credit.js`, `creditNote.js`, `debitNote.js`, `ageing.js`, `cashbook.js`, `csv.js`, `tallyExport.js` | billing, credit and export arithmetic |
+
+**`opsResearch.js` and `advice.js` are deliberately separate.** The formulas are settled
+results that do not change; the policy about *this* business will.
+
+---
+
+## 11. Online orders and fulfilment (2026-08-13)
+
+Before this, a paid website order became an invoice and then vanished. An invoice records
+what was sold; it has no field for where the parcel goes and no state that changes after it
+is raised. Nothing could answer "which orders still need packing", and **the delivery
+address the website collected was being discarded on arrival**.
+
+**`online_orders` is a separate table, not columns on `invoices`.** They have different
+lifetimes and different truths: an invoice is fixed once raised, an order moves for days
+afterwards, and a cancelled order still leaves its invoice behind. They share one link.
+The address is stored as *discrete columns* because a carrier wants pincode and state on
+their own — pincode decides serviceability, rate, and (see §9) the tax split.
+Unique on `(shop_id, external_ref)`, which is what makes the webhook safe to retry.
+
+**Lifecycle:** `paid → packed → shipped → delivered`, `cancelled` reachable from any of
+them. Enforced in `shipping.js`; status only moves forward, so nothing can erase that a
+parcel went out — including a confused carrier response.
+
+**Three rules worth keeping.** The address is validated *before* the carrier is called, so a
+missing pincode is reported plainly instead of arriving as an opaque rejection after the
+shopkeeper has committed. Booking twice is refused (409) rather than made idempotent — a
+second booking strands the first AWB and a parcel already handed over cannot be un-handed.
+Recording the order **cannot fail the webhook**: money is taken and stock already
+decremented, so a bookkeeping row must never make the caller retry a billing operation; it
+logs, and the daily reconcile replays it.
+
+**Carrier is behind an adapter.** `name / isConfigured / createShipment / track`. The mock
+is the default so a fresh deploy books nothing real by accident; it returns an obviously
+fake `MOCK…` AWB and sets `mock:true`, which both UIs surface loudly. **A named-but-
+unconfigured adapter is a 503, never a silent fall back to the mock** — falling back would
+hand a shop a fake AWB it believed was real. Adding a real courier = one adapter file.
+
+**Routes:** `GET /api/orders/:shopId` (defaults to pending), `GET /api/orders/detail/:id`,
+`POST /api/orders/:id/ship`, `PATCH /api/orders/:id/status`, `GET /api/orders/:id/track`.
+**UIs:** mobile Orders tab (🚚 — stock owns 📦) and `eastindicatea.com/admin.html`, which
+signs in with the same FastBahi shop login and prints packing slips one per sheet.
+
+---
+
+## 12. Multi-tenant isolation (2026-08-13/14)
+
+Audited route by route. Of 84 routes: 7 public (no shop data), 41 scoped by path, 18 by a
+record-ownership lookup, 16 by `shopId` in the body, 2 unscoped — the OCR/AI pair, which
+touch no shop data.
+
+Everything a second shop would otherwise have shared is now its own:
+
+| | How |
+|---|---|
+| Data | `shop_id` on every shop table; `designs`/`invoice_items` via parent |
+| Session | JWT scoped to one shop; another shop's data is 403/404 |
+| **Webhook credential** | `shops.webhook_secret`, per shop |
+| **Courier account** | `shops.shipping_provider` + `shipping_config`, per shop |
+
+**Why per-shop webhook secrets.** The webhook authenticated with one shared
+`ONLINE_ORDER_SECRET` and then read `shopId` from the body. With one shop that is fine.
+With two it is a cross-tenant hole: every shop's website necessarily holds the same secret,
+so any of them could post an order into any other shop's inventory by naming a different
+`shopId`. The shop is now read first and the secret compared against *that shop's own*, so
+the secret proves **which** shop is calling. Registration mints one, so a new shop is never
+left on the shared value. The shared value is still consulted for a shop that has none, and
+every such fallback is logged by shop id — **once that log is quiet, delete
+`ONLINE_ORDER_SECRET` from the host.**
+
+**Why per-shop courier config.** A courier account is a shop's own commercial relationship —
+its rates, its pickup, its liability — and cannot be shared any more than a bank account.
+A shop's own credentials beat anything platform-wide, so a leftover token cannot quietly
+book on the wrong account. There is deliberately **no default provider**.
+
+**Still platform-wide, and correctly so:** the storefront. FastBahi has zero storefront
+routes and is not an e-commerce platform. East Indica's shop is a hand-built Vercel site
+that talks to this API. See §14.
+
+---
+
+## 13. Decisions engine (`computeDecisions` + `advice.js`)
+
+`GET /api/decisions/:shopId`, surfaced in the app's Decisions screen. **No figure it
+produces comes from a language model** — every number is derived, checkable and arguable.
+
+Five functions in `opsResearch.js` had been written, tested and never called. They are now
+wired:
+
+- **Order size from EOQ**, `Q* = sqrt(2DS/H)` (Harris/Wilson; MIT OCW ESD.273J). It replaced
+  "cover the lead time plus a cycle", which ignores what an order costs to place and what
+  stock costs to hold — precisely the trade-off EOQ settles.
+  **Two bounds, and their order matters:** the cap (a quarter's demand) applies to the EOQ
+  only, and the floor (clear the reorder point) is applied last. Clamping the other way let
+  the cap cut into the floor and produced the one useless answer — *order this much, and
+  still be short*. A test asserts it; it caught exactly that bug.
+- **Cash-aware restock.** Ranked by urgency against the cash actually in the open session's
+  drawer, and cut off where it runs out. Advice that cannot be paid for is not advice.
+  Greedy, not an exact knapsack: solving it exactly would be false precision over estimated
+  costs, and buying what runs out first is what a person does anyway.
+  **When no session is open the section is absent, never zero** — unknown must not read as
+  none, or everything would look unaffordable.
+- **Margin leaks.** Products at or below cost, which hide inside a healthy revenue line.
+  Margin is `(p−c)/p`, on price — markup on cost flatters every trade.
+- **Online demand** folded into the same shelf, since a website order draws down the same
+  stock and was being left out on exactly the products that are growing.
+
+Sources are stated at the top of `advice.js`. `confidenceFrom` gates everything: a standard
+deviation from four observations is arithmetic, not evidence, and the engine stays quiet
+rather than dressing a guess up as a number.
+
+---
+
+## 14. What FastBahi is not
+
+It is **not** a Shopify competitor and should not become one. There are **no storefront
+routes** — no catalogue-to-web, cart, checkout, theme or domain handling. Each shop brings
+its own store; FastBahi is the back office behind it.
+
+The defensible position is the opposite one: *a billing app that pulls your online orders in
+from anywhere*. Shopify does not do GST, udhari or a cashbook; Vyapar does not pull online
+orders. Both of those are already built here.
+
+**Two things to know before selling online storefronts to other shops.** COD is structurally
+expensive in India — around 26% RTO against under 2% prepaid, roughly ₹561 lost per return —
+so East Indica's prepaid-only checkout is protection, not a gap. And if money ever flows
+through the platform's own account and is disbursed to shops, that is **payment aggregation
+and needs an RBI PA licence (₹15 crore net worth)**. Each shop connecting its own Razorpay
+avoids this entirely.

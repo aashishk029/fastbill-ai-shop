@@ -427,3 +427,46 @@ Fixed with one `publicShop()` helper listing the secret columns, so a future sec
 is removed everywhere by adding it to that list rather than by finding six destructurings.
 The response keeps a `hasWebhookSecret` boolean, because whether one exists is useful to
 the app and the value is not.
+
+---
+
+## 16. Stock and the storefront (2026-08-15)
+
+**The order used to be paid for before anyone checked the shelf.** `createInvoiceCore`
+refuses to oversell, but it runs inside the sync webhook, which fires *after* Razorpay has
+taken the money. That refusal is a 4xx, so `_lib.postToFastBill` correctly does not retry
+it, and `verify-payment` treats the sync as best-effort so it does not block the success
+page. The customer was charged, shown a confirmation, and no invoice, no stock movement and
+no `online_orders` row existed anywhere — the shopkeeper saw nothing. The nightly reconcile
+replayed it and failed identically, so it never healed.
+
+Two things now sit in front of that.
+
+**`POST /api/webhooks/stock-check`** — same per-shop shared secret as the order webhook,
+because what a shop has on its shelf is not public and this is server to server. Returns
+which lines cannot be filled. An unknown SKU is reported as unavailable rather than ignored:
+silently dropping a line would let someone pay for an order missing an item.
+`create-order.js` calls it *before* Razorpay.
+
+**`GET /api/stock`** on the storefront (Vercel) — asks the same endpoint server-side and
+returns **availability, not quantities**. Whether a shop can sell you something is public;
+how many are left is a competitor's view of throughput and nothing on the page needs it.
+The webhook secret never reaches the browser. `shop.html` and `product.html` withhold the
+Add button for anything out of stock, and it returns on its own when the shelf refills —
+neither page contains a list of what is available, so nobody has to remember to edit one.
+
+**Failing to reach either check does not block the sale.** Refusing real orders, or hiding
+the catalogue, because a free-tier backend was asleep would cost more than the rare oversell
+it prevents — and the post-payment check still catches that case. This narrows the window;
+it does not claim to close it.
+
+**Known, and deliberately left:** eight legacy single-size keys (`plainctc`, `elaichi`,
+`ginger`, `masala`, `assam`, `darjeeling`, `nilgiri`, `greentea`) are priced on the site for
+older carts but were never seeded in FastBahi, so they read as out of stock. That is the
+correct outcome — the alternative was silently taking money for them. Seed them if those
+carts should work. `PRODUCT_KEYS` in `api/_lib.js` is the single list both pricing and the
+stock lookup read from, so a product added to one cannot be forgotten in the other.
+
+The in-memory cache in `api/stock.js` only helps when a warm Vercel instance serves
+consecutive requests; the `Cache-Control: max-age=60` header is what actually keeps traffic
+off a sleeping backend.

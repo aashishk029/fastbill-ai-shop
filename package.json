@@ -9,8 +9,9 @@
     "client": "cd frontend && npm start",
     "build": "cd frontend && npm run build",
     "test": "node --test backend/**/*.test.js",
-    "check": "node --check backend/server.js && npm test && npm run redteam",
-    "redteam": "node redteam.js"
+    "check": "node --check backend/server.js && npm test && npm run redteam && npm run e2e",
+    "redteam": "node redteam.js",
+    "e2e": "node decisions.e2e.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.38.0",

@@ -119,6 +119,9 @@ const check = (cat, name, blocked, detail = "") =>
   check("secrets", "webhook with a session token instead of the secret",
     (await go("POST", "/webhooks/online-order", { shopId: A, externalRef: "x", items: [] }))[0] === 401);
   check("secrets", "cron route with a session token", (await go("POST", "/recurring-invoices/run-due", {}))[0] === 401);
+  check("secrets", "stock-check without the secret", (await go("POST", "/webhooks/stock-check", { shopId: B, items: [{ sku: "VIC_tea", quantityBoxes: 1 }] }, null))[0] === 401);
+  check("secrets", "stock-check reading another shop's shelf with my secret",
+    (await go("POST", "/webhooks/stock-check", { shopId: B, items: [{ sku: "VIC_tea", quantityBoxes: 1 }] }, null, { "x-webhook-secret": "a".repeat(64) }))[0] === 401);
   check("secrets", "mint a webhook secret without a PIN", (await go("POST", `/shops/${A}/webhook-secret`, {}))[0] === 401);
 
   // ── 4. Mass assignment ───────────────────────────────────────────────────────────────

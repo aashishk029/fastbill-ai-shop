@@ -5320,6 +5320,61 @@ app.post("/api/reminders/mark-sent", writeLimiter, async (req, res) => {
 });
 
 
+// Is this order actually in stock, asked before any money moves.
+//
+// The online store used to take payment first and discover the shortfall afterwards, when
+// the order webhook hit the stock check inside createInvoiceCore and threw. That failure is
+// permanent, so nothing retried it, and verify-payment treats the sync as best-effort — so
+// the customer was charged, shown a confirmation, and no invoice, no stock movement and no
+// order row existed anywhere. The daily reconcile replayed it and failed the same way, so
+// it never healed. Money taken for something the shop could not send is the worst failure
+// this system can have.
+//
+// Same shared-secret auth as the order webhook: this is server-to-server, and it answers
+// what a shop has on the shelf, which is not public.
+app.post("/api/webhooks/stock-check", async (req, res) => {
+  try {
+    const { shopId, items } = req.body || {};
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+    if (!/^[0-9a-f-]{36}$/i.test(String(shopId))) return res.status(401).json({ error: "Unauthorized" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items required" });
+
+    const { data: shopRow } = await supabase
+      .from("shops").select("webhook_secret").eq("id", shopId).maybeSingle();
+    const secret = (shopRow && shopRow.webhook_secret) || process.env.ONLINE_ORDER_SECRET;
+    if (!secret) return res.status(503).json({ error: "Not configured for this shop" });
+    const a = Buffer.from(req.get("x-webhook-secret") || ""), b = Buffer.from(secret);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const skus = items.map((i) => String(i.sku || "").trim()).filter(Boolean);
+    const { data: designs } = await supabase
+      .from("designs").select("id, design_code").in("design_code", skus);
+    const codeToId = Object.fromEntries((designs || []).map((d) => [d.design_code, d.id]));
+
+    const { data: inv } = await supabase
+      .from("inventory").select("design_id, quantity_boxes")
+      .eq("shop_id", shopId).in("design_id", Object.values(codeToId));
+    const onHand = Object.fromEntries((inv || []).map((r) => [r.design_id, parseFloat(r.quantity_boxes) || 0]));
+
+    // An unknown SKU is reported as unavailable rather than ignored: silently dropping a
+    // line would let the customer pay for an order missing an item.
+    const unavailable = [];
+    for (const it of items) {
+      const sku = String(it.sku || "").trim();
+      const want = parseFloat(it.quantityBoxes) || 0;
+      const id = codeToId[sku];
+      const have = id ? (onHand[id] || 0) : 0;
+      if (!id || want > have) unavailable.push({ sku, requested: want, available: have });
+    }
+
+    res.json({ ok: unavailable.length === 0, unavailable });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Mint or replace this shop's online-order webhook secret.
 //
 // PIN-gated for the same reason upi_id is: it is a credential, and whoever holds it can

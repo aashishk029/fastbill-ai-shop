@@ -200,4 +200,73 @@ function onlineDemandBySku(orders, { days = 30 } = {}) {
   return out;
 }
 
-module.exports = { orderQuantity, marginLeaks, affordableRestocks, onlineDemandBySku };
+/**
+ * Monthly fixed costs, separated from the ones that move with sales.
+ *
+ * Break-even needs to know what the shop owes before it sells anything. The expense
+ * categories already record this: rent, utilities and salary are owed whether or not a
+ * single cup is sold, while transport and marketing scale with activity. "other" is left
+ * out rather than guessed at in either direction.
+ *
+ * This is a classification, not a measurement, and it is stated as an assumption wherever
+ * the result is shown — a shopkeeper who pays commission-based salary would be misread by
+ * it, and should be able to see why the number came out as it did.
+ */
+const FIXED_CATEGORIES = new Set(["rent", "utility", "salary"]);
+
+function monthlyFixedCosts(expenses, { days = 90 } = {}) {
+  const months = Math.max(1, num(days) / 30);
+  let fixed = 0, counted = 0;
+  for (const e of expenses || []) {
+    if (!FIXED_CATEGORIES.has(String(e.category || "").toLowerCase())) continue;
+    fixed += num(e.amount); counted++;
+  }
+  if (!counted) return null;      // nothing classified — say nothing rather than imply zero
+  return { perMonth: round2(fixed / months), sampleCount: counted, windowDays: num(days) };
+}
+
+/**
+ * How much a shop must sell each month before it starts earning.
+ *
+ * Contribution per rupee of sales is taken from the shop's own realised margin rather than
+ * a single product's, because a shop covers its rent out of everything it sells.
+ */
+function shopBreakEven({ revenue, cogs, fixedPerMonth, windowDays = 90 }) {
+  const rev = num(revenue), cost = num(cogs), fx = num(fixedPerMonth);
+  if (rev <= 0 || fx <= 0) return null;
+  const contributionRatio = (rev - cost) / rev;
+  if (contributionRatio <= 0) return null;     // selling below cost overall; break-even is meaningless
+  const months = Math.max(1, num(windowDays) / 30);
+  return {
+    fixedPerMonth: round2(fx),
+    contributionMarginPct: round2(contributionRatio * 100),
+    breakEvenRevenuePerMonth: round2(fx / contributionRatio),
+    actualRevenuePerMonth: round2(rev / months),
+    coveringCosts: (rev / months) >= (fx / contributionRatio),
+  };
+}
+
+/**
+ * How much of a perishable to stock, when what is left over is a write-off.
+ *
+ * The reorder-point model assumes stock keeps. For anything with an expiry date it does
+ * not: order too little and the margin is lost, order too much and the whole cost is lost,
+ * and those two are not symmetric. The newsvendor critical ratio is the standard answer —
+ * stock up to the demand quantile where the cost of one more equals the cost of one fewer.
+ */
+function perishableQuantity({ unitCost, sellingPrice, meanDemand, sdDemand, salvageValue = 0 }) {
+  const r = ops.newsvendorQuantity({
+    unitCost, sellingPrice, salvageValue,
+    meanDemand: num(meanDemand), sdDemand: num(sdDemand),
+  });
+  if (!r) return null;
+  return {
+    quantity: Math.max(0, Math.round(r.optimalQuantity)),
+    serviceImplied: round2(r.criticalRatio * 100),
+    costOfOneTooFew: r.underageCost,
+    costOfOneTooMany: r.overageCost,
+  };
+}
+
+module.exports = { orderQuantity, marginLeaks, affordableRestocks, onlineDemandBySku,
+                  monthlyFixedCosts, shopBreakEven, perishableQuantity };

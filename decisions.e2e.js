@@ -47,7 +47,11 @@ const db = {
     { design_id: D2, quantity_boxes: 60, cost_per_box: 500, purchase_date: "2026-05-01" },
     { design_id: D3, quantity_boxes: 80, cost_per_box: 200, purchase_date: "2026-02-01" },
   ],
-  expenses: [{ amount: 4000, expense_date: new Date().toISOString() }],
+  expenses: [
+    { amount: 60000, expense_date: new Date().toISOString(), category: "rent" },
+    { amount: 30000, expense_date: new Date().toISOString(), category: "salary" },
+    { amount: 9000, expense_date: new Date().toISOString(), category: "marketing" },
+  ],
   online_orders: [
     { status: "paid", created_at: new Date().toISOString(), items: [{ sku: "EIT_milan", quantityBoxes: 4 }] },
     { status: "shipped", created_at: new Date().toISOString(), items: [{ sku: "EIT_milan", quantityBoxes: 2 }] },
@@ -128,6 +132,11 @@ const out = (l, ok, x = "") => {
     recs.filter((r) => r.type === "dead_stock").map((r) => r.title).join(", ") || "none");
 
   out("methodology states no LLM produced the numbers", /language model/i.test(d.methodology || ""));
+
+  out("break-even is reported", !!d.breakEven, JSON.stringify(d.breakEven?.breakEvenRevenuePerMonth));
+  out("only rent and salary counted as fixed (marketing excluded)", d.breakEven?.fixedPerMonth === 30000,
+    JSON.stringify(d.breakEven?.fixedPerMonth));
+  out("break-even states its assumption", /rent/i.test(d.breakEven?.assumption || ""));
 
   // The cash card must vanish, not read zero, when no session is open.
   db.cash_sessions = [];

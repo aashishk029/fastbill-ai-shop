@@ -470,3 +470,37 @@ stock lookup read from, so a product added to one cannot be forgotten in the oth
 The in-memory cache in `api/stock.js` only helps when a warm Vercel instance serves
 consecutive requests; the `Cache-Control: max-age=60` header is what actually keeps traffic
 off a sleeping backend.
+
+---
+
+## 17. Telling the customer where their order is (2026-08-17)
+
+A shopkeeper could mark an order packed, book a courier and ship it, and the customer learned
+none of it — `orders.html` only ever asked Razorpay whether the payment had gone through. The
+fulfilment state was in the database and invisible to the one person waiting for the parcel.
+
+**`POST /api/webhooks/order-status`** — keyed on the payment id the customer already holds,
+guarded by the same per-shop secret as the other server-to-server routes. Returns the
+fulfilment state and tracking number and **nothing else**: not the delivery address, not the
+amount, nothing about the shop's other orders.
+
+Two answers it gives on purpose. **Not found is normal**, not an error — the sync may not have
+run yet, and the storefront falls back to the payment state. And **a mock booking's AWB is
+withheld**: a tracking number that tracks nothing is worse than none, especially to someone
+waiting for a parcel.
+
+`api/order-status.js` on the storefront asks it server-side, so the secret never reaches the
+browser. It resolves the order id in the customer's link to the captured payment id first,
+because the backend keys on the payment — that is what the gateway signs and what makes the
+sync idempotent. `orders.html` shows *Being Prepared / Packed / Shipped / Delivered* with the
+courier and AWB, and falls back to payment state when fulfilment is unknown rather than
+inventing a stage.
+
+### An operational note for whoever works on this next
+
+The scratchpad clone under `/private/tmp` has been silently eaten twice by macOS tmp cleanup —
+`.git/HEAD`, `.git/config` and about half of `backend/lib/` removed by age while the working
+tree looked fine. Both times the symptom was a test failing with
+`Cannot find module './opsResearch'`, not an obvious filesystem error. **The remote is the
+source of truth; re-clone rather than trying to repair.** Commit early — uncommitted work
+there is not safe.

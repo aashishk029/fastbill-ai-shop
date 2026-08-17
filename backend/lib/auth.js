@@ -32,6 +32,7 @@ const PUBLIC_ROUTES = [
   { method: "POST", path: "/api/shops/login" },
   { method: "POST", path: "/api/webhooks/online-order" },
   { method: "POST", path: "/api/webhooks/stock-check" },
+  { method: "POST", path: "/api/webhooks/order-status" },
   { method: "POST", path: "/api/recurring-invoices/run-due" },
   { method: "GET", path: "/api/ads/active" },
   { method: "GET", path: "/api/jewellery/rates" },

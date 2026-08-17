@@ -5320,6 +5320,58 @@ app.post("/api/reminders/mark-sent", writeLimiter, async (req, res) => {
 });
 
 
+// Where is this order, asked by the store on a customer's behalf.
+//
+// A shopkeeper could mark an order packed, book a courier and ship it, and the customer
+// learned none of it — the storefront's order page only ever asked Razorpay whether the
+// payment went through. "Where is my order" is the question a small brand answers by hand
+// all day, and the answer was already in the database.
+//
+// Keyed on the payment id the customer already holds, and guarded by the same per-shop
+// secret as the other server-to-server routes, so the storefront asks and never the
+// browser. Returns the fulfilment state and the tracking number and nothing else — not the
+// address it is going to, not the amount, not anything about the shop's other orders.
+app.post("/api/webhooks/order-status", async (req, res) => {
+  try {
+    const { shopId, externalRef } = req.body || {};
+    if (!shopId || !externalRef) return res.status(400).json({ error: "shopId and externalRef required" });
+    if (!/^[0-9a-f-]{36}$/i.test(String(shopId))) return res.status(401).json({ error: "Unauthorized" });
+
+    const { data: shopRow } = await supabase
+      .from("shops").select("webhook_secret").eq("id", shopId).maybeSingle();
+    const secret = (shopRow && shopRow.webhook_secret) || process.env.ONLINE_ORDER_SECRET;
+    if (!secret) return res.status(503).json({ error: "Not configured for this shop" });
+    const a = Buffer.from(req.get("x-webhook-secret") || ""), b = Buffer.from(secret);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { data: order } = await supabase
+      .from("online_orders")
+      .select("status, awb, courier_provider, tracking_url, packed_at, shipped_at, delivered_at, created_at")
+      .eq("shop_id", shopId).eq("external_ref", externalRef).maybeSingle();
+
+    // Not found is a normal answer, not an error: the sync may not have run yet, and the
+    // storefront falls back to showing the payment state.
+    if (!order) return res.json({ found: false });
+
+    // A mock booking must never be shown to a customer waiting for a parcel as though a
+    // courier had it, so its AWB is withheld rather than presented as tracking.
+    const isMock = order.courier_provider === "mock";
+    res.json({
+      found: true,
+      status: order.status,
+      awb: isMock ? null : order.awb || null,
+      courier: isMock ? null : order.courier_provider || null,
+      trackingUrl: isMock ? null : order.tracking_url || null,
+      packedAt: order.packed_at, shippedAt: order.shipped_at, deliveredAt: order.delivered_at,
+      orderedAt: order.created_at,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Is this order actually in stock, asked before any money moves.
 //
 // The online store used to take payment first and discover the shortfall afterwards, when

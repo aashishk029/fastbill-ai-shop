@@ -18,15 +18,50 @@ jobs:
       - name: Ping health endpoint
         run: |
           URL="https://fastbill-ai-shop.onrender.com/api/health"
-          echo "Pinging $URL"
-          code=$(curl -s -o /tmp/body.json -w "%{http_code}" --max-time 90 "$URL" || echo "000")
-          echo "HTTP $code"
+
+          # Retry before declaring an outage.
+          #
+          # A single attempt used to fail the job and send an email, and on 2026-08-20 that
+          # meant three alerts for a Render-side blip that returned HTTP 503 with an empty
+          # body in under half a second — the request never reached the app, and the service
+          # recovered on its own. An alert that fires on every transient blip trains you to
+          # ignore it, and then a real outage goes unread. Three tries spread over a minute
+          # separates "the host hiccuped" from "the service is down".
+          #
+          # Any one success is enough: the point of this job is to keep the service warm, and
+          # it is warm the moment a request gets through.
+          code=""
+          for attempt in 1 2 3; do
+            code=$(curl -s -o /tmp/body.json -w "%{http_code}" --max-time 90 "$URL" || echo "000")
+            echo "attempt $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then break; fi
+            if [ "$attempt" -lt 3 ]; then sleep 30; fi
+          done
+
           cat /tmp/body.json || true
           echo ""
+
           if [ "$code" != "200" ]; then
-            echo "Health check failed (HTTP $code)"; exit 1
+            echo "Health check failed after 3 attempts over ~1 minute (last HTTP $code)."
+            echo "A sustained failure here means Render is down or the service is crash-looping —"
+            echo "check the Render dashboard's Events and Logs tabs, not the application code."
+            exit 1
           fi
+
+          # A reachable server with an unreachable database is worse than a cold one: every
+          # request answers, and every one of them fails. Supabase free projects pause after a
+          # week idle, which is exactly what this ping exists to prevent.
           if ! grep -q '"db":true' /tmp/body.json; then
-            echo "Warning: DB not reachable (Supabase may be paused)"; exit 1
+            echo "Server is up but the database is not reachable — Supabase may be paused."
+            exit 1
           fi
-          echo "OK — Render awake + Supabase warm"
+
+          # Enforcement in report-only mode answers identically to no gate at all from
+          # outside, so the only way to notice it silently reverted is to look.
+          if ! grep -q '"enforced":true' /tmp/body.json; then
+            echo "WARNING: AUTH_ENFORCE is not true — the session gate is not blocking anything."
+            echo "Any caller holding a shop UUID can read and write that shop. Set it on Render."
+            exit 1
+          fi
+
+          echo "OK — Render awake, Supabase warm, session gate enforcing"

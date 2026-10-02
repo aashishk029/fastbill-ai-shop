@@ -910,7 +910,10 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
       gst_rate: null, // mixed per-item rates — see invoice_items
       is_gst_invoice: isGstInvoice,
       payment_status: paymentStatus || 'paid',
-      amount_paid: (paymentStatus === 'credit') ? 0 : null,
+      // A credit (udhari) bill has nothing paid yet; anything else (cash/UPI/card)
+      // is settled in full at the time of sale, so RECEIVED must equal the total —
+      // this was left `null` here, which the bill then printed as ₹0.
+      amount_paid: (paymentStatus === 'credit') ? 0 : Math.round(finalGrossAmount * 100) / 100,
       table_number: tableNumber || null,
       discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
     };

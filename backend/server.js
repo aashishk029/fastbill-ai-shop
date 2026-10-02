@@ -709,6 +709,7 @@ const { customerKey, currentExposure, paymentBehaviour, evaluateCreditSale, cred
 const { expectedCash, reconcile, summarisePaymentModes } = require("./lib/cashbook");
 const { resolveSupply, splitTaxComponents, stateCodeFromGstin, stateName } = require("./lib/gstPlace");
 const { financialYear, creditNoteNumber, computeCreditNote, gstAdjustmentAllowed } = require("./lib/creditNote");
+const { invoiceNumber: sequentialInvoiceNumber } = require("./lib/invoiceNumber");
 const ops = require("./lib/opsResearch");
 const advice = require("./lib/advice");
 const { supplierKey, debitNoteNumber, computeDebitNote } = require("./lib/debitNote");
@@ -790,6 +791,30 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
         .from("invoices").select("*").eq("shop_id", shopId).eq("invoice_number", invoiceNumber).maybeSingle();
       if (existing) return { message: "✓ Invoice already recorded", invoice: existing, idempotent: true };
     }
+
+    // A caller-supplied invoiceNumber (the webhook idempotency path above) is
+    // used as-is. Otherwise, assign the next sequential number for this shop's
+    // financial year — falls back to the old INV-<timestamp> scheme if
+    // migration 20261002000000 hasn't run yet, so billing never breaks on an
+    // out-of-date database. See createInvoiceCore's insert loop below, which
+    // retries with the next sequence on a (shop_id, invoice_number) race.
+    let finalInvoiceNumber = invoiceNumber;
+    let seqForInsert = null;
+    let fyForInsert = null;
+    if (!finalInvoiceNumber) {
+      fyForInsert = financialYear();
+      const { count, error: seqCountError } = await supabase.from("invoices")
+        .select("id", { count: "exact", head: true })
+        .eq("shop_id", shopId).eq("financial_year", fyForInsert);
+      if (!seqCountError) {
+        seqForInsert = (count || 0) + 1;
+        finalInvoiceNumber = sequentialInvoiceNumber({ sequence: seqForInsert });
+      } else {
+        console.warn("sequential invoice numbers not available — run migration 20261002000000");
+        finalInvoiceNumber = `INV-${Date.now()}`;
+      }
+    }
+
     const mode = gstMode || 'included'; // 'included' | 'exclusive'
     const discount = Math.max(0, parseFloat(discountAmount) || 0);
 
@@ -895,68 +920,94 @@ async function createInvoiceCore({ shopId, customerName, customerPhone, customer
     });
     const { igst, cgst, sgst } = splitTaxComponents(gstAmount, supply.interState);
 
-    // Insert invoice
-    const invoiceRow = {
-      shop_id: shopId,
-      invoice_number: invoiceNumber || `INV-${Date.now()}`,
-      customer_name: customerName,
-      customer_phone: customerPhone || null,
-      customer_address: customerAddress || null,
-      customer_gstin: gstinUpper,
-      invoice_type: invoiceType,
-      taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
-      cgst_amount: isGstInvoice ? cgst : null,
-      sgst_amount: isGstInvoice ? sgst : null,
-      gst_rate: null, // mixed per-item rates — see invoice_items
-      is_gst_invoice: isGstInvoice,
-      payment_status: paymentStatus || 'paid',
-      // A credit (udhari) bill has nothing paid yet; anything else (cash/UPI/card)
-      // is settled in full at the time of sale, so RECEIVED must equal the total —
-      // this was left `null` here, which the bill then printed as ₹0.
-      amount_paid: (paymentStatus === 'credit') ? 0 : Math.round(finalGrossAmount * 100) / 100,
-      table_number: tableNumber || null,
-      discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
-    };
-
-    // How the customer settled it. Only meaningful on a paid bill — an udhari
-    // bill has not been paid by anything yet. Left null when not supplied, and
-    // reported as "not recorded" rather than assumed to be cash, because
-    // assuming would make every day-close wrong.
-    // Columns added by migration 20260804000000; stripped by the fallback below
-    // if the database has not caught up yet.
-    if (isGstInvoice && supply.interState) invoiceRow.igst_amount = igst;
-    invoiceRow.place_of_supply = supply.placeOfSupply || null;
-    invoiceRow.is_inter_state = supply.interState;
-
+    // Insert invoice. A sequential number can collide under a genuine race —
+    // two bills for the same shop in the same instant both counting the same
+    // existing total — so this retries with the next sequence on a duplicate
+    // (shop_id, invoice_number), the same pattern credit notes use.
     const PAYMENT_MODES = ["cash", "upi", "card", "bank"];
     const settledBy = String(paymentMode || "").toLowerCase();
-    if ((paymentStatus || "paid") === "paid" && PAYMENT_MODES.includes(settledBy)) {
-      invoiceRow.payment_mode = settledBy;
-    }
-
-    // Recording that a shopkeeper was warned and sold on credit anyway: the
-    // difference between a mistake and a decision. The column only exists after
-    // migration 20260802000000, so a missing-column error retries without it —
-    // an audit field must never be the reason a bill cannot be raised.
-    let { data: invoice, error: invoiceError } = await supabase
-      .from("invoices").insert([{ ...invoiceRow, credit_limit_overridden: !!creditLimitOverridden }]).select();
-    if (invoiceError && /column|schema cache/i.test(invoiceError.message || "")) {
-      // Retry without the columns added by later migrations. Billing must work
-      // on a database that has not caught up yet; the audit detail can wait.
-      const { credit_limit_overridden, payment_mode, igst_amount, place_of_supply, is_inter_state, ...preMigration } = { ...invoiceRow };
-
-      // But tax must never vanish. On an inter-state bill the tax was placed in
-      // igst_amount and cgst/sgst were zero — dropping the column here would
-      // store a bill with no tax at all. Record it the way this app always did
-      // until the migration lands: half in each. The total stays correct; only
-      // the legally required split is postponed.
-      if (isGstInvoice && supply.interState) {
-        const half = Math.round((gstAmount / 2) * 100) / 100;
-        preMigration.cgst_amount = Math.round((gstAmount - half) * 100) / 100;
-        preMigration.sgst_amount = half;
-        console.warn("inter-state bill recorded as CGST+SGST — run migration 20260804000000 to bill IGST correctly");
+    let invoice, invoiceError;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (attempt > 0 && seqForInsert) {
+        seqForInsert += 1;
+        finalInvoiceNumber = sequentialInvoiceNumber({ sequence: seqForInsert });
       }
-      ({ data: invoice, error: invoiceError } = await supabase.from("invoices").insert([preMigration]).select());
+
+      const invoiceRow = {
+        shop_id: shopId,
+        invoice_number: finalInvoiceNumber,
+        customer_name: customerName,
+        customer_phone: customerPhone || null,
+        customer_address: customerAddress || null,
+        customer_gstin: gstinUpper,
+        invoice_type: invoiceType,
+        taxable_value: isGstInvoice ? Math.round(taxableValue * 100) / 100 : null,
+        cgst_amount: isGstInvoice ? cgst : null,
+        sgst_amount: isGstInvoice ? sgst : null,
+        gst_rate: null, // mixed per-item rates — see invoice_items
+        is_gst_invoice: isGstInvoice,
+        payment_status: paymentStatus || 'paid',
+        // A credit (udhari) bill has nothing paid yet; anything else (cash/UPI/card)
+        // is settled in full at the time of sale, so RECEIVED must equal the total —
+        // this was left `null` here, which the bill then printed as ₹0.
+        amount_paid: (paymentStatus === 'credit') ? 0 : Math.round(finalGrossAmount * 100) / 100,
+        table_number: tableNumber || null,
+        discount_amount: discount > 0 ? Math.round(discount * 100) / 100 : null,
+      };
+      // financial_year/sequence columns only exist after migration 20261002000000
+      // (fyForInsert/seqForInsert are null when that migration hasn't run, or when
+      // invoiceNumber was supplied by the caller) — omit them rather than insert
+      // nulls into columns that might not exist yet.
+      if (fyForInsert && seqForInsert) {
+        invoiceRow.financial_year = fyForInsert;
+        invoiceRow.sequence = seqForInsert;
+      }
+
+      // How the customer settled it. Only meaningful on a paid bill — an udhari
+      // bill has not been paid by anything yet. Left null when not supplied, and
+      // reported as "not recorded" rather than assumed to be cash, because
+      // assuming would make every day-close wrong.
+      // Columns added by migration 20260804000000; stripped by the fallback below
+      // if the database has not caught up yet.
+      if (isGstInvoice && supply.interState) invoiceRow.igst_amount = igst;
+      invoiceRow.place_of_supply = supply.placeOfSupply || null;
+      invoiceRow.is_inter_state = supply.interState;
+      if ((paymentStatus || "paid") === "paid" && PAYMENT_MODES.includes(settledBy)) {
+        invoiceRow.payment_mode = settledBy;
+      }
+
+      // Recording that a shopkeeper was warned and sold on credit anyway: the
+      // difference between a mistake and a decision. The column only exists after
+      // migration 20260802000000, so a missing-column error retries without it —
+      // an audit field must never be the reason a bill cannot be raised.
+      ({ data: invoice, error: invoiceError } = await supabase
+        .from("invoices").insert([{ ...invoiceRow, credit_limit_overridden: !!creditLimitOverridden }]).select());
+
+      if (invoiceError && /column|schema cache/i.test(invoiceError.message || "")) {
+        // Retry without the columns added by later migrations. Billing must work
+        // on a database that has not caught up yet; the audit detail can wait.
+        const { credit_limit_overridden, payment_mode, igst_amount, place_of_supply, is_inter_state, financial_year, sequence, ...preMigration } = { ...invoiceRow };
+
+        // But tax must never vanish. On an inter-state bill the tax was placed in
+        // igst_amount and cgst/sgst were zero — dropping the column here would
+        // store a bill with no tax at all. Record it the way this app always did
+        // until the migration lands: half in each. The total stays correct; only
+        // the legally required split is postponed.
+        if (isGstInvoice && supply.interState) {
+          const half = Math.round((gstAmount / 2) * 100) / 100;
+          preMigration.cgst_amount = Math.round((gstAmount - half) * 100) / 100;
+          preMigration.sgst_amount = half;
+          console.warn("inter-state bill recorded as CGST+SGST — run migration 20260804000000 to bill IGST correctly");
+        }
+        ({ data: invoice, error: invoiceError } = await supabase.from("invoices").insert([preMigration]).select());
+      }
+
+      if (!invoiceError) break;
+      // A duplicate serial on a genuine race is worth retrying with the next
+      // sequence; anything else (and any case with no sequence to advance —
+      // the old timestamp scheme, a caller-supplied number, or the migration
+      // not having run) is a real error.
+      if (!seqForInsert || !/duplicate key|unique/i.test(invoiceError.message || "")) break;
     }
 
     if (invoiceError) throw invoiceError;

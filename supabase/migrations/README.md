@@ -14,6 +14,7 @@ GitHub→Supabase auto-migrations can be switched on later with no restructuring
 | `20250501000000_add_hsn_columns.sql` | applied earlier | HSN columns |
 | `20260616120000_pilot_production.sql` | **run for pilot** | S1 decimal quantities + inventory RPC + safe empty-shop dedupe |
 | `20260616120100_phase2_s2_s3.sql` | later (before paid/multi-shop) | per-shop design codes + atomic invoice RPC |
+| `20261002000000_sequential_invoice_numbers.sql` | **run before relying on sequential invoice numbers** | per-shop financial-year invoice sequence (CGST Rule 46(b)); backend falls back to the old `INV-<timestamp>` scheme until this runs |
 
 ## Auto-migrations (deferred — not worth it for 1 pilot)
 Needs Supabase **paid plan** + Dashboard → Integrations → GitHub → connect repo.
